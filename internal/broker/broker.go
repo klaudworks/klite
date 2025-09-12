@@ -3,7 +3,6 @@ package broker
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/server"
 )
 
 // Broker is the top-level klite broker.
@@ -24,6 +24,8 @@ type Broker struct {
 	done       chan struct{} // closed when Run() returns
 	ready      chan struct{} // closed when initialization is complete
 	logger     *slog.Logger
+	server     *server.Server
+	handlers   *server.HandlerRegistry
 
 	mu   sync.Mutex
 	quit bool
@@ -31,12 +33,19 @@ type Broker struct {
 
 // New creates a new Broker with the given config.
 func New(cfg Config) *Broker {
+	logger := setupLogger(cfg.LogLevel)
+	handlers := server.NewHandlerRegistry()
+	shutdownCh := make(chan struct{})
+	srv := server.NewServer(handlers, shutdownCh, logger)
+
 	return &Broker{
 		cfg:        cfg,
-		shutdownCh: make(chan struct{}),
+		shutdownCh: shutdownCh,
 		done:       make(chan struct{}),
 		ready:      make(chan struct{}),
-		logger:     setupLogger(cfg.LogLevel),
+		logger:     logger,
+		server:     srv,
+		handlers:   handlers,
 	}
 }
 
@@ -85,13 +94,13 @@ func (b *Broker) Run(ctx context.Context) error {
 	// Signal that initialization is complete
 	close(b.ready)
 
-	// 6. Accept connections (blocks until ctx cancelled)
+	// 6. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- b.acceptLoop(ctx)
+		errCh <- b.server.Serve(b.listener)
 	}()
 
-	// Wait for context cancellation or accept error
+	// Wait for context cancellation or serve error
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
@@ -102,6 +111,10 @@ func (b *Broker) Run(ctx context.Context) error {
 
 	// 7. Shutdown sequence
 	b.shutdown()
+
+	// 8. Wait for all connections to drain
+	b.server.Wait()
+
 	b.logger.Info("klite stopped")
 	return nil
 }
@@ -137,26 +150,9 @@ func (b *Broker) Ready() <-chan struct{} {
 	return b.ready
 }
 
-func (b *Broker) acceptLoop(ctx context.Context) error {
-	for {
-		conn, err := b.listener.Accept()
-		if err != nil {
-			// Check if we're shutting down
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			b.logger.Error("accept error", "error", err)
-			continue
-		}
-		b.logger.Debug("new connection", "remote", conn.RemoteAddr())
-		// For now, just close the connection -- protocol handling added in 03-tcp-and-wire.md
-		conn.Close()
-	}
+// Handlers returns the handler registry for registering API handlers.
+func (b *Broker) Handlers() *server.HandlerRegistry {
+	return b.handlers
 }
 
 func (b *Broker) shutdown() {
