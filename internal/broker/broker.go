@@ -75,6 +75,7 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 		ClusterID:      b.clusterID,
 		State:          b.state,
 	}))
+	b.handlers.Register(19, handler.HandleCreateTopics(b.state))
 }
 
 // Run starts the broker and blocks until ctx is cancelled.
