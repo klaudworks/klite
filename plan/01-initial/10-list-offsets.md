@@ -1,5 +1,11 @@
 # ListOffsets Handler (Key 2)
 
+> **NOTE:** A basic ListOffsets handler was added in `08-produce.md` to support
+> produce-consume integration tests. It lives in `internal/handler/list_offsets.go`
+> and handles the core case (resolve -1/-2/-3 and timestamp lookups). This task
+> should **extend** that handler with any additional edge cases, validation,
+> and integration tests listed below.
+
 After this work unit, clients can resolve special timestamp values to concrete
 offsets. Used by consumers on startup to find where to begin reading.
 

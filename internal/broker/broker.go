@@ -69,6 +69,9 @@ func (b *Broker) registerBaseHandlers() {
 // registerRuntimeHandlers wires up handlers that depend on runtime state
 // (cluster ID, advertised address, etc.). Must be called after initialization.
 func (b *Broker) registerRuntimeHandlers(advAddr string) {
+	b.handlers.Register(0, handler.HandleProduce(b.state))
+	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh))
+	b.handlers.Register(2, handler.HandleListOffsets(b.state))
 	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
 		NodeID:         b.cfg.NodeID,
 		AdvertisedAddr: advAddr,

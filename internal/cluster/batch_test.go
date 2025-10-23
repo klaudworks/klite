@@ -70,7 +70,7 @@ func TestParseBatchHeader(t *testing.T) {
 			10,         // numRecords
 		)
 
-		meta, err := parseBatchHeader(raw)
+		meta, err := ParseBatchHeader(raw)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -113,17 +113,17 @@ func TestParseBatchHeader(t *testing.T) {
 	t.Run("too short", func(t *testing.T) {
 		t.Parallel()
 		raw := make([]byte, 60) // 1 byte short
-		_, err := parseBatchHeader(raw)
-		if err != errShortBatch {
-			t.Errorf("expected errShortBatch, got %v", err)
+		_, err := ParseBatchHeader(raw)
+		if err != ErrShortBatch {
+			t.Errorf("expected ErrShortBatch, got %v", err)
 		}
 	})
 
 	t.Run("empty slice", func(t *testing.T) {
 		t.Parallel()
-		_, err := parseBatchHeader(nil)
-		if err != errShortBatch {
-			t.Errorf("expected errShortBatch, got %v", err)
+		_, err := ParseBatchHeader(nil)
+		if err != ErrShortBatch {
+			t.Errorf("expected ErrShortBatch, got %v", err)
 		}
 	})
 
@@ -132,7 +132,7 @@ func TestParseBatchHeader(t *testing.T) {
 		raw := makeBatchBytes(
 			-1, -1, -1, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1,
 		)
-		meta, err := parseBatchHeader(raw)
+		meta, err := ParseBatchHeader(raw)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -152,7 +152,7 @@ func TestParseBatchHeader(t *testing.T) {
 		raw := make([]byte, 200)
 		raw[16] = 2 // magic
 		binary.BigEndian.PutUint32(raw[57:61], 5)
-		meta, err := parseBatchHeader(raw)
+		meta, err := ParseBatchHeader(raw)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
