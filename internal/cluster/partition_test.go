@@ -595,13 +595,14 @@ func TestNotifyWaiters(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
-		ch := pd.RegisterWaiter()
+		w := NewFetchWaiter()
+		pd.RegisterWaiter(w)
 
 		// NotifyWaiters should close the channel
 		pd.NotifyWaiters()
 
 		select {
-		case <-ch:
+		case <-w.Ch():
 			// OK - channel was closed
 		default:
 			t.Error("waiter channel was not closed")
@@ -612,15 +613,18 @@ func TestNotifyWaiters(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
-		ch1 := pd.RegisterWaiter()
-		ch2 := pd.RegisterWaiter()
-		ch3 := pd.RegisterWaiter()
+		w1 := NewFetchWaiter()
+		w2 := NewFetchWaiter()
+		w3 := NewFetchWaiter()
+		pd.RegisterWaiter(w1)
+		pd.RegisterWaiter(w2)
+		pd.RegisterWaiter(w3)
 
 		pd.NotifyWaiters()
 
-		for i, ch := range []<-chan struct{}{ch1, ch2, ch3} {
+		for i, w := range []*FetchWaiter{w1, w2, w3} {
 			select {
-			case <-ch:
+			case <-w.Ch():
 				// OK
 			default:
 				t.Errorf("waiter %d channel was not closed", i)
@@ -641,14 +645,38 @@ func TestNotifyWaiters(t *testing.T) {
 
 		pd.NotifyWaiters() // notify with no waiters
 
-		ch := pd.RegisterWaiter()
+		w := NewFetchWaiter()
+		pd.RegisterWaiter(w)
 
 		select {
-		case <-ch:
+		case <-w.Ch():
 			t.Error("new waiter should not be immediately woken")
 		default:
 			// OK - channel is still open
 		}
+	})
+
+	t.Run("shared waiter across partitions", func(t *testing.T) {
+		t.Parallel()
+		pd1 := newTestPartition()
+		pd2 := newTestPartition()
+
+		// Register the same waiter on two partitions
+		w := NewFetchWaiter()
+		pd1.RegisterWaiter(w)
+		pd2.RegisterWaiter(w)
+
+		// Notifying one partition should wake the shared waiter
+		pd1.NotifyWaiters()
+		select {
+		case <-w.Ch():
+			// OK
+		default:
+			t.Error("shared waiter should be woken by first partition")
+		}
+
+		// Notifying the second partition should not panic (sync.Once protects double-close)
+		pd2.NotifyWaiters()
 	})
 }
 

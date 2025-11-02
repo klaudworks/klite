@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"time"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -10,9 +12,10 @@ import (
 // HandleFetch returns the Fetch handler (API key 1).
 // Supports v4-16.
 //
-// This is a minimal implementation for Phase 1 that serves available data
-// without long-polling. Task 09-fetch will add long-polling, size limits,
-// fetch sessions, and full KIP-74 behavior.
+// Implements long-polling (MaxWaitMs/MinBytes), size limits (MaxBytes,
+// PartitionMaxBytes), KIP-74 (first batch always returned even if oversized),
+// fetch sessions (FETCH_SESSION_ID_NOT_FOUND for non-zero), and TopicID
+// resolution for v13+.
 func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.FetchRequest)
@@ -25,56 +28,76 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 		}
 
 		// Fetch sessions: return FETCH_SESSION_ID_NOT_FOUND for non-zero session ID.
-		// This forces clients to fall back to full fetches.
+		// This forces clients to fall back to full fetches (Phase 1 simplification).
 		if r.SessionID != 0 {
 			resp.ErrorCode = 70 // FETCH_SESSION_ID_NOT_FOUND
 			return resp, nil
 		}
 
-		for _, rt := range r.Topics {
-			st := kmsg.NewFetchResponseTopic()
-			st.Topic = rt.Topic
-			if r.Version >= 13 {
-				st.TopicID = rt.TopicID
-			}
+		// Resolve all topics and partitions upfront.
+		type partFetchInfo struct {
+			td          *cluster.TopicData
+			pd          *cluster.PartData
+			topicIdx    int // index into r.Topics
+			partIdx     int // index into r.Topics[topicIdx].Partitions
+			topicName   string
+			topicID     [16]byte
+			partitionID int32
+		}
 
+		var allParts []partFetchInfo
+
+		for ti, rt := range r.Topics {
 			// Resolve topic
 			var td *cluster.TopicData
 			if r.Version >= 13 && rt.TopicID != [16]byte{} {
-				// Topic ID lookup - scan all topics
-				for _, t := range state.GetAllTopics() {
-					if t.ID == rt.TopicID {
-						td = t
-						break
-					}
-				}
+				td = state.GetTopicByID(rt.TopicID)
 			} else {
 				td = state.GetTopic(rt.Topic)
 			}
 
-			for _, rp := range rt.Partitions {
+			for pi, rp := range rt.Partitions {
+				info := partFetchInfo{
+					td:          td,
+					topicIdx:    ti,
+					partIdx:     pi,
+					topicName:   rt.Topic,
+					topicID:     rt.TopicID,
+					partitionID: rp.Partition,
+				}
+				if td != nil && int(rp.Partition) >= 0 && int(rp.Partition) < len(td.Partitions) {
+					info.pd = td.Partitions[rp.Partition]
+				}
+				allParts = append(allParts, info)
+			}
+		}
+
+		// Perform the initial fetch and check if we need to long-poll.
+		type partResult struct {
+			sp       kmsg.FetchResponseTopicPartition
+			hasData  bool
+			dataSize int
+		}
+
+		doFetch := func() ([]partResult, int) {
+			results := make([]partResult, len(allParts))
+			totalBytes := 0
+
+			for i, info := range allParts {
 				sp := kmsg.NewFetchResponseTopicPartition()
-				sp.Partition = rp.Partition
+				sp.Partition = info.partitionID
 
-				if td == nil {
+				if info.td == nil || info.pd == nil {
 					sp.ErrorCode = kerr.UnknownTopicOrPartition.Code
 					sp.HighWatermark = -1
 					sp.LastStableOffset = -1
 					sp.LogStartOffset = -1
-					st.Partitions = append(st.Partitions, sp)
+					results[i] = partResult{sp: sp}
 					continue
 				}
 
-				if int(rp.Partition) < 0 || int(rp.Partition) >= len(td.Partitions) {
-					sp.ErrorCode = kerr.UnknownTopicOrPartition.Code
-					sp.HighWatermark = -1
-					sp.LastStableOffset = -1
-					sp.LogStartOffset = -1
-					st.Partitions = append(st.Partitions, sp)
-					continue
-				}
-
-				pd := td.Partitions[rp.Partition]
+				pd := info.pd
+				rp := r.Topics[info.topicIdx].Partitions[info.partIdx]
 
 				pd.RLock()
 				hw := pd.HW()
@@ -86,13 +109,13 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 					pd.RUnlock()
 					sp.ErrorCode = kerr.OffsetOutOfRange.Code
 					sp.HighWatermark = hw
-					sp.LastStableOffset = hw // no transactions, LSO = HW
+					sp.LastStableOffset = hw
 					sp.LogStartOffset = logStart
-					st.Partitions = append(st.Partitions, sp)
+					results[i] = partResult{sp: sp}
 					continue
 				}
 
-				// Fetch batches
+				// Fetch batches with per-partition size limit
 				maxBytes := rp.PartitionMaxBytes
 				if maxBytes <= 0 {
 					maxBytes = 1024 * 1024 // 1MB default
@@ -105,22 +128,92 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 				sp.LogStartOffset = logStart
 
 				// Serialize batch data into Records
+				dataSize := 0
 				if len(batches) > 0 {
-					var totalSize int
 					for _, b := range batches {
-						totalSize += len(b.RawBytes)
+						dataSize += len(b.RawBytes)
 					}
-					records := make([]byte, 0, totalSize)
+					records := make([]byte, 0, dataSize)
 					for _, b := range batches {
 						records = append(records, b.RawBytes...)
 					}
 					sp.RecordBatches = records
 				}
 
-				st.Partitions = append(st.Partitions, sp)
+				results[i] = partResult{sp: sp, hasData: dataSize > 0, dataSize: dataSize}
+				totalBytes += dataSize
 			}
 
-			resp.Topics = append(resp.Topics, st)
+			return results, totalBytes
+		}
+
+		results, totalBytes := doFetch()
+
+		// Long-polling: if we have less than MinBytes and MaxWaitMs > 0, wait
+		// for new data or timeout.
+		if int32(totalBytes) < r.MinBytes && r.MaxWaitMillis > 0 {
+			// Create a shared waiter and register on partitions that had no data
+			w := cluster.NewFetchWaiter()
+			for i, info := range allParts {
+				if info.pd != nil && !results[i].hasData && results[i].sp.ErrorCode == 0 {
+					info.pd.RegisterWaiter(w)
+				}
+			}
+
+			// Block until woken, timeout, or shutdown
+			timer := time.NewTimer(time.Duration(r.MaxWaitMillis) * time.Millisecond)
+			select {
+			case <-w.Ch():
+				// Woken by produce — re-fetch all partitions below
+			case <-timer.C:
+				// Timeout — return whatever we had from the initial fetch
+			case <-shutdownCh:
+				// Broker shutting down
+			}
+			timer.Stop()
+
+			// Re-fetch ALL partitions (not just the one that woke us)
+			results, totalBytes = doFetch()
+		}
+
+		// Apply response-level MaxBytes across all partitions.
+		// Iterate through partitions and trim when we exceed MaxBytes,
+		// but always include at least one complete partition's data (KIP-74).
+		if r.MaxBytes > 0 {
+			var responseTotalBytes int32
+			firstPartitionWithData := true
+			for i := range results {
+				dataSize := int32(results[i].dataSize)
+				if dataSize == 0 {
+					continue
+				}
+				if !firstPartitionWithData && responseTotalBytes+dataSize > r.MaxBytes {
+					// Trim this partition's data to fit
+					results[i].sp.RecordBatches = nil
+					results[i].dataSize = 0
+					continue
+				}
+				responseTotalBytes += dataSize
+				firstPartitionWithData = false
+			}
+		}
+
+		// Build the response
+		// Group results back into topic responses
+		topicMap := make(map[int]int) // topicIdx -> index in resp.Topics
+		for i, info := range allParts {
+			tidx, exists := topicMap[info.topicIdx]
+			if !exists {
+				st := kmsg.NewFetchResponseTopic()
+				st.Topic = info.topicName
+				if r.Version >= 13 {
+					st.TopicID = info.topicID
+				}
+				tidx = len(resp.Topics)
+				topicMap[info.topicIdx] = tidx
+				resp.Topics = append(resp.Topics, st)
+			}
+			resp.Topics[tidx].Partitions = append(resp.Topics[tidx].Partitions, results[i].sp)
 		}
 
 		return resp, nil
