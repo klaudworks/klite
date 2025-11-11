@@ -254,14 +254,16 @@ func (pd *PartData) ListOffsets(timestamp int64) (offset int64, ts int64) {
 		return pd.logStart, -1
 	case -3: // MaxTimestamp (KIP-734)
 		if len(pd.batches) == 0 || pd.maxTimestampBatchIdx < 0 {
-			return pd.logStart, -1
+			return -1, -1
 		}
 		b := &pd.batches[pd.maxTimestampBatchIdx]
-		// Return the offset AFTER the batch (next offset), as per Kafka spec for MaxTimestamp
-		return b.BaseOffset + int64(b.LastOffsetDelta) + 1, b.MaxTimestamp
+		// Return the last offset in the batch with the max timestamp.
+		// Kafka returns the exact record offset, but since we don't decompress
+		// batches, we return the last offset in the batch (matches kfake).
+		return b.BaseOffset + int64(b.LastOffsetDelta), b.MaxTimestamp
 	default: // timestamp >= 0: find first batch with MaxTimestamp >= timestamp
 		if len(pd.batches) == 0 {
-			return pd.hw, -1
+			return -1, -1
 		}
 
 		// Linear scan — batches are in offset order, timestamps may not be
@@ -273,8 +275,8 @@ func (pd *PartData) ListOffsets(timestamp int64) (offset int64, ts int64) {
 			}
 		}
 
-		// No batch has timestamp >= requested: return HW
-		return pd.hw, -1
+		// No batch has timestamp >= requested: return -1 (not found)
+		return -1, -1
 	}
 }
 
