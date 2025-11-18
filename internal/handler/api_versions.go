@@ -18,6 +18,9 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 3, MinVersion: 4, MaxVersion: 12},  // Metadata
 	{ApiKey: 18, MinVersion: 0, MaxVersion: 4},  // ApiVersions
 	{ApiKey: 19, MinVersion: 2, MaxVersion: 7},  // CreateTopics
+
+	// Phase 2: Consumer groups
+	{ApiKey: 10, MinVersion: 0, MaxVersion: 6}, // FindCoordinator
 }
 
 // apiVersionsMap is a lookup table built from apiVersions for fast version
