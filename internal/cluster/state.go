@@ -1,19 +1,25 @@
 package cluster
 
 import (
+	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// State holds all in-memory cluster state: topics, partitions, offsets.
+// State holds all in-memory cluster state: topics, partitions, offsets, groups.
 // Protected by a RWMutex for concurrent access.
 type State struct {
 	mu     sync.RWMutex
 	topics map[string]*TopicData // topic name -> topic
 	tnorms map[string]string     // normalized name -> actual topic name (collision detection)
+	groups map[string]*Group     // group ID -> group
 	cfg    Config
+
+	shutdownCh <-chan struct{}
+	logger     *slog.Logger
 }
 
 // Config holds cluster-level configuration relevant to state management.
@@ -28,8 +34,20 @@ func NewState(cfg Config) *State {
 	return &State{
 		topics: make(map[string]*TopicData),
 		tnorms: make(map[string]string),
+		groups: make(map[string]*Group),
 		cfg:    cfg,
+		logger: slog.Default(),
 	}
+}
+
+// SetShutdownCh sets the shutdown channel used by group goroutines.
+func (s *State) SetShutdownCh(ch <-chan struct{}) {
+	s.shutdownCh = ch
+}
+
+// SetLogger sets the logger used by group goroutines.
+func (s *State) SetLogger(l *slog.Logger) {
+	s.logger = l
 }
 
 // NormalizeTopicName normalizes a topic name for collision detection.
@@ -212,3 +230,128 @@ func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 }
 
 // PartData and StoredBatch are defined in partition.go.
+
+// GetOrCreateGroup returns an existing group, or creates a new one.
+// The group's manage goroutine is started on creation.
+func (s *State) GetOrCreateGroup(groupID string) *Group {
+	s.mu.RLock()
+	g, ok := s.groups[groupID]
+	s.mu.RUnlock()
+	if ok {
+		return g
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Double-check after acquiring write lock
+	if g, ok := s.groups[groupID]; ok {
+		return g
+	}
+	g = NewGroup(groupID, s.shutdownCh, s.logger)
+	s.groups[groupID] = g
+	return g
+}
+
+// GetGroup returns the group with the given ID, or nil if not found.
+func (s *State) GetGroup(groupID string) *Group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.groups[groupID]
+}
+
+// GetAllGroups returns a snapshot of all current groups.
+func (s *State) GetAllGroups() []*Group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*Group, 0, len(s.groups))
+	for _, g := range s.groups {
+		result = append(result, g)
+	}
+	return result
+}
+
+// DeleteGroup removes a group by ID and stops its goroutine.
+func (s *State) DeleteGroup(groupID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.groups[groupID]
+	if ok {
+		g.Stop()
+		delete(s.groups, groupID)
+	}
+	return ok
+}
+
+// AddPartitions increases the partition count for a topic to newCount.
+// If newCount <= current count, this is a no-op.
+func (s *State) AddPartitions(topicName string, newCount int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	td, ok := s.topics[topicName]
+	if !ok {
+		return
+	}
+	current := len(td.Partitions)
+	if newCount <= current {
+		return
+	}
+	for i := current; i < newCount; i++ {
+		td.Partitions = append(td.Partitions, &PartData{
+			Topic:                topicName,
+			Index:                int32(i),
+			maxTimestampBatchIdx: -1,
+		})
+	}
+}
+
+// SetTopicConfig sets a single config key on a topic.
+func (s *State) SetTopicConfig(topicName, key, value string) {
+	s.mu.RLock()
+	td, ok := s.topics[topicName]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	td.Configs[key] = value
+}
+
+// DeleteTopicConfig removes a single config override from a topic.
+func (s *State) DeleteTopicConfig(topicName, key string) {
+	s.mu.RLock()
+	td, ok := s.topics[topicName]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	delete(td.Configs, key)
+}
+
+// ReplaceTopicConfigs replaces all topic configs with the provided set.
+// Configs not in the provided set revert to defaults (removed from overrides).
+func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfigsRequestResourceConfig) {
+	s.mu.RLock()
+	td, ok := s.topics[topicName]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	// Clear existing overrides
+	for k := range td.Configs {
+		delete(td.Configs, k)
+	}
+	// Apply new ones
+	for _, c := range configs {
+		if c.Value != nil {
+			td.Configs[c.Name] = *c.Value
+		}
+	}
+}
+
+// StopAllGroups stops all group goroutines. Called during broker shutdown.
+func (s *State) StopAllGroups() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range s.groups {
+		g.Stop()
+	}
+}

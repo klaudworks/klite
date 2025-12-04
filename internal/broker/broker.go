@@ -46,6 +46,8 @@ func New(cfg Config) *Broker {
 		DefaultPartitions: cfg.DefaultPartitions,
 		AutoCreateTopics:  cfg.AutoCreateTopics,
 	})
+	state.SetShutdownCh(shutdownCh)
+	state.SetLogger(logger)
 
 	b := &Broker{
 		cfg:        cfg,
@@ -82,6 +84,34 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 	b.handlers.Register(10, handler.HandleFindCoordinator(handler.FindCoordinatorConfig{
 		NodeID:         b.cfg.NodeID,
 		AdvertisedAddr: advAddr,
+	}))
+	b.handlers.Register(8, handler.HandleOffsetCommit(b.state))
+	b.handlers.Register(9, handler.HandleOffsetFetch(b.state))
+	b.handlers.Register(11, handler.HandleJoinGroup(b.state))
+	b.handlers.Register(12, handler.HandleHeartbeat(b.state))
+	b.handlers.Register(13, handler.HandleLeaveGroup(b.state))
+	b.handlers.Register(14, handler.HandleSyncGroup(b.state))
+	b.handlers.Register(47, handler.HandleOffsetDelete(b.state))
+
+	// Phase 3: Admin APIs
+	b.handlers.Register(15, handler.HandleDescribeGroups(b.state))
+	b.handlers.Register(16, handler.HandleListGroups(b.state))
+	b.handlers.Register(20, handler.HandleDeleteTopics(b.state))
+	b.handlers.Register(21, handler.HandleDeleteRecords(b.state))
+	b.handlers.Register(23, handler.HandleOffsetForLeaderEpoch(b.state))
+	b.handlers.Register(32, handler.HandleDescribeConfigs(handler.DescribeConfigsConfig{
+		NodeID: b.cfg.NodeID,
+		State:  b.state,
+	}))
+	b.handlers.Register(33, handler.HandleAlterConfigs(b.state))
+	b.handlers.Register(35, handler.HandleDescribeLogDirs(b.state, b.cfg.DataDir))
+	b.handlers.Register(37, handler.HandleCreatePartitions(b.state))
+	b.handlers.Register(42, handler.HandleDeleteGroups(b.state))
+	b.handlers.Register(44, handler.HandleIncrementalAlterConfigs(b.state))
+	b.handlers.Register(60, handler.HandleDescribeCluster(handler.DescribeClusterConfig{
+		NodeID:         b.cfg.NodeID,
+		AdvertisedAddr: advAddr,
+		ClusterID:      b.clusterID,
 	}))
 }
 
@@ -161,6 +191,9 @@ func (b *Broker) Run(ctx context.Context) error {
 
 	// 10. Wait for all connections to drain
 	b.server.Wait()
+
+	// 11. Stop all group goroutines
+	b.state.StopAllGroups()
 
 	b.logger.Info("klite stopped")
 	return nil

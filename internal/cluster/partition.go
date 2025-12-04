@@ -285,3 +285,55 @@ func (pd *PartData) ListOffsets(timestamp int64) (offset int64, ts int64) {
 func (pd *PartData) BatchCount() int {
 	return len(pd.batches)
 }
+
+// TotalBytes returns the total bytes of stored batch data.
+// Caller must hold pd.mu.RLock().
+func (pd *PartData) TotalBytes() int64 {
+	var total int64
+	for i := range pd.batches {
+		total += int64(len(pd.batches[i].RawBytes))
+	}
+	return total
+}
+
+// AdvanceLogStart advances the log start offset to the given value,
+// trimming any batches that are entirely before the new log start.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) AdvanceLogStart(offset int64) {
+	if offset <= pd.logStart {
+		return
+	}
+	if offset > pd.hw {
+		offset = pd.hw
+	}
+	pd.logStart = offset
+
+	// Trim batches whose last offset is before the new logStart
+	trimIdx := 0
+	for trimIdx < len(pd.batches) {
+		b := &pd.batches[trimIdx]
+		lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+		if lastOffset < offset {
+			trimIdx++
+		} else {
+			break
+		}
+	}
+
+	if trimIdx > 0 {
+		// Release trimmed batch memory
+		copy(pd.batches, pd.batches[trimIdx:])
+		for i := len(pd.batches) - trimIdx; i < len(pd.batches); i++ {
+			pd.batches[i] = StoredBatch{} // zero out for GC
+		}
+		pd.batches = pd.batches[:len(pd.batches)-trimIdx]
+
+		// Recalculate maxTimestampBatchIdx
+		pd.maxTimestampBatchIdx = -1
+		for i := range pd.batches {
+			if pd.maxTimestampBatchIdx < 0 || pd.batches[i].MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
+				pd.maxTimestampBatchIdx = i
+			}
+		}
+	}
+}
