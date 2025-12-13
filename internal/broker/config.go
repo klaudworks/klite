@@ -19,6 +19,13 @@ type Config struct {
 	AutoCreateTopics  bool
 	LogLevel          string
 
+	// WAL configuration (Phase 3)
+	WALEnabled         bool   // Enable WAL persistence (default false)
+	WALSyncIntervalMs  int    // Fsync batch window in milliseconds (default 2)
+	WALSegmentMaxBytes int64  // Max segment size before rotation (default 64 MiB)
+	WALMaxDiskSize     int64  // Max total WAL on disk (default 1 GiB)
+	RingBufferMaxMem   int64  // Global memory budget for ring buffers (default 512 MiB)
+
 	// Listener allows injecting a pre-created listener (for tests).
 	// If non-nil, the broker uses this instead of opening Listen.
 	Listener net.Listener

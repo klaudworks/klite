@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/wal"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -20,6 +21,11 @@ type State struct {
 
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
+
+	// WAL-related state (Phase 3+)
+	walWriter      *wal.Writer
+	walIndex       *wal.Index
+	ringBufferMem  int64 // global memory budget for ring buffers
 }
 
 // Config holds cluster-level configuration relevant to state management.
@@ -48,6 +54,36 @@ func (s *State) SetShutdownCh(ch <-chan struct{}) {
 // SetLogger sets the logger used by group goroutines.
 func (s *State) SetLogger(l *slog.Logger) {
 	s.logger = l
+}
+
+// SetWALConfig configures the cluster state for WAL mode.
+// All existing partitions get ring buffers initialized.
+func (s *State) SetWALConfig(w *wal.Writer, idx *wal.Index, ringBufferMem int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.walWriter = w
+	s.walIndex = idx
+	s.ringBufferMem = ringBufferMem
+
+	// Initialize ring buffers for all existing partitions
+	totalPartitions := 0
+	for _, td := range s.topics {
+		totalPartitions += len(td.Partitions)
+	}
+
+	slots := CalcRingSlots(ringBufferMem, totalPartitions, 16*1024)
+
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			ring := NewRingBuffer(slots)
+			pd.InitWAL(ring, w, idx)
+		}
+	}
+}
+
+// HasWAL returns whether WAL is configured.
+func (s *State) HasWAL() bool {
+	return s.walWriter != nil
 }
 
 // NormalizeTopicName normalizes a topic name for collision detection.
@@ -115,6 +151,12 @@ func (s *State) CreateTopic(name string, numPartitions int) (*TopicData, bool) {
 	td := newTopicData(name, numPartitions, s.cfg.NodeID)
 	s.topics[name] = td
 	s.tnorms[NormalizeTopicName(name)] = name
+
+	// Initialize WAL on new partitions if WAL is enabled
+	if s.walWriter != nil {
+		s.initPartitionsWAL(td)
+	}
+
 	return td, true
 }
 
@@ -135,6 +177,12 @@ func (s *State) CreateTopicWithConfigs(name string, numPartitions int, configs m
 	}
 	s.topics[name] = td
 	s.tnorms[NormalizeTopicName(name)] = name
+
+	// Initialize WAL on new partitions if WAL is enabled
+	if s.walWriter != nil {
+		s.initPartitionsWAL(td)
+	}
+
 	return td, true
 }
 
@@ -217,6 +265,7 @@ func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 		partitions[i] = &PartData{
 			Topic:                name,
 			Index:                int32(i),
+			TopicID:              topicID,
 			maxTimestampBatchIdx: -1,
 		}
 	}
@@ -296,11 +345,19 @@ func (s *State) AddPartitions(topicName string, newCount int) {
 		return
 	}
 	for i := current; i < newCount; i++ {
-		td.Partitions = append(td.Partitions, &PartData{
+		pd := &PartData{
 			Topic:                topicName,
 			Index:                int32(i),
+			TopicID:              td.ID,
 			maxTimestampBatchIdx: -1,
-		})
+		}
+		if s.walWriter != nil {
+			totalPartitions := s.countPartitions() + (newCount - current)
+			slots := CalcRingSlots(s.ringBufferMem, totalPartitions, 16*1024)
+			ring := NewRingBuffer(slots)
+			pd.InitWAL(ring, s.walWriter, s.walIndex)
+		}
+		td.Partitions = append(td.Partitions, pd)
 	}
 }
 
@@ -354,4 +411,26 @@ func (s *State) StopAllGroups() {
 	for _, g := range s.groups {
 		g.Stop()
 	}
+}
+
+// initPartitionsWAL initializes ring buffers and WAL references on all partitions of a topic.
+// Caller must hold s.mu.Lock().
+func (s *State) initPartitionsWAL(td *TopicData) {
+	totalPartitions := s.countPartitions()
+	slots := CalcRingSlots(s.ringBufferMem, totalPartitions, 16*1024)
+
+	for _, pd := range td.Partitions {
+		ring := NewRingBuffer(slots)
+		pd.InitWAL(ring, s.walWriter, s.walIndex)
+	}
+}
+
+// countPartitions returns the total number of partitions across all topics.
+// Caller must hold s.mu.RLock() or s.mu.Lock().
+func (s *State) countPartitions() int {
+	total := 0
+	for _, td := range s.topics {
+		total += len(td.Partitions)
+	}
+	return total
 }

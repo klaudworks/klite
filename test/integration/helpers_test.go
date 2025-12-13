@@ -32,6 +32,21 @@ func WithDefaultPartitions(n int) BrokerOpt {
 	return func(c *broker.Config) { c.DefaultPartitions = n }
 }
 
+// WithWALEnabled enables or disables WAL persistence.
+func WithWALEnabled(v bool) BrokerOpt {
+	return func(c *broker.Config) { c.WALEnabled = v }
+}
+
+// WithDataDir sets the data directory (for restart tests using the same dir).
+func WithDataDir(dir string) BrokerOpt {
+	return func(c *broker.Config) { c.DataDir = dir }
+}
+
+// WithRingBufferMaxMem sets the global ring buffer memory budget.
+func WithRingBufferMaxMem(n int64) BrokerOpt {
+	return func(c *broker.Config) { c.RingBufferMaxMem = n }
+}
+
 // StartBroker starts a klite broker in-process on a random port.
 // Registers cleanup with t.Cleanup().
 func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
