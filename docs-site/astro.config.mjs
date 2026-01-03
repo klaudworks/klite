@@ -10,8 +10,30 @@ export default defineConfig({
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/kliteio/klite' }],
 			sidebar: [
 				{
+					label: 'Getting Started',
+					items: [
+						{ label: 'Quickstart', slug: 'guides/getting-started' },
+					],
+				},
+				{
+					label: 'Deployment',
+					items: [
+						{ label: 'Docker', slug: 'guides/docker' },
+						{ label: 'Kubernetes & Helm', slug: 'guides/kubernetes' },
+					],
+				},
+				{
+					label: 'Concepts',
+					autogenerate: { directory: 'concepts' },
+				},
+				{
 					label: 'Guides',
-					autogenerate: { directory: 'guides' },
+					items: [
+						{ label: 'Consumer Groups', slug: 'guides/consumer-groups' },
+						{ label: 'Migrating from Kafka', slug: 'guides/migrating-from-kafka' },
+						{ label: 'Monitoring', slug: 'guides/monitoring' },
+						{ label: 'Troubleshooting', slug: 'guides/troubleshooting' },
+					],
 				},
 				{
 					label: 'Reference',
