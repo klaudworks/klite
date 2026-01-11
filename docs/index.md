@@ -9,7 +9,7 @@ hero:
       link: /guides/getting-started/
       icon: right-arrow
     - text: GitHub
-      link: https://github.com/kliteio/klite
+      link: https://github.com/klaudworks/klite
       icon: external
       variant: minimal
 ---
@@ -18,7 +18,7 @@ hero:
 
 ```bash
 # Download
-curl -L https://github.com/kliteio/klite/releases/latest/download/klite-$(uname -s | tr A-Z a-z)-$(uname -m) -o klite && chmod +x klite
+curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-$(uname -s | tr A-Z a-z)-$(uname -m) -o klite && chmod +x klite
 
 # Start
 ./klite

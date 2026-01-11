@@ -11,16 +11,16 @@ klite is a Kafka-compatible broker in a single Go binary. This guide gets you fr
 
 ```bash
 # macOS (Apple Silicon)
-curl -L https://github.com/kliteio/klite/releases/latest/download/klite-darwin-arm64 -o klite
+curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-darwin-arm64 -o klite
 
 # macOS (Intel)
-curl -L https://github.com/kliteio/klite/releases/latest/download/klite-darwin-amd64 -o klite
+curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-darwin-amd64 -o klite
 
 # Linux (amd64)
-curl -L https://github.com/kliteio/klite/releases/latest/download/klite-linux-amd64 -o klite
+curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-linux-amd64 -o klite
 
 # Linux (arm64)
-curl -L https://github.com/kliteio/klite/releases/latest/download/klite-linux-arm64 -o klite
+curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-linux-arm64 -o klite
 
 chmod +x klite
 ```

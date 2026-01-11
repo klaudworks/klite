@@ -7,7 +7,7 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'klite',
-			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/kliteio/klite' }],
+			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/klaudworks/klite' }],
 			sidebar: [
 				{
 					label: 'Getting Started',

@@ -133,7 +133,7 @@ export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 # ... start your app
 ```
 
-If you encounter a compatibility issue, check [Troubleshooting](/guides/troubleshooting/) or [open an issue](https://github.com/kliteio/klite/issues).
+If you encounter a compatibility issue, check [Troubleshooting](/guides/troubleshooting/) or [open an issue](https://github.com/klaudworks/klite/issues).
 
 ## Next steps
 
