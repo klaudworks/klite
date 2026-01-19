@@ -31,7 +31,7 @@ kcat -C -b localhost:9092 -t my-topic -e
 Or with Docker:
 
 ```bash
-docker run -p 9092:9092 ghcr.io/kliteio/klite
+docker run -p 9092:9092 ghcr.io/klaudworks/klite
 ```
 
 ## Why klite?

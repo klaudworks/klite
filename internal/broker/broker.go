@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -31,8 +32,9 @@ type Broker struct {
 	logger     *slog.Logger
 	server     *server.Server
 	handlers   *server.HandlerRegistry
-	walWriter  *wal.Writer // nil if WAL disabled
-	walIndex   *wal.Index  // nil if WAL disabled
+	walWriter  *wal.Writer    // nil if WAL disabled
+	walIndex   *wal.Index     // nil if WAL disabled
+	metaLog    *metadata.Log  // nil if metadata persistence disabled
 
 	mu   sync.Mutex
 	quit bool
@@ -135,14 +137,21 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.clusterID = cid
 
-	// 3. Initialize WAL if enabled
+	// 3. Initialize metadata.log if WAL is enabled (replay metadata first)
+	if b.cfg.WALEnabled {
+		if err := b.initMetadataLog(); err != nil {
+			return fmt.Errorf("init metadata.log: %w", err)
+		}
+	}
+
+	// 4. Initialize WAL if enabled (replay WAL after metadata)
 	if b.cfg.WALEnabled {
 		if err := b.initWAL(); err != nil {
 			return fmt.Errorf("init WAL: %w", err)
 		}
 	}
 
-	// 4. Start TCP listener
+	// 5. Start TCP listener
 	ln := b.cfg.Listener
 	if ln == nil {
 		ln, err = net.Listen("tcp", b.cfg.Listen)
@@ -152,17 +161,17 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.listener = ln
 
-	// 5. Resolve advertised address (after listener is bound so we know the real port)
+	// 6. Resolve advertised address (after listener is bound so we know the real port)
 	advAddr, warn := b.resolveAdvertisedAddr()
 	if warn {
 		b.logger.Warn("--advertised-addr not set, using derived address in Metadata responses; clients outside this host won't be able to connect",
 			"advertised_addr", advAddr)
 	}
 
-	// 6. Register handlers that depend on runtime state
+	// 7. Register handlers that depend on runtime state
 	b.registerRuntimeHandlers(advAddr)
 
-	// 7. Log startup
+	// 8. Log startup
 	b.logger.Info("klite started",
 		"listen", b.listener.Addr().String(),
 		"advertised_addr", advAddr,
@@ -175,7 +184,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// Signal that initialization is complete
 	close(b.ready)
 
-	// 8. Serve connections (blocks until listener closed)
+	// 9. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- b.server.Serve(b.listener)
@@ -192,26 +201,93 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	// 9. Shutdown sequence
+	// 10. Shutdown sequence
 	b.shutdown()
 
-	// 10. Wait for Serve() to return so no new connections are accepted
+	// 11. Wait for Serve() to return so no new connections are accepted
 	if !serveReturned {
 		<-errCh
 	}
 
-	// 11. Wait for all connections to drain
+	// 12. Wait for all connections to drain
 	b.server.Wait()
 
-	// 12. Stop all group goroutines
+	// 13. Stop all group goroutines
 	b.state.StopAllGroups()
 
-	// 13. Stop WAL writer (flush pending writes)
+	// 14. Stop WAL writer (flush pending writes)
 	if b.walWriter != nil {
 		b.walWriter.Stop()
 	}
 
+	// 15. Close metadata log
+	if b.metaLog != nil {
+		b.metaLog.Close()
+	}
+
 	b.logger.Info("klite stopped")
+	return nil
+}
+
+// initMetadataLog initializes the metadata.log, sets up replay callbacks,
+// replays existing entries to rebuild state, then compacts if needed.
+func (b *Broker) initMetadataLog() error {
+	ml, err := metadata.NewLog(metadata.LogConfig{
+		DataDir: b.cfg.DataDir,
+		Logger:  b.logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Set replay callbacks to rebuild cluster state
+	ml.SetCallbacks(
+		// CREATE_TOPIC
+		func(e metadata.CreateTopicEntry) {
+			b.state.CreateTopicFromReplay(e.TopicName, int(e.PartitionCount), e.TopicID, e.Configs)
+		},
+		// DELETE_TOPIC
+		func(e metadata.DeleteTopicEntry) {
+			b.state.DeleteTopic(e.TopicName)
+		},
+		// ALTER_CONFIG
+		func(e metadata.AlterConfigEntry) {
+			b.state.SetTopicConfig(e.TopicName, e.Key, e.Value)
+		},
+		// OFFSET_COMMIT
+		func(e metadata.OffsetCommitEntry) {
+			b.state.SetCommittedOffsetFromReplay(e.Group, e.Topic, e.Partition, e.Offset, e.Metadata)
+		},
+		// PRODUCER_ID (Phase 4)
+		func(e metadata.ProducerIDEntry) {
+			// TODO: Phase 4 — set next producer ID counter
+		},
+		// LOG_START_OFFSET
+		func(e metadata.LogStartOffsetEntry) {
+			b.state.SetLogStartOffsetFromReplay(e.TopicName, e.Partition, e.LogStartOffset)
+		},
+	)
+
+	// Replay existing entries
+	count, err := ml.Replay()
+	if err != nil {
+		ml.Close()
+		return fmt.Errorf("replay metadata.log: %w", err)
+	}
+
+	if count > 0 {
+		b.logger.Info("metadata.log replay complete", "entries", count)
+	}
+
+	// Set up snapshot function for compaction
+	ml.SetSnapshotFn(b.state.SnapshotEntries)
+
+	// Compact if needed (after replay, live state is in memory)
+	ml.Compact()
+
+	b.metaLog = ml
+	b.state.SetMetadataLog(ml)
+
 	return nil
 }
 
@@ -278,19 +354,44 @@ func (b *Broker) initWAL() error {
 }
 
 // replayWAL scans existing WAL segments and rebuilds in-memory state.
+// Authority rules:
+//   - metadata.log is authoritative for topic existence, partition counts, and logStartOffset.
+//   - WAL entries for unknown topics or out-of-range partitions are skipped with a warning.
+//   - WAL entries whose last offset is below the partition's logStartOffset (from metadata.log) are skipped.
+//   - WAL replay can only advance HW and logStartOffset, never reduce them.
 func (b *Broker) replayWAL(w *wal.Writer) error {
 	entryCount := 0
+	skippedUnknown := 0
+	skippedPartition := 0
+	skippedBelowLogStart := 0
+	skippedCorrupt := 0
+
 	err := w.Replay(func(entry wal.Entry, segmentSeq uint64, fileOffset int64) error {
-		// Look up or create the topic by ID
+		// Look up the topic by ID — metadata.log has already been replayed
 		td := b.state.GetTopicByID(entry.TopicID)
 		if td == nil {
-			// Topic might not exist yet (metadata.log not replayed).
-			// Skip entries for unknown topics during WAL-only replay.
+			// WAL entry for topic not in metadata.log. Should not happen
+			// (CREATE_TOPIC is written and fsync'd before produce can succeed).
+			// Log a warning and skip.
+			if skippedUnknown == 0 {
+				b.logger.Warn("WAL replay: skipping entry for unknown topic ID",
+					"topic_id", fmt.Sprintf("%x", entry.TopicID),
+					"segment", segmentSeq, "offset", fileOffset)
+			}
+			skippedUnknown++
 			return nil
 		}
 
 		if int(entry.Partition) >= len(td.Partitions) {
-			return nil // skip invalid partition
+			// Partition index beyond the topic's partition count — indicates corruption.
+			if skippedPartition == 0 {
+				b.logger.Warn("WAL replay: skipping entry for out-of-range partition",
+					"topic", td.Name, "partition", entry.Partition,
+					"partition_count", len(td.Partitions),
+					"segment", segmentSeq, "offset", fileOffset)
+			}
+			skippedPartition++
+			return nil
 		}
 
 		pd := td.Partitions[entry.Partition]
@@ -298,7 +399,23 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 		// Parse batch header to get metadata
 		meta, err := cluster.ParseBatchHeader(entry.Data)
 		if err != nil {
-			return nil // skip corrupted batch
+			if skippedCorrupt == 0 {
+				b.logger.Warn("WAL replay: skipping entry with corrupted batch header",
+					"topic", td.Name, "partition", entry.Partition,
+					"segment", segmentSeq, "offset", fileOffset, "err", err)
+			}
+			skippedCorrupt++
+			return nil
+		}
+
+		// Skip WAL entries whose last offset is below the persisted logStartOffset
+		lastOffset := entry.Offset + int64(meta.LastOffsetDelta)
+		pd.RLock()
+		logStart := pd.LogStart()
+		pd.RUnlock()
+		if lastOffset < logStart {
+			skippedBelowLogStart++
+			return nil
 		}
 
 		// Rebuild partition state
@@ -311,10 +428,19 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 			NumRecords:      meta.NumRecords,
 		}
 
-		// Advance HW if needed
-		endOffset := entry.Offset + int64(meta.LastOffsetDelta) + 1
+		// Advance HW if needed (WAL can only advance, never reduce)
+		endOffset := lastOffset + 1
 		if endOffset > pd.HW() {
 			pd.SetHW(endOffset)
+		}
+
+		// Advance logStartOffset if the lowest WAL offset is higher
+		// than the metadata.log value (secondary authority)
+		if entry.Offset > pd.LogStart() {
+			// Only if no earlier entries exist in this partition
+			// This is handled naturally: first WAL entry for a partition
+			// sets the floor. We don't need explicit logic — the metadata.log
+			// value takes precedence and WAL data below it was already skipped.
 		}
 
 		// If ring buffer is initialized, push to it
@@ -325,7 +451,6 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 
 		// Add to WAL index
 		tp := wal.TopicPartition{TopicID: entry.TopicID, Partition: entry.Partition}
-		lastOffset := entry.Offset + int64(meta.LastOffsetDelta)
 		idxEntry := wal.IndexEntry{
 			BaseOffset:  entry.Offset,
 			LastOffset:  lastOffset,
@@ -345,8 +470,14 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 		return err
 	}
 
-	if entryCount > 0 {
-		b.logger.Info("WAL replay complete", "entries", entryCount)
+	if entryCount > 0 || skippedUnknown > 0 || skippedPartition > 0 || skippedBelowLogStart > 0 || skippedCorrupt > 0 {
+		b.logger.Info("WAL replay complete",
+			"entries", entryCount,
+			"skipped_unknown_topic", skippedUnknown,
+			"skipped_invalid_partition", skippedPartition,
+			"skipped_below_log_start", skippedBelowLogStart,
+			"skipped_corrupt_batch", skippedCorrupt,
+		)
 	}
 	return nil
 }

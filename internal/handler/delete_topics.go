@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -57,6 +58,14 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 				st.TopicID = td.ID
 				if !state.DeleteTopic(topicName) {
 					st.ErrorCode = kerr.UnknownTopicOrPartition.Code
+				} else {
+					// Persist to metadata.log
+					if ml := state.MetadataLog(); ml != nil {
+						entry := metadata.MarshalDeleteTopic(&metadata.DeleteTopicEntry{
+							TopicName: topicName,
+						})
+						ml.AppendSync(entry) //nolint:errcheck
+					}
 				}
 			}
 

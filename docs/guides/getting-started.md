@@ -34,7 +34,7 @@ go install github.com/klaudworks/klite/cmd/klite@latest
 ### Docker
 
 ```bash
-docker run -p 9092:9092 ghcr.io/kliteio/klite
+docker run -p 9092:9092 ghcr.io/klaudworks/klite
 ```
 
 See the [Docker guide](/guides/docker/) for persistent volumes and custom configuration.

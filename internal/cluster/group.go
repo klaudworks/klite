@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -109,6 +110,7 @@ type Group struct {
 
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
+	metaLog    *metadata.Log // optional: persistence for offset commits
 }
 
 // TopicPartition is a (topic, partition) pair used as a map key.
@@ -143,6 +145,11 @@ func NewGroup(id string, shutdownCh <-chan struct{}, logger *slog.Logger) *Group
 	}
 	go g.manage()
 	return g
+}
+
+// SetMetadataLog sets the metadata log for persisting offset commits.
+func (g *Group) SetMetadataLog(ml *metadata.Log) {
+	g.metaLog = ml
 }
 
 // Send sends a request to the group goroutine and waits for a response.
@@ -1097,6 +1104,17 @@ func (g *Group) handleOffsetCommit(req *kmsg.OffsetCommitRequest) kmsg.Response 
 					Metadata:    derefStr(rp.Metadata),
 					CommitTime:  time.Now(),
 				}
+				// Persist to metadata.log (buffered, no fsync — losing a few offsets on crash is OK)
+				if g.metaLog != nil {
+					entry := metadata.MarshalOffsetCommit(&metadata.OffsetCommitEntry{
+						Group:     g.id,
+						Topic:     rt.Topic,
+						Partition: rp.Partition,
+						Offset:    rp.Offset,
+						Metadata:  derefStr(rp.Metadata),
+					})
+					g.metaLog.Append(entry) //nolint:errcheck
+				}
 			}
 			rtResp.Partitions = append(rtResp.Partitions, rpResp)
 		}
@@ -1349,6 +1367,19 @@ type GroupMemberInfo struct {
 	InstanceID       *string
 	ProtocolMetadata []byte
 	Assignment       []byte
+}
+
+// GetCommittedOffsets returns a copy of all committed offsets.
+// Safe to call from any goroutine (uses Control to access group state).
+func (g *Group) GetCommittedOffsets() map[TopicPartition]CommittedOffset {
+	var result map[TopicPartition]CommittedOffset
+	g.Control(func() {
+		result = make(map[TopicPartition]CommittedOffset, len(g.offsets))
+		for k, v := range g.offsets {
+			result[k] = v
+		}
+	})
+	return result
 }
 
 // Describe returns a snapshot of the group state. Must be called from the

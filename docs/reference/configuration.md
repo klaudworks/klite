@@ -114,7 +114,7 @@ docker run -p 9092:9092 \
   -e KLITE_S3_BUCKET=my-bucket \
   -e KLITE_S3_REGION=us-east-1 \
   -v klite-data:/data \
-  ghcr.io/kliteio/klite
+  ghcr.io/klaudworks/klite
 ```
 
 ### Kubernetes (via Helm values)

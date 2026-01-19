@@ -1,0 +1,9 @@
+FROM gcr.io/distroless/static-debian12
+
+COPY klite /klite
+
+EXPOSE 9092
+VOLUME /data
+
+ENTRYPOINT ["/klite"]
+CMD ["--data-dir", "/data"]

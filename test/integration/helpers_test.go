@@ -47,6 +47,11 @@ func WithRingBufferMaxMem(n int64) BrokerOpt {
 	return func(c *broker.Config) { c.RingBufferMaxMem = n }
 }
 
+// WithWALSegmentMaxBytes sets the max segment size before rotation.
+func WithWALSegmentMaxBytes(n int64) BrokerOpt {
+	return func(c *broker.Config) { c.WALSegmentMaxBytes = n }
+}
+
 // StartBroker starts a klite broker in-process on a random port.
 // Registers cleanup with t.Cleanup().
 func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {

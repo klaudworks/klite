@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gocritic
+    - gofumpt
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+linters-settings:
+  gofumpt:
+    extra-rules: true
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+    disabled-checks:
+      - hugeParam # false positives on request/response structs
+
+issues:
+  exclude-dirs:
+    - .cache
+  exclude-rules:
+    # Test files can have longer functions and unused params.
+    - path: _test\.go
+      linters:
+        - gocritic

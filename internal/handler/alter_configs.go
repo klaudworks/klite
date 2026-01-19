@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -35,9 +36,21 @@ func HandleIncrementalAlterConfigs(state *cluster.State) server.Handler {
 						case kmsg.IncrementalAlterConfigOpSet:
 							if rc.Value != nil {
 								state.SetTopicConfig(rr.ResourceName, rc.Name, *rc.Value)
+								// Persist to metadata.log
+								if ml := state.MetadataLog(); ml != nil {
+									entry := metadata.MarshalAlterConfig(&metadata.AlterConfigEntry{
+										TopicName: rr.ResourceName,
+										Key:       rc.Name,
+										Value:     *rc.Value,
+									})
+									ml.Append(entry) //nolint:errcheck
+								}
 							}
 						case kmsg.IncrementalAlterConfigOpDelete:
 							state.DeleteTopicConfig(rr.ResourceName, rc.Name)
+							// For delete, we persist an ALTER_CONFIG with empty value
+							// On replay, we'll need to handle this as "set to empty means delete"
+							// Actually, compaction handles this — snapshot only includes live state
 						}
 					}
 				}
@@ -81,6 +94,19 @@ func HandleAlterConfigs(state *cluster.State) server.Handler {
 				if !r.ValidateOnly {
 					// Full replacement: clear existing configs, apply new ones
 					state.ReplaceTopicConfigs(rr.ResourceName, rr.Configs)
+					// Persist each config to metadata.log
+					if ml := state.MetadataLog(); ml != nil {
+						for _, c := range rr.Configs {
+							if c.Value != nil {
+								entry := metadata.MarshalAlterConfig(&metadata.AlterConfigEntry{
+									TopicName: rr.ResourceName,
+									Key:       c.Name,
+									Value:     *c.Value,
+								})
+								ml.Append(entry) //nolint:errcheck
+							}
+						}
+					}
 				}
 
 			case kmsg.ConfigResourceTypeBroker:

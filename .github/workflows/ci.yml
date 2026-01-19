@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - LICENSE
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -race -cover -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binary
+        run: go build -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::8}" -o bin/klite ./cmd/klite
+
+      - name: Verify binary runs
+        run: bin/klite --version
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for docs changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+              - 'docs-site/**'
+
+      - uses: pnpm/action-setup@v4
+        if: steps.filter.outputs.docs == 'true'
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        if: steps.filter.outputs.docs == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: docs-site/pnpm-lock.yaml
+
+      - name: Install dependencies
+        if: steps.filter.outputs.docs == 'true'
+        run: pnpm install --frozen-lockfile
+        working-directory: docs-site
+
+      - name: Build docs
+        if: steps.filter.outputs.docs == 'true'
+        run: pnpm run build
+        working-directory: docs-site
+
+      - name: Skip
+        if: steps.filter.outputs.docs != 'true'
+        run: echo "No docs changes, skipping build"

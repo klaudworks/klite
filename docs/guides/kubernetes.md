@@ -68,7 +68,7 @@ kcat -C -b localhost:9092 -t my-topic -e
 replicaCount: 1  # klite is a single-broker; always 1
 
 image:
-  repository: ghcr.io/kliteio/klite
+  repository: ghcr.io/klaudworks/klite
   tag: latest  # TODO: Pin to a specific version in production
   pullPolicy: IfNotPresent
 
