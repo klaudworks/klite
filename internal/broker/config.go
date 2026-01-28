@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // Config holds all broker configuration.
@@ -25,6 +26,16 @@ type Config struct {
 	WALSegmentMaxBytes int64  // Max segment size before rotation (default 64 MiB)
 	WALMaxDiskSize     int64  // Max total WAL on disk (default 1 GiB)
 	RingBufferMaxMem   int64  // Global memory budget for ring buffers (default 512 MiB)
+
+	// S3 configuration (Phase 4)
+	S3Bucket        string        // S3 bucket name (empty = S3 disabled)
+	S3Region        string        // S3 region
+	S3Endpoint      string        // Custom S3 endpoint (for LocalStack/MinIO)
+	S3Prefix        string        // S3 key prefix (default: "klite/<clusterID>")
+	S3FlushInterval time.Duration // Unified S3 sync interval (default 10m)
+
+	// S3API allows injecting a mock S3 client for tests.
+	S3API interface{} // s3.S3API when set
 
 	// Listener allows injecting a pre-created listener (for tests).
 	// If non-nil, the broker uses this instead of opening Listen.

@@ -1,8 +1,10 @@
 package cluster
 
 import (
+	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -15,6 +17,19 @@ type StoredBatch struct {
 	RawBytes        []byte // Original RecordBatch bytes from the client
 	MaxTimestamp    int64
 	NumRecords      int32
+}
+
+// S3Fetcher is the interface for reading from S3 in the fetch cascade.
+// Implemented by s3.Reader. Kept as an interface to avoid circular imports.
+type S3Fetcher interface {
+	FetchBatches(ctx context.Context, topic string, partition int32, offset int64, maxBytes int32) ([]S3BatchData, error)
+}
+
+// S3BatchData holds batch data returned from S3.
+type S3BatchData struct {
+	RawBytes        []byte
+	BaseOffset      int64
+	LastOffsetDelta int32
 }
 
 // FetchWaiter represents a Fetch request waiting for new data (long polling).
@@ -84,6 +99,10 @@ type PartData struct {
 	totalBytes         int64          // running total of raw RecordBatch bytes
 	maxTimestampVal    int64          // max timestamp value (ring buffer mode)
 	maxTimestampOffset int64          // offset associated with max timestamp (ring buffer mode)
+
+	// Phase 4 (S3)
+	s3FlushWatermark int64          // highest offset+1 flushed to S3
+	s3Fetch          S3Fetcher      // S3 reader for tier 3 reads (nil if S3 not configured)
 }
 
 // HW returns the current high watermark (next offset to be assigned).
@@ -143,6 +162,30 @@ func (pd *PartData) SetHW(hw int64) {
 // HasWAL returns whether this partition has WAL enabled.
 func (pd *PartData) HasWAL() bool {
 	return pd.ring != nil
+}
+
+// S3FlushWatermark returns the highest offset+1 flushed to S3.
+// Caller must hold pd.mu.RLock() or pd.mu.Lock().
+func (pd *PartData) S3FlushWatermark() int64 {
+	return pd.s3FlushWatermark
+}
+
+// SetS3FlushWatermark sets the S3 flush watermark.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) SetS3FlushWatermark(w int64) {
+	if w > pd.s3FlushWatermark {
+		pd.s3FlushWatermark = w
+	}
+}
+
+// SetS3Fetcher sets the S3 fetcher for tier 3 reads.
+func (pd *PartData) SetS3Fetcher(f S3Fetcher) {
+	pd.s3Fetch = f
+}
+
+// HasS3 returns whether S3 is configured for this partition.
+func (pd *PartData) HasS3() bool {
+	return pd.s3Fetch != nil
 }
 
 // PushBatch appends a batch, assigns offset. Returns base offset.
@@ -394,8 +437,74 @@ func (pd *PartData) fetchFromTiered(offset int64, maxBytes int32) []StoredBatch 
 		}
 	}
 
-	// Tier 2: WAL via index + pread
+	// Determine the lowest offset available in WAL. If the requested offset
+	// is below the WAL range and S3 is available, skip WAL and try S3 first.
+	// This handles the disaster recovery case where WAL was deleted but S3
+	// still has the old data.
+	walHasOffset := false
 	if pd.walIndex != nil && pd.walWriter != nil {
+		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
+		entries := pd.walIndex.Lookup(tp, offset, maxBytes)
+		if len(entries) > 0 {
+			// Only use WAL if its entries actually start at or near the
+			// requested offset. If the first entry's BaseOffset is far
+			// beyond the requested offset, the data for the requested
+			// offset is not in the WAL — try S3 first.
+			if entries[0].BaseOffset <= offset || pd.s3Fetch == nil {
+				walHasOffset = true
+				var result []StoredBatch
+				for _, e := range entries {
+					data, err := pd.walWriter.ReadBatch(e)
+					if err != nil {
+						break
+					}
+					meta, err := ParseBatchHeader(data)
+					if err != nil {
+						break
+					}
+					result = append(result, StoredBatch{
+						BaseOffset:      e.BaseOffset,
+						LastOffsetDelta: meta.LastOffsetDelta,
+						RawBytes:        data,
+						MaxTimestamp:    meta.MaxTimestamp,
+						NumRecords:      meta.NumRecords,
+					})
+				}
+				if len(result) > 0 {
+					return result
+				}
+			}
+		}
+	}
+
+	// Tier 3 (Phase 4): S3 range read
+	if pd.s3Fetch != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s3Batches, err := pd.s3Fetch.FetchBatches(ctx, pd.Topic, pd.Index, offset, maxBytes)
+		if err == nil && len(s3Batches) > 0 {
+			var result []StoredBatch
+			for _, sb := range s3Batches {
+				meta, parseErr := ParseBatchHeader(sb.RawBytes)
+				if parseErr != nil {
+					continue
+				}
+				result = append(result, StoredBatch{
+					BaseOffset:      sb.BaseOffset,
+					LastOffsetDelta: sb.LastOffsetDelta,
+					RawBytes:        sb.RawBytes,
+					MaxTimestamp:    meta.MaxTimestamp,
+					NumRecords:      meta.NumRecords,
+				})
+			}
+			if len(result) > 0 {
+				return result
+			}
+		}
+	}
+
+	// Fallback: if S3 didn't have data but WAL does (for a higher range), use WAL
+	if !walHasOffset && pd.walIndex != nil && pd.walWriter != nil {
 		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
 		entries := pd.walIndex.Lookup(tp, offset, maxBytes)
 		if len(entries) > 0 {
@@ -403,7 +512,7 @@ func (pd *PartData) fetchFromTiered(offset int64, maxBytes int32) []StoredBatch 
 			for _, e := range entries {
 				data, err := pd.walWriter.ReadBatch(e)
 				if err != nil {
-					break // fall through to next tier or return what we have
+					break
 				}
 				meta, err := ParseBatchHeader(data)
 				if err != nil {
@@ -422,8 +531,6 @@ func (pd *PartData) fetchFromTiered(offset int64, maxBytes int32) []StoredBatch 
 			}
 		}
 	}
-
-	// Tier 3 (Phase 4): S3 range read — not yet implemented
 	return nil
 }
 

@@ -104,3 +104,13 @@ Follow the **testing pyramid**: test at the lowest layer that can verify the beh
 - **No E2E / Kubernetes tests** — everything in this project is testable with unit tests or in-process integration tests.
 - **Do not test third-party library behavior** — e.g., do not write tests that verify franz-go's client encoding. That's their responsibility, not ours.
 - When adding a new feature, ask: "What is the cheapest test that can verify this?" — prefer unit over integration.
+
+## Code Comments
+
+- Do not write low-value comments. Comments should be reserved for high-value information that is not easily understood by reading the code alone.
+- Keep comments concise and to the point.
+
+## Subagents
+
+- Use subagents sparingly. They are useful when a search would return verbose output that would pollute the main context just to find a small piece of detailed information.
+- Do not use the `explore` subagent when gaining a general understanding of the codebase. Read files and grep directly instead.

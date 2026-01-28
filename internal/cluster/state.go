@@ -29,6 +29,9 @@ type State struct {
 	walIndex       *wal.Index
 	ringBufferMem  int64 // global memory budget for ring buffers
 
+	// S3-related state (Phase 4)
+	s3Fetcher S3Fetcher // S3 reader adapter (nil if S3 not configured)
+
 	// Metadata log (Phase 3+)
 	metaLog *metadata.Log
 }
@@ -581,7 +584,66 @@ func (s *State) initPartitionsWAL(td *TopicData) {
 	for _, pd := range td.Partitions {
 		ring := NewRingBuffer(slots)
 		pd.InitWAL(ring, s.walWriter, s.walIndex)
+		if s.s3Fetcher != nil {
+			pd.SetS3Fetcher(s.s3Fetcher)
+		}
 	}
+}
+
+// SetS3Fetcher sets the S3 fetcher on all existing partitions.
+func (s *State) SetS3Fetcher(fetcher S3Fetcher) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			pd.SetS3Fetcher(fetcher)
+		}
+	}
+	s.s3Fetcher = fetcher
+}
+
+// FlushablePartitions returns all partitions with unflushed WAL data.
+// Implements s3.PartitionFlusher.
+func (s *State) FlushablePartitions() []FlushablePartition {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []FlushablePartition
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			pd.mu.RLock()
+			hw := pd.hw
+			watermark := pd.s3FlushWatermark
+			topicID := pd.TopicID
+			pd.mu.RUnlock()
+
+			if hw <= watermark {
+				continue // nothing to flush
+			}
+
+			capturedPd := pd
+			result = append(result, FlushablePartition{
+				Topic:     td.Name,
+				Partition: pd.Index,
+				TopicID:   topicID,
+				S3Watermark: watermark,
+				HW:          hw,
+				Partition_:  capturedPd,
+			})
+		}
+	}
+
+	return result
+}
+
+// FlushablePartition holds data needed for S3 flush of a single partition.
+type FlushablePartition struct {
+	Topic       string
+	Partition   int32
+	TopicID     [16]byte
+	S3Watermark int64
+	HW          int64
+	Partition_  *PartData // reference to the partition for watermark update
 }
 
 // countPartitions returns the total number of partitions across all topics.
