@@ -42,6 +42,16 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 42, MinVersion: 0, MaxVersion: 2},  // DeleteGroups
 	{ApiKey: 44, MinVersion: 0, MaxVersion: 1},  // IncrementalAlterConfigs
 	{ApiKey: 60, MinVersion: 0, MaxVersion: 2},  // DescribeCluster
+
+	// Phase 4: Transactions
+	{ApiKey: 22, MinVersion: 0, MaxVersion: 5},  // InitProducerID
+	{ApiKey: 24, MinVersion: 0, MaxVersion: 4},  // AddPartitionsToTxn
+	{ApiKey: 25, MinVersion: 0, MaxVersion: 3},  // AddOffsetsToTxn
+	{ApiKey: 26, MinVersion: 0, MaxVersion: 4},  // EndTxn
+	{ApiKey: 28, MinVersion: 0, MaxVersion: 4},  // TxnOffsetCommit
+	{ApiKey: 61, MinVersion: 0, MaxVersion: 0},  // DescribeProducers
+	{ApiKey: 65, MinVersion: 0, MaxVersion: 0},  // DescribeTransactions
+	{ApiKey: 66, MinVersion: 0, MaxVersion: 1},  // ListTransactions
 }
 
 // apiVersionsMap is a lookup table built from apiVersions for fast version

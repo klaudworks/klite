@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
@@ -127,6 +129,16 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 		AdvertisedAddr: advAddr,
 		ClusterID:      b.clusterID,
 	}))
+
+	// Phase 4: Transactions
+	b.handlers.Register(22, handler.HandleInitProducerID(b.state))
+	b.handlers.Register(24, handler.HandleAddPartitionsToTxn(b.state))
+	b.handlers.Register(25, handler.HandleAddOffsetsToTxn(b.state))
+	b.handlers.Register(26, handler.HandleEndTxn(b.state))
+	b.handlers.Register(28, handler.HandleTxnOffsetCommit(b.state))
+	b.handlers.Register(61, handler.HandleDescribeProducers(b.state))
+	b.handlers.Register(65, handler.HandleDescribeTransactions(b.state))
+	b.handlers.Register(66, handler.HandleListTransactions(b.state))
 }
 
 // Run starts the broker and blocks until ctx is cancelled.
@@ -287,7 +299,7 @@ func (b *Broker) initMetadataLog() error {
 		},
 		// PRODUCER_ID (Phase 4)
 		func(e metadata.ProducerIDEntry) {
-			// TODO: Phase 4 — set next producer ID counter
+			b.state.PIDManager().SetNextPID(e.NextProducerID)
 		},
 		// LOG_START_OFFSET
 		func(e metadata.LogStartOffsetEntry) {
@@ -798,10 +810,27 @@ func (b *Broker) probeS3Watermarks() {
 
 // createAWSS3Client creates an AWS S3 client from broker config.
 func createAWSS3Client(cfg Config) (s3store.S3API, error) {
-	// Import done at package level via build
-	// For now, return an error if no custom endpoint is set
-	// Production users must set S3API directly or we create via aws-sdk-go-v2
-	return nil, fmt.Errorf("AWS S3 client creation requires S3API to be set in config (use S3Endpoint for custom endpoints)")
+	region := cfg.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+		awsconfig.WithRegion(region),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+
+	var s3Opts []func(*s3sdk.Options)
+	if cfg.S3Endpoint != "" {
+		s3Opts = append(s3Opts, func(o *s3sdk.Options) {
+			o.BaseEndpoint = &cfg.S3Endpoint
+			o.UsePathStyle = true
+		})
+	}
+
+	return s3sdk.NewFromConfig(awsCfg, s3Opts...), nil
 }
 
 // s3PartitionAdapter adapts the cluster state to the s3.PartitionProvider interface.

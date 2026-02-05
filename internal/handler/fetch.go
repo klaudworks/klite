@@ -102,6 +102,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 				pd.RLock()
 				hw := pd.HW()
 				logStart := pd.LogStart()
+				lso := pd.LSO()
 
 				// Validate fetch offset
 				fetchOffset := rp.FetchOffset
@@ -109,7 +110,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 					pd.RUnlock()
 					sp.ErrorCode = kerr.OffsetOutOfRange.Code
 					sp.HighWatermark = hw
-					sp.LastStableOffset = hw
+					sp.LastStableOffset = lso
 					sp.LogStartOffset = logStart
 					results[i] = partResult{sp: sp}
 					continue
@@ -121,11 +122,43 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 					maxBytes = 1024 * 1024 // 1MB default
 				}
 				batches := pd.FetchFrom(fetchOffset, maxBytes)
+
+				// For READ_COMMITTED (IsolationLevel=1), filter and cap at LSO
+				readCommitted := r.IsolationLevel == 1
+				var abortedTxns []cluster.AbortedTxnEntry
+				if readCommitted && len(batches) > 0 {
+					// Filter out batches at or beyond LSO
+					var filtered []cluster.StoredBatch
+					for _, b := range batches {
+						if b.BaseOffset >= lso {
+							break
+						}
+						filtered = append(filtered, b)
+					}
+					batches = filtered
+
+					// Get aborted transaction index for this range
+					if len(batches) > 0 {
+						lastBatch := batches[len(batches)-1]
+						lastOffset := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta) + 1
+						abortedTxns = pd.AbortedTxnsInRange(fetchOffset, lastOffset)
+					}
+				}
 				pd.RUnlock()
 
 				sp.HighWatermark = hw
-				sp.LastStableOffset = hw // no transactions, LSO = HW
+				sp.LastStableOffset = lso
 				sp.LogStartOffset = logStart
+
+				// Add aborted transaction info to response
+				if readCommitted {
+					for _, at := range abortedTxns {
+						sp.AbortedTransactions = append(sp.AbortedTransactions, kmsg.FetchResponseTopicPartitionAbortedTransaction{
+							ProducerID:  at.ProducerID,
+							FirstOffset: at.FirstOffset,
+						})
+					}
+				}
 
 				// Serialize batch data into Records
 				dataSize := 0
