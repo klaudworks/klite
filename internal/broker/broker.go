@@ -23,6 +23,7 @@ import (
 	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/metadata"
 	s3store "github.com/klaudworks/klite/internal/s3"
+	"github.com/klaudworks/klite/internal/sasl"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -45,6 +46,7 @@ type Broker struct {
 	s3Client   *s3store.Client  // nil if S3 disabled
 	s3Reader   *s3store.Reader  // nil if S3 disabled
 	s3Flusher  *s3store.Flusher // nil if S3 disabled
+	saslStore  *sasl.Store      // nil if SASL disabled
 
 	mu   sync.Mutex
 	quit bool
@@ -75,13 +77,52 @@ func New(cfg Config) *Broker {
 		server:     srv,
 		handlers:   handlers,
 	}
+
+	// Initialize SASL if enabled
+	if cfg.SASLEnabled {
+		b.initSASLStore()
+		srv.SetSASLEnabled(true)
+	}
+
 	b.registerBaseHandlers()
 	return b
+}
+
+// initSASLStore creates and populates the SASL credential store.
+func (b *Broker) initSASLStore() {
+	if b.cfg.SASLStore != nil {
+		b.saslStore = b.cfg.SASLStore.(*sasl.Store)
+		return
+	}
+	b.saslStore = sasl.NewStore()
+
+	// Add CLI-flag user
+	if b.cfg.SASLUser != "" && b.cfg.SASLPassword != "" {
+		switch b.cfg.SASLMechanism {
+		case sasl.MechanismPlain:
+			b.saslStore.AddPlain(b.cfg.SASLUser, b.cfg.SASLPassword)
+		case sasl.MechanismScram256:
+			auth := sasl.NewScramAuth(sasl.MechanismScram256, b.cfg.SASLPassword)
+			b.saslStore.AddScram256(b.cfg.SASLUser, auth)
+		case sasl.MechanismScram512:
+			auth := sasl.NewScramAuth(sasl.MechanismScram512, b.cfg.SASLPassword)
+			b.saslStore.AddScram512(b.cfg.SASLUser, auth)
+		default:
+			b.logger.Warn("unknown SASL mechanism for CLI user, skipping", "mechanism", b.cfg.SASLMechanism)
+		}
+	}
 }
 
 // registerBaseHandlers wires up handlers that don't depend on runtime state.
 func (b *Broker) registerBaseHandlers() {
 	b.handlers.Register(18, handler.HandleApiVersions())
+
+	// SASL handlers are registered early (before runtime handlers)
+	// because they only depend on the SASL store, not on cluster state.
+	if b.saslStore != nil {
+		b.handlers.RegisterConn(17, handler.HandleSASLHandshake())
+		b.handlers.RegisterConn(36, handler.HandleSASLAuthenticate(b.saslStore))
+	}
 }
 
 // registerRuntimeHandlers wires up handlers that depend on runtime state
@@ -130,6 +171,12 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 		ClusterID:      b.clusterID,
 	}))
 
+	// Phase 5: SASL credential management
+	if b.saslStore != nil {
+		b.handlers.Register(50, handler.HandleDescribeUserScramCredentials(b.saslStore))
+		b.handlers.Register(51, handler.HandleAlterUserScramCredentials(b.saslStore, b.metaLog))
+	}
+
 	// Phase 4: Transactions
 	b.handlers.Register(22, handler.HandleInitProducerID(b.state))
 	b.handlers.Register(24, handler.HandleAddPartitionsToTxn(b.state))
@@ -169,6 +216,16 @@ func (b *Broker) Run(ctx context.Context) error {
 		if err := b.initMetadataLog(); err != nil {
 			return fmt.Errorf("init metadata.log: %w", err)
 		}
+		// After metadata.log replay (which may have loaded persisted SCRAM
+		// credentials), re-apply CLI-flag user so config always wins.
+		if b.saslStore != nil && b.cfg.SASLUser != "" && b.cfg.SASLPassword != "" {
+			b.applyCLISASLUser()
+		}
+	}
+
+	// Validate SASL: if enabled but no credentials configured, refuse to start
+	if b.cfg.SASLEnabled && b.saslStore != nil && b.saslStore.Empty() {
+		return fmt.Errorf("SASL is enabled but no credentials are configured; add users via --sasl-user/--sasl-password or config file")
 	}
 
 	// 4. Initialize WAL if enabled (replay WAL after metadata)
@@ -217,6 +274,9 @@ func (b *Broker) Run(ctx context.Context) error {
 
 	// Signal that initialization is complete
 	close(b.ready)
+
+	// 8b. Start retention loop
+	go b.retentionLoop(ctx)
 
 	// 9. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
@@ -306,6 +366,32 @@ func (b *Broker) initMetadataLog() error {
 			b.state.SetLogStartOffsetFromReplay(e.TopicName, e.Partition, e.LogStartOffset)
 		},
 	)
+
+	// Set up SCRAM credential replay callbacks if SASL is enabled
+	if b.saslStore != nil {
+		ml.SetScramCallbacks(
+			func(e metadata.ScramCredentialEntry) {
+				auth := sasl.ScramAuthFromPreHashed(
+					scramMechName(e.Mechanism),
+					int(e.Iterations),
+					e.SaltedPass,
+					e.Salt,
+				)
+				if e.Mechanism == 1 {
+					b.saslStore.AddScram256(e.Username, auth)
+				} else if e.Mechanism == 2 {
+					b.saslStore.AddScram512(e.Username, auth)
+				}
+			},
+			func(e metadata.ScramCredentialDeleteEntry) {
+				if e.Mechanism == 1 {
+					b.saslStore.DeleteScram256(e.Username)
+				} else if e.Mechanism == 2 {
+					b.saslStore.DeleteScram512(e.Username)
+				}
+			},
+		)
+	}
 
 	// Replay existing entries
 	count, err := ml.Replay()
@@ -992,6 +1078,86 @@ func parseClusterID(content string) string {
 func generateClusterID() string {
 	id := uuid.New()
 	return base64.RawURLEncoding.EncodeToString(id[:])
+}
+
+// applyCLISASLUser re-applies the CLI-specified SASL user to override
+// any persisted credentials for the same user.
+func (b *Broker) applyCLISASLUser() {
+	switch b.cfg.SASLMechanism {
+	case sasl.MechanismPlain:
+		b.saslStore.AddPlain(b.cfg.SASLUser, b.cfg.SASLPassword)
+	case sasl.MechanismScram256:
+		auth := sasl.NewScramAuth(sasl.MechanismScram256, b.cfg.SASLPassword)
+		b.saslStore.AddScram256(b.cfg.SASLUser, auth)
+	case sasl.MechanismScram512:
+		auth := sasl.NewScramAuth(sasl.MechanismScram512, b.cfg.SASLPassword)
+		b.saslStore.AddScram512(b.cfg.SASLUser, auth)
+	}
+}
+
+// scramMechName converts a mechanism number to a name string.
+func scramMechName(mech int8) string {
+	switch mech {
+	case 1:
+		return sasl.MechanismScram256
+	case 2:
+		return sasl.MechanismScram512
+	default:
+		return ""
+	}
+}
+
+// retentionLoop runs the retention enforcement goroutine.
+func (b *Broker) retentionLoop(ctx context.Context) {
+	interval := b.cfg.RetentionCheckInterval
+	if interval == 0 {
+		interval = 5 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.enforceRetention()
+		}
+	}
+}
+
+// enforceRetention scans all partitions and trims data exceeding retention.
+func (b *Broker) enforceRetention() {
+	nowMs := time.Now().UnixMilli()
+	topics := b.state.GetAllTopics()
+
+	for _, td := range topics {
+		retentionMs := int64(604800000) // 7 days default
+		retentionBytes := int64(-1)     // infinite default
+
+		if v, ok := td.Configs["retention.ms"]; ok {
+			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+				retentionMs = parsed
+			}
+		}
+		if v, ok := td.Configs["retention.bytes"]; ok {
+			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+				retentionBytes = parsed
+			}
+		}
+
+		for _, pd := range td.Partitions {
+			newLogStart, origLogStart := pd.RetentionScan(retentionMs, retentionBytes, nowMs)
+			if newLogStart > origLogStart {
+				pd.CompactionMu.Lock()
+				if err := pd.AdvanceLogStartOffset(newLogStart, b.metaLog); err != nil {
+					b.logger.Warn("retention: failed to advance logStartOffset",
+						"topic", td.Name, "partition", pd.Index,
+						"new_log_start", newLogStart, "err", err)
+				}
+				pd.CompactionMu.Unlock()
+			}
+		}
+	}
 }
 
 // setupLogger creates an slog.Logger with the given level.

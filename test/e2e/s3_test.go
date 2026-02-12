@@ -18,8 +18,9 @@ import (
 func TestS3ProduceAndFlush(t *testing.T) {
 	binary := buildBroker(t)
 	dataDir := t.TempDir()
+	prefix := "klite/e2e/" + t.Name()
 
-	bp := startBroker(t, binary, dataDir)
+	bp := startBroker(t, binary, dataDir, prefix)
 
 	topic := "e2e-produce-flush"
 	admin := newAdminClient(t, bp.addr)
@@ -42,7 +43,7 @@ func TestS3ProduceAndFlush(t *testing.T) {
 	bp.stopGraceful(t)
 
 	// Verify S3 has objects for the topic
-	keys := listS3Objects(t)
+	keys := listS3Objects(t, prefix)
 	found := false
 	for _, key := range keys {
 		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {
@@ -58,11 +59,12 @@ func TestS3ProduceAndFlush(t *testing.T) {
 func TestS3RestartAndConsume(t *testing.T) {
 	binary := buildBroker(t)
 	dataDir := t.TempDir()
+	prefix := "klite/e2e/" + t.Name()
 	topic := "e2e-restart-consume"
 	numRecords := 15
 
 	// Phase 1: produce + graceful stop (flush to S3)
-	bp := startBroker(t, binary, dataDir)
+	bp := startBroker(t, binary, dataDir, prefix)
 
 	admin := newAdminClient(t, bp.addr)
 	_, err := admin.CreateTopic(t.Context(), 1, 1, nil, topic)
@@ -85,8 +87,8 @@ func TestS3RestartAndConsume(t *testing.T) {
 	// Delete local WAL to force reads from S3
 	os.RemoveAll(dataDir + "/wal")
 
-	// Phase 2: restart and consume from S3
-	bp2 := startBroker(t, binary, dataDir)
+	// Phase 2: restart with same prefix — should find data in S3
+	bp2 := startBroker(t, binary, dataDir, prefix)
 
 	consumer := newKgoClient(t, bp2.addr,
 		kgo.ConsumeTopics(topic),
@@ -104,9 +106,10 @@ func TestS3RestartAndConsume(t *testing.T) {
 func TestS3GracefulShutdown(t *testing.T) {
 	binary := buildBroker(t)
 	dataDir := t.TempDir()
+	prefix := "klite/e2e/" + t.Name()
 	topic := "e2e-graceful-shutdown"
 
-	bp := startBroker(t, binary, dataDir)
+	bp := startBroker(t, binary, dataDir, prefix)
 
 	admin := newAdminClient(t, bp.addr)
 	_, err := admin.CreateTopic(t.Context(), 1, 1, nil, topic)
@@ -128,7 +131,7 @@ func TestS3GracefulShutdown(t *testing.T) {
 	bp.stopGraceful(t)
 
 	// Verify data made it to S3
-	keys := listS3Objects(t)
+	keys := listS3Objects(t, prefix)
 	found := false
 	for _, key := range keys {
 		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {

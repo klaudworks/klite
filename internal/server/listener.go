@@ -18,8 +18,9 @@ type Server struct {
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
 
-	maxConns  int64
-	connCount atomic.Int64
+	maxConns    int64
+	connCount   atomic.Int64
+	saslEnabled bool // when true, new connections start at SASLStageBegin
 
 	// wg tracks active connection goroutines for clean shutdown.
 	wg sync.WaitGroup
@@ -33,6 +34,11 @@ func NewServer(handlers *HandlerRegistry, shutdownCh <-chan struct{}, logger *sl
 		logger:     logger,
 		maxConns:   defaultMaxConnections,
 	}
+}
+
+// SetSASLEnabled configures whether SASL authentication is required.
+func (s *Server) SetSASLEnabled(enabled bool) {
+	s.saslEnabled = enabled
 }
 
 // Serve accepts connections on ln and handles them until the listener is closed.

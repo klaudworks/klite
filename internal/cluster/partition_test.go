@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -926,4 +927,366 @@ func TestReadCascadeFetchFromMiddle(t *testing.T) {
 	if result[0].BaseOffset != 3 {
 		t.Errorf("first batch base: got %d, want 3", result[0].BaseOffset)
 	}
+}
+
+// --- Phase 6 tests: Retention ---
+
+func TestRetentionByTime(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+	nowMs := int64(10000)
+
+	pd.Lock()
+	pushTestBatch(t, pd, 1, 1000) // old: offset 0, ts=1000
+	pushTestBatch(t, pd, 1, 2000) // old: offset 1, ts=2000
+	pushTestBatch(t, pd, 1, 8000) // recent: offset 2, ts=8000
+	pushTestBatch(t, pd, 1, 9000) // recent: offset 3, ts=9000
+	pd.Unlock()
+
+	// retention.ms=5000 -> cutoff=5000 -> batches with ts<5000 should be trimmed
+	newLS, origLS := pd.RetentionScan(5000, -1, nowMs)
+	if origLS != 0 {
+		t.Errorf("origLogStart: got %d, want 0", origLS)
+	}
+	if newLS != 2 { // batches at offset 0 (ts=1000) and 1 (ts=2000) should be trimmed
+		t.Errorf("newLogStart: got %d, want 2", newLS)
+	}
+
+	// Apply the advancement
+	pd.Lock()
+	pd.AdvanceLogStart(newLS)
+	pd.Unlock()
+
+	pd.RLock()
+	if pd.LogStart() != 2 {
+		t.Errorf("logStart after advance: got %d, want 2", pd.LogStart())
+	}
+	if pd.BatchCount() != 2 {
+		t.Errorf("batch count after advance: got %d, want 2", pd.BatchCount())
+	}
+	pd.RUnlock()
+}
+
+func TestRetentionBySize(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 1, 1000) // offset 0
+	pushTestBatch(t, pd, 1, 2000) // offset 1
+	pushTestBatch(t, pd, 1, 3000) // offset 2
+	pd.Unlock()
+
+	pd.RLock()
+	totalBytes := pd.TotalBytes()
+	pd.RUnlock()
+
+	// Set retention.bytes to approximately 2/3 of total (should trim 1 batch)
+	retentionBytes := totalBytes * 2 / 3
+
+	newLS, _ := pd.RetentionScan(-1, retentionBytes, 100000)
+	if newLS != 1 {
+		t.Errorf("newLogStart for size retention: got %d, want 1", newLS)
+	}
+
+	pd.Lock()
+	pd.AdvanceLogStart(newLS)
+	pd.Unlock()
+
+	pd.RLock()
+	if pd.LogStart() != 1 {
+		t.Errorf("logStart: got %d, want 1", pd.LogStart())
+	}
+	if pd.BatchCount() != 2 {
+		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
+	}
+	pd.RUnlock()
+}
+
+func TestRetentionInfinite(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 1, 1000)
+	pushTestBatch(t, pd, 1, 2000)
+	pd.Unlock()
+
+	// Both set to -1 (infinite) -> nothing should be trimmed
+	newLS, origLS := pd.RetentionScan(-1, -1, 100000)
+	if newLS != origLS {
+		t.Errorf("infinite retention: newLogStart=%d should equal origLogStart=%d", newLS, origLS)
+	}
+}
+
+func TestRetentionBothPolicies(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+	nowMs := int64(10000)
+
+	pd.Lock()
+	pushTestBatch(t, pd, 1, 1000) // offset 0, ts=1000
+	pushTestBatch(t, pd, 1, 2000) // offset 1, ts=2000
+	pushTestBatch(t, pd, 1, 3000) // offset 2, ts=3000
+	pushTestBatch(t, pd, 1, 8000) // offset 3, ts=8000
+	pushTestBatch(t, pd, 1, 9000) // offset 4, ts=9000
+	pd.Unlock()
+
+	// Time retention: cutoff = 10000 - 5000 = 5000 -> trim offsets 0,1,2 (ts < 5000) -> newLS=3
+	// Size retention: total is ~305 bytes, limit = 200 -> need to drop ~105 bytes = ~2 batches -> newLS=2
+	// Time is more aggressive, so newLS=3 should win
+
+	pd.RLock()
+	totalBytes := pd.TotalBytes()
+	pd.RUnlock()
+
+	// Set size limit to slightly more than 2 batches worth
+	sizeLimit := totalBytes * 3 / 5
+	newLS, _ := pd.RetentionScan(5000, sizeLimit, nowMs)
+	if newLS != 3 {
+		t.Errorf("both policies: got newLS=%d, want 3 (time was more aggressive)", newLS)
+	}
+}
+
+func TestRetentionBytesPerPartition(t *testing.T) {
+	t.Parallel()
+
+	// Create 3 partitions, each with different amounts of data
+	pds := make([]*PartData, 3)
+	for i := 0; i < 3; i++ {
+		pds[i] = &PartData{
+			Topic:                "test-topic",
+			Index:                int32(i),
+			maxTimestampBatchIdx: -1,
+		}
+	}
+
+	// Push different amounts to each partition
+	for _, pd := range pds {
+		pd.Lock()
+	}
+	pushTestBatch(t, pds[0], 1, 1000) // 1 batch
+	pushTestBatch(t, pds[0], 1, 2000) // 2 batches
+	pushTestBatch(t, pds[0], 1, 3000) // 3 batches
+
+	pushTestBatch(t, pds[1], 1, 1000) // 1 batch only
+
+	pushTestBatch(t, pds[2], 1, 1000) // 1 batch
+	pushTestBatch(t, pds[2], 1, 2000) // 2 batches
+
+	for _, pd := range pds {
+		pd.Unlock()
+	}
+
+	// Per-partition size limit: 1 batch worth
+	pds[0].RLock()
+	oneBatchSize := pds[0].TotalBytes() / 3
+	pds[0].RUnlock()
+
+	// Partition 0 has 3 batches -> should trim 2
+	newLS0, _ := pds[0].RetentionScan(-1, oneBatchSize, 100000)
+	if newLS0 != 2 { // trim offsets 0 and 1
+		t.Errorf("partition 0: newLS=%d, want 2", newLS0)
+	}
+
+	// Partition 1 has 1 batch -> should not trim
+	newLS1, origLS1 := pds[1].RetentionScan(-1, oneBatchSize, 100000)
+	if newLS1 != origLS1 {
+		t.Errorf("partition 1: should not trim, newLS=%d, origLS=%d", newLS1, origLS1)
+	}
+
+	// Partition 2 has 2 batches -> should trim 1
+	newLS2, _ := pds[2].RetentionScan(-1, oneBatchSize, 100000)
+	if newLS2 != 1 { // trim offset 0
+		t.Errorf("partition 2: newLS=%d, want 1", newLS2)
+	}
+}
+
+func TestAdvanceLogStartOffset(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 1, 1000) // offset 0
+	pushTestBatch(t, pd, 1, 2000) // offset 1
+	pushTestBatch(t, pd, 1, 3000) // offset 2
+	pd.Unlock()
+
+	// Advance without metadata.log (pass nil)
+	pd.CompactionMu.Lock()
+	err := pd.AdvanceLogStartOffset(2, nil)
+	pd.CompactionMu.Unlock()
+	if err != nil {
+		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
+	}
+
+	pd.RLock()
+	if pd.LogStart() != 2 {
+		t.Errorf("logStart: got %d, want 2", pd.LogStart())
+	}
+	if pd.BatchCount() != 1 {
+		t.Errorf("batch count: got %d, want 1", pd.BatchCount())
+	}
+	// Remaining batch should be offset 2
+	if pd.batches[0].BaseOffset != 2 {
+		t.Errorf("remaining batch base: got %d, want 2", pd.batches[0].BaseOffset)
+	}
+	pd.RUnlock()
+}
+
+func TestAdvanceLogStartOffsetStraddlingBatch(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 3, 1000) // offsets 0,1,2
+	pushTestBatch(t, pd, 3, 2000) // offsets 3,4,5
+	pd.Unlock()
+
+	// Advance to middle of first batch (offset 1)
+	pd.CompactionMu.Lock()
+	err := pd.AdvanceLogStartOffset(1, nil)
+	pd.CompactionMu.Unlock()
+	if err != nil {
+		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
+	}
+
+	pd.RLock()
+	// logStart should be exactly 1, not rounded to batch boundary
+	if pd.LogStart() != 1 {
+		t.Errorf("logStart: got %d, want 1", pd.LogStart())
+	}
+	// Both batches should still be present (first batch straddles logStart)
+	if pd.BatchCount() != 2 {
+		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
+	}
+	pd.RUnlock()
+}
+
+func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	for i := 0; i < 10; i++ {
+		pushTestBatch(t, pd, 1, int64(1000+i*100)) // offsets 0..9
+	}
+	pd.Unlock()
+
+	// Two goroutines concurrently advancing logStartOffset
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		pd.CompactionMu.Lock()
+		pd.AdvanceLogStartOffset(5, nil)
+		pd.CompactionMu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		pd.CompactionMu.Lock()
+		pd.AdvanceLogStartOffset(7, nil)
+		pd.CompactionMu.Unlock()
+	}()
+
+	wg.Wait()
+
+	pd.RLock()
+	// logStart should end up at 7 (the higher value)
+	if pd.LogStart() != 7 {
+		t.Errorf("logStart: got %d, want 7", pd.LogStart())
+	}
+	// Should have 3 remaining batches (offsets 7, 8, 9)
+	if pd.BatchCount() != 3 {
+		t.Errorf("batch count: got %d, want 3", pd.BatchCount())
+	}
+	pd.RUnlock()
+}
+
+func TestRetentionByTimeRingBuffer(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+	nowMs := int64(10000)
+
+	pd.Lock()
+	pd.PushBatch(makeSimpleBatch(1, 1000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 1000, NumRecords: 1})
+	pd.PushBatch(makeSimpleBatch(1, 2000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 2000, NumRecords: 1})
+	pd.PushBatch(makeSimpleBatch(1, 8000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 8000, NumRecords: 1})
+	pd.PushBatch(makeSimpleBatch(1, 9000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 9000, NumRecords: 1})
+	pd.Unlock()
+
+	// cutoff = 10000 - 5000 = 5000 -> trim first 2 batches
+	newLS, origLS := pd.RetentionScan(5000, -1, nowMs)
+	if origLS != 0 {
+		t.Errorf("origLogStart: got %d, want 0", origLS)
+	}
+	if newLS != 2 {
+		t.Errorf("newLogStart: got %d, want 2", newLS)
+	}
+
+	// Apply advance
+	pd.CompactionMu.Lock()
+	err := pd.AdvanceLogStartOffset(newLS, nil)
+	pd.CompactionMu.Unlock()
+	if err != nil {
+		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
+	}
+
+	pd.RLock()
+	if pd.LogStart() != 2 {
+		t.Errorf("logStart: got %d, want 2", pd.LogStart())
+	}
+	if pd.BatchCount() != 2 {
+		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
+	}
+	pd.RUnlock()
+}
+
+func TestRetentionBySizeRingBuffer(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+
+	pd.Lock()
+	pd.PushBatch(makeSimpleBatch(1, 1000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 1000, NumRecords: 1})
+	pd.PushBatch(makeSimpleBatch(1, 2000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 2000, NumRecords: 1})
+	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1})
+	pd.Unlock()
+
+	pd.RLock()
+	totalBytes := pd.TotalBytes()
+	pd.RUnlock()
+
+	retentionBytes := totalBytes * 2 / 3
+
+	newLS, _ := pd.RetentionScan(-1, retentionBytes, 100000)
+	if newLS != 1 {
+		t.Errorf("newLogStart for size retention: got %d, want 1", newLS)
+	}
+
+	pd.CompactionMu.Lock()
+	err := pd.AdvanceLogStartOffset(newLS, nil)
+	pd.CompactionMu.Unlock()
+	if err != nil {
+		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
+	}
+
+	pd.RLock()
+	if pd.LogStart() != 1 {
+		t.Errorf("logStart: got %d, want 1", pd.LogStart())
+	}
+	if pd.BatchCount() != 2 {
+		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
+	}
+	pd.RUnlock()
 }

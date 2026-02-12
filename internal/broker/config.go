@@ -37,6 +37,18 @@ type Config struct {
 	// S3API allows injecting a mock S3 client for tests.
 	S3API interface{} // s3.S3API when set
 
+	// SASL configuration (Phase 5)
+	SASLEnabled  bool   // Enable SASL authentication
+	SASLMechanism string // Mechanism for CLI-specified user: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+	SASLUser     string // Username for CLI-specified bootstrap user
+	SASLPassword string // Password for CLI-specified bootstrap user
+
+	// Retention configuration (Phase 6)
+	RetentionCheckInterval time.Duration // How often the retention goroutine runs (default 5m)
+
+	// SASLStore allows injecting a pre-configured SASL credential store (for tests).
+	SASLStore interface{} // *sasl.Store when set
+
 	// Listener allows injecting a pre-created listener (for tests).
 	// If non-nil, the broker uses this instead of opening Listen.
 	Listener net.Listener
@@ -95,6 +107,15 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.S3Endpoint, "s3-endpoint", cfg.S3Endpoint, "Custom S3 endpoint (for LocalStack/MinIO)")
 	fs.StringVar(&cfg.S3Prefix, "s3-prefix", cfg.S3Prefix, "S3 key prefix (default: klite/<clusterID>)")
 	fs.DurationVar(&cfg.S3FlushInterval, "s3-flush-interval", cfg.S3FlushInterval, "S3 flush interval (default: 10m)")
+
+	// Retention flags
+	fs.DurationVar(&cfg.RetentionCheckInterval, "retention-check-interval", cfg.RetentionCheckInterval, "How often the retention goroutine runs (default: 5m)")
+
+	// SASL flags
+	fs.BoolVar(&cfg.SASLEnabled, "sasl-enabled", cfg.SASLEnabled, "Enable SASL authentication")
+	fs.StringVar(&cfg.SASLMechanism, "sasl-mechanism", cfg.SASLMechanism, "Mechanism for CLI-specified user: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512")
+	fs.StringVar(&cfg.SASLUser, "sasl-user", cfg.SASLUser, "Username for CLI-specified bootstrap user")
+	fs.StringVar(&cfg.SASLPassword, "sasl-password", cfg.SASLPassword, "Password for CLI-specified bootstrap user")
 }
 
 // ApplyEnvOverrides reads KLITE_* environment variables and applies them to
