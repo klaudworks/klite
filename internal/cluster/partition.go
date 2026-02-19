@@ -113,12 +113,64 @@ type PartData struct {
 	// Phase 4 (Transactions)
 	abortedTxns []AbortedTxnEntry // aborted transaction index, sorted by LastOffset
 	openTxnPIDs map[int64]int64   // producerID -> first offset of open txn on this partition
+
+	// Phase 6 (Compaction)
+	cleanedUpTo   int64     // highest offset that has been compacted (persisted via metadata.log)
+	dirtyObjects  int32     // objects flushed since last compaction (volatile)
+	lastCompacted time.Time // wall clock time of last successful compaction (volatile)
 }
 
 // HW returns the current high watermark (next offset to be assigned).
 // Caller must hold pd.mu.RLock() or pd.mu.Lock().
 func (pd *PartData) HW() int64 {
 	return pd.hw
+}
+
+// CleanedUpTo returns the highest offset that has been compacted.
+// Caller must hold pd.mu.RLock() or pd.mu.Lock().
+func (pd *PartData) CleanedUpTo() int64 {
+	return pd.cleanedUpTo
+}
+
+// SetCleanedUpTo sets the compaction watermark.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) SetCleanedUpTo(offset int64) {
+	if offset > pd.cleanedUpTo {
+		pd.cleanedUpTo = offset
+	}
+}
+
+// DirtyObjects returns the number of dirty S3 objects since last compaction.
+func (pd *PartData) DirtyObjects() int32 {
+	pd.mu.RLock()
+	defer pd.mu.RUnlock()
+	return pd.dirtyObjects
+}
+
+// IncrementDirtyObjects atomically increments the dirty object counter.
+// Called after S3 flush. Caller must hold pd.mu.Lock().
+func (pd *PartData) IncrementDirtyObjects() {
+	pd.dirtyObjects++
+}
+
+// ResetDirtyObjects resets the dirty counter and updates lastCompacted.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) ResetDirtyObjects(now time.Time) {
+	pd.dirtyObjects = 0
+	pd.lastCompacted = now
+}
+
+// SetDirtyObjects sets the dirty object count (used during startup rehydration).
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) SetDirtyObjects(count int32) {
+	pd.dirtyObjects = count
+}
+
+// LastCompacted returns the time of last successful compaction.
+func (pd *PartData) LastCompacted() time.Time {
+	pd.mu.RLock()
+	defer pd.mu.RUnlock()
+	return pd.lastCompacted
 }
 
 // LogStart returns the log start offset.

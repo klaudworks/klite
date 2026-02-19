@@ -46,6 +46,12 @@ type Config struct {
 	// Retention configuration (Phase 6)
 	RetentionCheckInterval time.Duration // How often the retention goroutine runs (default 5m)
 
+	// Compaction configuration (Phase 6)
+	CompactionCheckInterval  time.Duration // How often to scan dirty counters (default 30s)
+	CompactionMinDirtyObjects int          // Min dirty objects before compaction triggers (default 4)
+	CompactionWindowBytes    int64         // Max source object size per window (default 256 MiB)
+	CompactionS3Concurrency  int           // Max concurrent S3 GETs for compaction (default 4)
+
 	// SASLStore allows injecting a pre-configured SASL credential store (for tests).
 	SASLStore interface{} // *sasl.Store when set
 
@@ -110,6 +116,10 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 
 	// Retention flags
 	fs.DurationVar(&cfg.RetentionCheckInterval, "retention-check-interval", cfg.RetentionCheckInterval, "How often the retention goroutine runs (default: 5m)")
+
+	// Compaction flags
+	fs.DurationVar(&cfg.CompactionCheckInterval, "compaction-check-interval", cfg.CompactionCheckInterval, "How often to scan dirty counters for eligible partitions (default: 30s)")
+	fs.IntVar(&cfg.CompactionMinDirtyObjects, "compaction-min-dirty-objects", cfg.CompactionMinDirtyObjects, "Min dirty S3 objects before compaction triggers (default: 4)")
 
 	// SASL flags
 	fs.BoolVar(&cfg.SASLEnabled, "sasl-enabled", cfg.SASLEnabled, "Enable SASL authentication")

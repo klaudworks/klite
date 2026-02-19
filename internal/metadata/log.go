@@ -41,14 +41,15 @@ type Log struct {
 	appendCount atomic.Int64
 
 	// For replay callbacks
-	topicCallback                func(CreateTopicEntry)
-	deleteTopicCallback          func(DeleteTopicEntry)
-	alterConfigCallback          func(AlterConfigEntry)
-	offsetCommitCallback         func(OffsetCommitEntry)
-	producerIDCallback           func(ProducerIDEntry)
-	logStartCallback             func(LogStartOffsetEntry)
-	scramCredentialCallback      func(ScramCredentialEntry)
-	scramCredentialDeleteCallback func(ScramCredentialDeleteEntry)
+	topicCallback                  func(CreateTopicEntry)
+	deleteTopicCallback            func(DeleteTopicEntry)
+	alterConfigCallback            func(AlterConfigEntry)
+	offsetCommitCallback           func(OffsetCommitEntry)
+	producerIDCallback             func(ProducerIDEntry)
+	logStartCallback               func(LogStartOffsetEntry)
+	scramCredentialCallback        func(ScramCredentialEntry)
+	scramCredentialDeleteCallback  func(ScramCredentialDeleteEntry)
+	compactionWatermarkCallback    func(CompactionWatermarkEntry)
 
 	// Snapshot provider for compaction (set by broker during init)
 	snapshotFn func() [][]byte
@@ -277,6 +278,15 @@ func (l *Log) dispatchEntry(entryType byte, data []byte) error {
 			l.scramCredentialDeleteCallback(e)
 		}
 
+	case EntryCompactionWatermark:
+		e, err := UnmarshalCompactionWatermark(data)
+		if err != nil {
+			return err
+		}
+		if l.compactionWatermarkCallback != nil {
+			l.compactionWatermarkCallback(e)
+		}
+
 	default:
 		l.logger.Warn("unknown metadata entry type, skipping", "type", entryType)
 	}
@@ -308,6 +318,11 @@ func (l *Log) SetScramCallbacks(
 ) {
 	l.scramCredentialCallback = credentialCb
 	l.scramCredentialDeleteCallback = deleteCb
+}
+
+// SetCompactionWatermarkCallback sets the replay callback for compaction watermark entries.
+func (l *Log) SetCompactionWatermarkCallback(cb func(CompactionWatermarkEntry)) {
+	l.compactionWatermarkCallback = cb
 }
 
 // compactLocked performs compaction while holding l.mu.

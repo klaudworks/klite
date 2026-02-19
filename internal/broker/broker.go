@@ -278,6 +278,11 @@ func (b *Broker) Run(ctx context.Context) error {
 	// 8b. Start retention loop
 	go b.retentionLoop(ctx)
 
+	// 8c. Start compaction loop (only if S3 is configured)
+	if b.s3Client != nil {
+		go b.compactionLoop(ctx)
+	}
+
 	// 9. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
 	go func() {
@@ -366,6 +371,11 @@ func (b *Broker) initMetadataLog() error {
 			b.state.SetLogStartOffsetFromReplay(e.TopicName, e.Partition, e.LogStartOffset)
 		},
 	)
+
+	// Compaction watermark replay callback
+	ml.SetCompactionWatermarkCallback(func(e metadata.CompactionWatermarkEntry) {
+		b.state.SetCompactionWatermarkFromReplay(e.TopicName, e.Partition, e.CleanedUpTo)
+	})
 
 	// Set up SCRAM credential replay callbacks if SASL is enabled
 	if b.saslStore != nil {
@@ -671,6 +681,10 @@ func (b *Broker) initS3() error {
 	// but no local WAL data (disaster recovery scenario)
 	b.probeS3Watermarks()
 
+	// Rehydrate dirty object counters for compacted partitions so
+	// compaction resumes after restart without new writes.
+	b.rehydrateDirtyCounters()
+
 	b.logger.Info("S3 storage initialized",
 		"bucket", b.cfg.S3Bucket,
 		"prefix", prefix,
@@ -855,9 +869,60 @@ func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, 
 	return nil
 }
 
+// rehydrateDirtyCounters counts S3 objects per compacted partition and sets
+// the dirty object counter so compaction can trigger after restart without
+// new writes. For each compacted partition, objects above cleanedUpTo are
+// counted as dirty.
+func (b *Broker) rehydrateDirtyCounters() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	topics := b.state.GetAllTopics()
+	for _, td := range topics {
+		policy, ok := td.Configs["cleanup.policy"]
+		if !ok {
+			policy = "delete"
+		}
+		if !strings.Contains(policy, "compact") {
+			continue
+		}
+
+		for _, pd := range td.Partitions {
+			prefix := s3store.ObjectKeyPrefix(b.s3Client.Prefix(), td.Name, pd.Index)
+			objects, err := b.s3Client.ListObjects(ctx, prefix)
+			if err != nil {
+				b.logger.Debug("dirty counter rehydration failed",
+					"topic", td.Name, "partition", pd.Index, "err", err)
+				continue
+			}
+
+			pd.Lock()
+			cleanedUpTo := pd.CleanedUpTo()
+			dirty := int32(0)
+			for _, obj := range objects {
+				if !strings.HasSuffix(obj.Key, ".obj") {
+					continue
+				}
+				baseOff := s3store.ParseBaseOffsetFromKey(obj.Key)
+				if baseOff > cleanedUpTo {
+					dirty++
+				}
+			}
+			if dirty > 0 {
+				pd.SetDirtyObjects(dirty)
+				b.logger.Debug("dirty counter rehydrated",
+					"topic", td.Name, "partition", pd.Index, "dirty", dirty)
+			}
+			pd.Unlock()
+		}
+	}
+}
+
 // probeS3Watermarks discovers high-water marks from S3 for each partition
-// and updates the cluster state. This handles the disaster recovery case where
-// metadata.log was restored from S3 backup but WAL data is gone.
+// and updates the cluster state. For partitions with no WAL data (disaster
+// recovery), both HW and S3 flush watermark are set from S3. For partitions
+// with WAL data, only the S3 flush watermark is set to avoid re-flushing
+// objects that already exist in S3.
 func (b *Broker) probeS3Watermarks() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -868,10 +933,11 @@ func (b *Broker) probeS3Watermarks() {
 		for _, pd := range td.Partitions {
 			pd.RLock()
 			hw := pd.HW()
+			flushWM := pd.S3FlushWatermark()
 			pd.RUnlock()
 
-			if hw > 0 {
-				continue // already has HW from WAL replay
+			if flushWM > 0 {
+				continue // already has S3 flush watermark
 			}
 
 			s3HW, err := b.s3Reader.DiscoverHW(ctx, td.Name, pd.Index)
@@ -881,7 +947,9 @@ func (b *Broker) probeS3Watermarks() {
 			}
 			if s3HW > 0 {
 				pd.Lock()
-				pd.SetHW(s3HW)
+				if hw == 0 {
+					pd.SetHW(s3HW)
+				}
 				pd.SetS3FlushWatermark(s3HW)
 				pd.Unlock()
 				updated++
@@ -947,6 +1015,7 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 			AdvanceWatermark: func(newWatermark int64) {
 				pd.Lock()
 				pd.SetS3FlushWatermark(newWatermark)
+				pd.IncrementDirtyObjects()
 				pd.Unlock()
 			},
 		})
@@ -1157,6 +1226,151 @@ func (b *Broker) enforceRetention() {
 				pd.CompactionMu.Unlock()
 			}
 		}
+	}
+}
+
+// compactionLoop runs the background compaction goroutine.
+func (b *Broker) compactionLoop(ctx context.Context) {
+	interval := b.cfg.CompactionCheckInterval
+	if interval == 0 {
+		interval = 30 * time.Second
+	}
+	minDirty := b.cfg.CompactionMinDirtyObjects
+	if minDirty == 0 {
+		minDirty = 4
+	}
+
+	compactor := s3store.NewCompactor(s3store.CompactorConfig{
+		Client:  b.s3Client,
+		Reader:  b.s3Reader,
+		Logger:  b.logger,
+		PersistWatermark: func(topic string, partition int32, cleanedUpTo int64) error {
+			if b.metaLog == nil {
+				return nil
+			}
+			entry := metadata.MarshalCompactionWatermark(&metadata.CompactionWatermarkEntry{
+				TopicName:   topic,
+				Partition:   partition,
+				CleanedUpTo: cleanedUpTo,
+			})
+			return b.metaLog.AppendSync(entry)
+		},
+		WindowBytes:   b.cfg.CompactionWindowBytes,
+		S3Concurrency: b.cfg.CompactionS3Concurrency,
+	})
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.compactOneDirtyPartition(ctx, compactor, int32(minDirty))
+		}
+	}
+}
+
+// compactOneDirtyPartition finds the most eligible partition and compacts it.
+func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32) {
+	topics := b.state.GetAllTopics()
+
+	var bestPD *cluster.PartData
+	var bestTD *cluster.TopicData
+	var bestDirty int32
+
+	for _, td := range topics {
+		policy, ok := td.Configs["cleanup.policy"]
+		if !ok {
+			policy = "delete"
+		}
+		if !strings.Contains(policy, "compact") {
+			continue
+		}
+
+		for _, pd := range td.Partitions {
+			dirty := pd.DirtyObjects()
+
+			// Eligibility check
+			if dirty < minDirty {
+				// Check staleness guarantee
+				lc := pd.LastCompacted()
+				if lc.IsZero() && dirty > 0 {
+					// Never compacted and has dirty objects — eligible
+				} else if dirty <= 0 {
+					continue
+				} else {
+					// Check max.compaction.lag.ms
+					maxLagMs := int64(9223372036854775807) // math.MaxInt64
+					if v, ok := td.Configs["max.compaction.lag.ms"]; ok {
+						if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+							maxLagMs = parsed
+						}
+					}
+					if maxLagMs < 9223372036854775807 && time.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
+						// Stale — eligible
+					} else {
+						continue
+					}
+				}
+			}
+
+			if dirty > bestDirty || bestPD == nil {
+				bestPD = pd
+				bestTD = td
+				bestDirty = dirty
+			}
+		}
+	}
+
+	if bestPD == nil {
+		return
+	}
+
+	// Determine topic-level configs
+	minCompactionLagMs := int64(0)
+	if v, ok := bestTD.Configs["min.compaction.lag.ms"]; ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			minCompactionLagMs = parsed
+		}
+	}
+
+	deleteRetentionMs := int64(86400000) // 24h default
+	if v, ok := bestTD.Configs["delete.retention.ms"]; ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			deleteRetentionMs = parsed
+		}
+	}
+	compactor.SetDeleteRetentionMs(deleteRetentionMs)
+
+	bestPD.RLock()
+	cleanedUpTo := bestPD.CleanedUpTo()
+	bestPD.RUnlock()
+
+	newWatermark, err := compactor.CompactPartition(
+		ctx,
+		bestTD.Name,
+		bestPD.Index,
+		cleanedUpTo,
+		minCompactionLagMs,
+		func() { bestPD.CompactionMu.Lock() },
+		func() { bestPD.CompactionMu.Unlock() },
+	)
+
+	if err != nil {
+		b.logger.Warn("compaction failed",
+			"topic", bestTD.Name, "partition", bestPD.Index, "err", err)
+		return
+	}
+
+	if newWatermark > cleanedUpTo {
+		bestPD.Lock()
+		bestPD.SetCleanedUpTo(newWatermark)
+		bestPD.ResetDirtyObjects(time.Now())
+		bestPD.Unlock()
+		b.logger.Info("compaction complete",
+			"topic", bestTD.Name, "partition", bestPD.Index,
+			"cleaned_up_to", newWatermark)
 	}
 }
 
