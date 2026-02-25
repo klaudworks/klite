@@ -116,6 +116,6 @@ The following Kafka topic configs are accepted (stored and returned by DescribeC
 
 ## Next steps
 
-- [Configuration](/reference/configuration/) -- broker-level configuration
+- [Configuration](/guides/configuration/) -- broker-level configuration
 - [Supported APIs](/reference/supported-apis/) -- API compatibility reference
 - [Storage](/concepts/storage/) -- how retention and compaction work internally

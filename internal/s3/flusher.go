@@ -283,11 +283,16 @@ func CollectWALBatches(walWriter *wal.Writer, walIndex *wal.Index, topicID [16]b
 		// Read batch from WAL
 		data, err := walWriter.ReadBatch(e)
 		if err != nil {
-			continue // skip unreadable entries
+			slog.Warn("S3 flush: skipping unreadable WAL batch",
+				"topic_id", topicID, "partition", partition,
+				"base_offset", e.BaseOffset, "err", err)
+			continue
 		}
 
-		// Parse header to get lastOffsetDelta
 		if len(data) < RecordBatchHeaderSize {
+			slog.Warn("S3 flush: skipping short WAL batch",
+				"topic_id", topicID, "partition", partition,
+				"base_offset", e.BaseOffset, "len", len(data))
 			continue
 		}
 		lastOffsetDelta := int32(binary.BigEndian.Uint32(data[23:27]))

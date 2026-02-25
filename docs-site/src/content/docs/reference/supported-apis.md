@@ -100,4 +100,4 @@ The following API keys are intentionally not supported. Requests for these APIs 
 
 - [Compatibility](/concepts/compatibility/) -- client library support and known differences
 - [Topic configs](/reference/topic-configs/) -- supported per-topic configuration
-- [Configuration](/reference/configuration/) -- broker configuration reference
+- [Configuration](/guides/configuration/) -- broker configuration reference

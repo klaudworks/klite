@@ -3,9 +3,11 @@ package integration
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -28,7 +30,6 @@ func lookupTopicID(t *testing.T, cl *kgo.Client, topic string) [16]byte {
 }
 
 // buildFetchAtOffset builds a Fetch request for a single partition.
-// Uses TopicID (for v13+) resolved from the broker's Metadata.
 func buildFetchAtOffset(t *testing.T, cl *kgo.Client, topic string, partition int32, offset int64) *kmsg.FetchRequest {
 	t.Helper()
 	topicID := lookupTopicID(t, cl, topic)
@@ -71,8 +72,7 @@ func createTopicWithRetention(t *testing.T, cl *kgo.Client, topic string, partit
 	require.Equal(t, int16(0), resp.Topics[0].ErrorCode, "create topic %s: %s", topic, kerr.ErrorForCode(resp.Topics[0].ErrorCode))
 }
 
-// produceRecordWithTimestamp produces a single record with a specific timestamp
-// using the kgo client, which builds proper RecordBatch encoding.
+// produceRecordWithTimestamp produces a single record with a specific timestamp.
 func produceRecordWithTimestamp(t *testing.T, cl *kgo.Client, topic string, partition int32, key string, ts time.Time) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -88,84 +88,73 @@ func produceRecordWithTimestamp(t *testing.T, cl *kgo.Client, topic string, part
 	require.NoError(t, results.FirstErr(), "produce record %s", key)
 }
 
-// TestRetentionEnforcement creates a topic with short retention, produces
-// records with old timestamps, triggers retention, and verifies deletion.
-func TestRetentionEnforcement(t *testing.T) {
-	t.Parallel()
-
-	// Use a short retention check interval so we don't wait 5 minutes
-	tb := StartBroker(t,
-		WithAutoCreateTopics(false),
-		WithRetentionCheckInterval(500*time.Millisecond),
-	)
-	cl := NewClient(t, tb.Addr)
-
-	topic := "retention-test"
-
-	// Create topic with 5 second retention
-	createTopicWithRetention(t, cl, topic, 1, "5000")
-
-	// Produce records with old timestamps (10 seconds ago — clearly expired)
-	oldTs := time.Now().Add(-10 * time.Second)
-	for i := 0; i < 5; i++ {
-		produceRecordWithTimestamp(t, cl, topic, 0, fmt.Sprintf("old-%d", i), oldTs.Add(time.Duration(i)*time.Millisecond))
+// waitForS3Objects polls until at least minCount .obj files exist for a
+// topic/partition in the given InMemoryS3.
+func waitForS3Objects(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int, minCount int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		count := 0
+		partStr := fmt.Sprintf("%s/%d/", topic, partition)
+		for _, k := range mem.Keys() {
+			if strings.Contains(k, partStr) && strings.HasSuffix(k, ".obj") {
+				count++
+			}
+		}
+		if count >= minCount {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-
-	// Produce records with current timestamps (well within 5s retention)
-	recentTs := time.Now()
-	for i := 0; i < 3; i++ {
-		produceRecordWithTimestamp(t, cl, topic, 0, fmt.Sprintf("new-%d", i), recentTs.Add(time.Duration(i)*time.Millisecond))
-	}
-
-	// Wait for retention to run (check interval is 500ms, wait a few cycles)
-	time.Sleep(2 * time.Second)
-
-	// Check ListOffsets earliest - should have advanced past the old records
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	listReq := kmsg.NewListOffsetsRequest()
-	listReq.Version = 7
-	lt := kmsg.NewListOffsetsRequestTopic()
-	lt.Topic = topic
-	lp := kmsg.NewListOffsetsRequestTopicPartition()
-	lp.Partition = 0
-	lp.Timestamp = -2 // Earliest
-	lt.Partitions = append(lt.Partitions, lp)
-	listReq.Topics = append(listReq.Topics, lt)
-
-	listResp, err := listReq.RequestWith(ctx, cl)
-	require.NoError(t, err)
-	require.Len(t, listResp.Topics, 1)
-	require.Len(t, listResp.Topics[0].Partitions, 1)
-
-	lsPartition := listResp.Topics[0].Partitions[0]
-	assert.Equal(t, int16(0), lsPartition.ErrorCode)
-	// Earliest offset should have advanced past 0 (old records deleted)
-	assert.Greater(t, lsPartition.Offset, int64(0), "logStartOffset should have advanced past 0")
+	t.Fatalf("timed out waiting for %d S3 objects for %s/%d (timeout %v)", minCount, topic, partition, timeout)
 }
 
-// TestRetentionConsumerReset verifies that a consumer reading old data gets
-// OFFSET_OUT_OF_RANGE after retention, and can reset to earliest.
-func TestRetentionConsumerReset(t *testing.T) {
-	t.Parallel()
+// waitForLogStartAdvance polls ListOffsets(Earliest) until logStartOffset > minOffset.
+func waitForLogStartAdvance(t *testing.T, cl *kgo.Client, topic string, partition int32, minOffset int64, timeout time.Duration) int64 {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		listReq := kmsg.NewListOffsetsRequest()
+		listReq.Version = 7
+		lt := kmsg.NewListOffsetsRequestTopic()
+		lt.Topic = topic
+		lp := kmsg.NewListOffsetsRequestTopicPartition()
+		lp.Partition = partition
+		lp.Timestamp = -2 // Earliest
+		lt.Partitions = append(lt.Partitions, lp)
+		listReq.Topics = append(listReq.Topics, lt)
 
-	tb := StartBroker(t,
-		WithAutoCreateTopics(false),
-		WithRetentionCheckInterval(500*time.Millisecond),
-	)
+		listResp, err := listReq.RequestWith(ctx, cl)
+		cancel()
+		if err == nil && len(listResp.Topics) > 0 && len(listResp.Topics[0].Partitions) > 0 {
+			offset := listResp.Topics[0].Partitions[0].Offset
+			if offset > minOffset {
+				return offset
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for logStartOffset to advance past %d for %s/%d", minOffset, topic, partition)
+	return 0
+}
+
+// produceOldAndNew produces old (expired) and recent records, waits for both
+// batches to flush to S3, and waits for retention to advance logStartOffset.
+// Returns the client used for producing.
+func produceOldAndNew(t *testing.T, tb *TestBroker, mem *s3store.InMemoryS3, topic string) *kgo.Client {
+	t.Helper()
 	cl := NewClient(t, tb.Addr)
-
-	topic := "retention-consumer-reset"
-
-	// Create topic with 5 second retention
 	createTopicWithRetention(t, cl, topic, 1, "5000")
 
-	// Produce old records (10 seconds ago — clearly expired)
+	// Produce old records (10s ago — clearly expired with 5s retention)
 	oldTs := time.Now().Add(-10 * time.Second)
 	for i := 0; i < 5; i++ {
 		produceRecordWithTimestamp(t, cl, topic, 0, fmt.Sprintf("old-%d", i), oldTs)
 	}
+
+	// Wait for old records to land in S3
+	waitForS3Objects(t, mem, topic, 0, 1, 10*time.Second)
 
 	// Produce recent records (well within 5s retention)
 	recentTs := time.Now()
@@ -173,10 +162,32 @@ func TestRetentionConsumerReset(t *testing.T) {
 		produceRecordWithTimestamp(t, cl, topic, 0, fmt.Sprintf("new-%d", i), recentTs)
 	}
 
-	// Wait for retention
-	time.Sleep(2 * time.Second)
+	// Wait for recent records to flush (second S3 object)
+	waitForS3Objects(t, mem, topic, 0, 2, 10*time.Second)
 
-	// Try to fetch from offset 0 - should get OFFSET_OUT_OF_RANGE
+	// Wait for retention to advance logStartOffset past 0
+	waitForLogStartAdvance(t, cl, topic, 0, 0, 10*time.Second)
+
+	return cl
+}
+
+// TestRetentionConsumerReset verifies that a consumer reading old data gets
+// OFFSET_OUT_OF_RANGE after retention, and can reset to earliest.
+func TestRetentionConsumerReset(t *testing.T) {
+	t.Parallel()
+
+	mem := s3store.NewInMemoryS3()
+	tb := StartBroker(t,
+		WithAutoCreateTopics(false),
+		WithS3(mem, "test-bucket", "klite/ret-reset"),
+		WithS3FlushInterval(200*time.Millisecond),
+		WithRetentionCheckInterval(500*time.Millisecond),
+	)
+
+	topic := "retention-consumer-reset"
+	cl := produceOldAndNew(t, tb, mem, topic)
+
+	// Fetch from offset 0 — should get OFFSET_OUT_OF_RANGE
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -190,7 +201,7 @@ func TestRetentionConsumerReset(t *testing.T) {
 	assert.Equal(t, kerr.OffsetOutOfRange.Code, fetchPart.ErrorCode,
 		"fetching deleted offset should return OFFSET_OUT_OF_RANGE")
 
-	// Now consume from earliest - should get only the recent records
+	// Consume from earliest — should get only the recent records
 	consumer := NewClient(t, tb.Addr,
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
@@ -204,65 +215,43 @@ func TestRetentionConsumerReset(t *testing.T) {
 func TestRetentionSurvivesRestart(t *testing.T) {
 	t.Parallel()
 
+	mem := s3store.NewInMemoryS3()
 	dataDir := t.TempDir()
 	topic := "retention-restart"
 
-	// Phase 1: Start broker, produce with old timestamps, trigger retention
+	// Phase 1: Start broker, produce old data, flush to S3, trigger retention
 	func() {
 		tb := StartBroker(t,
 			WithAutoCreateTopics(false),
-			WithWALEnabled(true),
 			WithDataDir(dataDir),
+			WithS3(mem, "test-bucket", "klite/ret-restart"),
+			WithS3FlushInterval(200*time.Millisecond),
 			WithRetentionCheckInterval(500*time.Millisecond),
 		)
-		cl := NewClient(t, tb.Addr)
 
-		createTopicWithRetention(t, cl, topic, 1, "5000")
+		cl := produceOldAndNew(t, tb, mem, topic)
 
-		// Produce old records (10 seconds ago — clearly expired)
-		oldTs := time.Now().Add(-10 * time.Second)
-		for i := 0; i < 5; i++ {
-			produceRecordWithTimestamp(t, cl, topic, 0, fmt.Sprintf("old-%d", i), oldTs)
-		}
-
-		// Produce recent records (well within 5s retention)
-		recentTs := time.Now()
-		for i := 0; i < 3; i++ {
-			produceRecordWithTimestamp(t, cl, topic, 0, fmt.Sprintf("new-%d", i), recentTs)
-		}
-
-		// Wait for retention to run
-		time.Sleep(2 * time.Second)
-
-		// Verify logStartOffset advanced
+		// Verify logStartOffset advanced before stopping
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		listReq := kmsg.NewListOffsetsRequest()
-		listReq.Version = 7
-		lt := kmsg.NewListOffsetsRequestTopic()
-		lt.Topic = topic
-		lp := kmsg.NewListOffsetsRequestTopicPartition()
-		lp.Partition = 0
-		lp.Timestamp = -2
-		lt.Partitions = append(lt.Partitions, lp)
-		listReq.Topics = append(listReq.Topics, lt)
-
-		listResp, err := listReq.RequestWith(ctx, cl)
+		adm := kadm.NewClient(cl)
+		offsets, err := adm.ListStartOffsets(ctx, topic)
 		require.NoError(t, err)
-		require.Greater(t, listResp.Topics[0].Partitions[0].Offset, int64(0),
-			"logStartOffset should advance before restart")
+		o, ok := offsets.Lookup(topic, 0)
+		require.True(t, ok)
+		require.Greater(t, o.Offset, int64(0), "logStartOffset should advance before restart")
 	}()
 
-	// Phase 2: Restart broker with same data dir
+	// Phase 2: Restart broker with same data dir + same S3
 	tb2 := StartBroker(t,
 		WithAutoCreateTopics(false),
-		WithWALEnabled(true),
 		WithDataDir(dataDir),
-		WithRetentionCheckInterval(5*time.Minute), // long interval to avoid re-triggering
+		WithS3(mem, "test-bucket", "klite/ret-restart"),
+		WithS3FlushInterval(24*time.Hour),
+		WithRetentionCheckInterval(5*time.Minute),
 	)
 
-	// Verify logStartOffset is restored from metadata.log
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -286,7 +275,6 @@ func TestRetentionSurvivesRestart(t *testing.T) {
 	assert.Greater(t, restoredLogStart, int64(0),
 		"logStartOffset should be restored from metadata.log after restart")
 
-	// Verify deleted data does not reappear
 	fetchReq := buildFetchAtOffset(t, cl2, topic, 0, 0)
 	fetchResp, err := fetchReq.RequestWith(ctx, cl2)
 	require.NoError(t, err)

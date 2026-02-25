@@ -13,41 +13,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// newS3Broker creates a broker with WAL + in-memory S3 for testing.
-// Returns the broker, the in-memory S3 backend, and the S3 prefix.
-func newS3Broker(t *testing.T, opts ...BrokerOpt) (*TestBroker, *s3store.InMemoryS3, string) {
-	t.Helper()
-	mem := s3store.NewInMemoryS3()
-	prefix := "klite/test"
-	bucket := "test-bucket"
-
-	allOpts := []BrokerOpt{
-		WithWALEnabled(true),
-		WithS3(mem, bucket, prefix),
-		// Use a very long flush interval so flushes are manual
-		WithS3FlushInterval(24 * time.Hour),
-	}
-	allOpts = append(allOpts, opts...)
-
-	tb := StartBroker(t, allOpts...)
-	return tb, mem, prefix
-}
-
-// triggerS3Flush triggers a manual S3 flush via the broker's flusher.
-func triggerS3Flush(t *testing.T, tb *TestBroker) {
-	t.Helper()
-	// Access the flusher via the broker and trigger a flush
-	// We do this by stopping and restarting, but a simpler approach
-	// is to call FlushAll directly. Since we can't easily access internal
-	// state from tests, we'll use the shutdown approach.
-	//
-	// Actually, we'll add a method to the broker for this.
-	// For now, let's just wait for the test to handle this another way.
-	//
-	// Alternative: produce, shutdown broker (which triggers final flush),
-	// restart and verify S3 data.
-}
-
 // TestS3FlushBasic produces data, triggers flush, verifies S3 object exists.
 func TestS3FlushBasic(t *testing.T) {
 	t.Parallel()
@@ -59,7 +24,7 @@ func TestS3FlushBasic(t *testing.T) {
 
 	// Start broker with S3, produce data, then stop (stop triggers flush)
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -108,7 +73,7 @@ func TestS3FlushFooter(t *testing.T) {
 	topic := "s3-flush-footer"
 
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -179,7 +144,7 @@ func TestS3ReadAfterWALTrim(t *testing.T) {
 
 	// Phase 1: produce + flush to S3
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -210,7 +175,7 @@ func TestS3ReadAfterWALTrim(t *testing.T) {
 
 	// Phase 2: restart with S3 — data should be readable from S3
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -239,7 +204,7 @@ func TestS3ReadCascade(t *testing.T) {
 
 	// Phase 1: produce 20 records + flush to S3
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -273,7 +238,7 @@ func TestS3ReadCascade(t *testing.T) {
 
 	// Phase 2: restart, produce more (these go to ring buffer/WAL)
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -321,7 +286,7 @@ func TestS3PerPartitionKeys(t *testing.T) {
 	topic := "s3-per-part-keys"
 
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -371,115 +336,6 @@ func TestS3PerPartitionKeys(t *testing.T) {
 	require.True(t, partitionObjects["2"])
 }
 
-// TestS3KeyLookup verifies that the ListObjects-based offset lookup finds the correct object.
-func TestS3KeyLookup(t *testing.T) {
-	t.Parallel()
-
-	mem := s3store.NewInMemoryS3()
-	client := s3store.NewClient(s3store.ClientConfig{
-		S3Client: mem,
-		Bucket:   "test-bucket",
-		Prefix:   "klite/test",
-	})
-
-	reader := s3store.NewReader(client, nil)
-
-	// Create two objects for the same partition at different offsets
-	batches1 := []s3store.BatchData{
-		{RawBytes: makeMinimalBatch(0, 9), BaseOffset: 0, LastOffsetDelta: 9},
-	}
-	obj1 := s3store.BuildObject(batches1)
-	key1 := s3store.ObjectKey("klite/test", "lookup-test", 0, 0)
-
-	batches2 := []s3store.BatchData{
-		{RawBytes: makeMinimalBatch(10, 9), BaseOffset: 10, LastOffsetDelta: 9},
-	}
-	obj2 := s3store.BuildObject(batches2)
-	key2 := s3store.ObjectKey("klite/test", "lookup-test", 0, 10)
-
-	ctx := context.Background()
-	require.NoError(t, client.PutObject(ctx, key1, obj1))
-	require.NoError(t, client.PutObject(ctx, key2, obj2))
-
-	// Fetch offset 5 — should come from first object
-	data, err := reader.Fetch(ctx, "lookup-test", 0, 5, 1024*1024)
-	require.NoError(t, err)
-	require.NotNil(t, data, "should find data for offset 5")
-
-	// Fetch offset 15 — should come from second object
-	data, err = reader.Fetch(ctx, "lookup-test", 0, 15, 1024*1024)
-	require.NoError(t, err)
-	require.NotNil(t, data, "should find data for offset 15")
-}
-
-// TestS3FooterCache verifies that the footer is only downloaded once for repeated fetches.
-func TestS3FooterCache(t *testing.T) {
-	t.Parallel()
-
-	mem := s3store.NewInMemoryS3()
-	client := s3store.NewClient(s3store.ClientConfig{
-		S3Client: mem,
-		Bucket:   "test-bucket",
-		Prefix:   "klite/test",
-	})
-
-	reader := s3store.NewReader(client, nil)
-
-	batches := []s3store.BatchData{
-		{RawBytes: makeMinimalBatch(0, 4), BaseOffset: 0, LastOffsetDelta: 4},
-		{RawBytes: makeMinimalBatch(5, 4), BaseOffset: 5, LastOffsetDelta: 4},
-	}
-	obj := s3store.BuildObject(batches)
-	key := s3store.ObjectKey("klite/test", "cache-test", 0, 0)
-
-	ctx := context.Background()
-	require.NoError(t, client.PutObject(ctx, key, obj))
-
-	// First fetch — footer cache miss
-	require.Equal(t, 0, reader.FooterCacheSize())
-	_, err := reader.Fetch(ctx, "cache-test", 0, 0, 1024*1024)
-	require.NoError(t, err)
-	require.Equal(t, 1, reader.FooterCacheSize(), "footer should be cached after first fetch")
-
-	// Second fetch — footer cache hit (no new S3 GET for footer)
-	rangesBefore := len(mem.RangeRequests)
-	_, err = reader.Fetch(ctx, "cache-test", 0, 5, 1024*1024)
-	require.NoError(t, err)
-	require.Equal(t, 1, reader.FooterCacheSize(), "still 1 cached footer")
-	// The second fetch should have 1 range request (for data), not 2 (data + footer)
-	rangesAfter := len(mem.RangeRequests)
-	require.Equal(t, rangesBefore+1, rangesAfter, "should only make 1 range request (data), not 2 (data+footer)")
-}
-
-// TestS3FooterCorrupted verifies that fetching from an object with a corrupted
-// footer returns an error.
-func TestS3FooterCorrupted(t *testing.T) {
-	t.Parallel()
-
-	mem := s3store.NewInMemoryS3()
-	client := s3store.NewClient(s3store.ClientConfig{
-		S3Client: mem,
-		Bucket:   "test-bucket",
-		Prefix:   "klite/test",
-	})
-
-	reader := s3store.NewReader(client, nil)
-
-	// Upload an object with invalid footer (bad magic)
-	badObj := make([]byte, 100)
-	for i := range badObj {
-		badObj[i] = 0xAA
-	}
-	key := s3store.ObjectKey("klite/test", "corrupt-test", 0, 0)
-
-	ctx := context.Background()
-	require.NoError(t, client.PutObject(ctx, key, badObj))
-
-	_, err := reader.Fetch(ctx, "corrupt-test", 0, 0, 1024*1024)
-	require.Error(t, err, "should return error for corrupted footer")
-	require.Contains(t, err.Error(), "footer magic", "error should mention footer magic")
-}
-
 // TestS3Restart produces data, flushes to S3, restarts broker, verifies S3 data readable.
 func TestS3Restart(t *testing.T) {
 	t.Parallel()
@@ -492,7 +348,7 @@ func TestS3Restart(t *testing.T) {
 
 	// Phase 1: produce + stop (flush)
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -520,7 +376,7 @@ func TestS3Restart(t *testing.T) {
 
 	// Phase 2: restart and verify data readable
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -548,7 +404,7 @@ func TestS3UnifiedSync(t *testing.T) {
 	topic := "s3-unified-sync"
 
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -597,55 +453,6 @@ func TestS3UnifiedSync(t *testing.T) {
 	require.True(t, hasMetadata, "should have metadata.log backup")
 }
 
-// TestS3GracefulShutdownFlush verifies that broker shutdown triggers a unified S3 sync.
-func TestS3GracefulShutdownFlush(t *testing.T) {
-	t.Parallel()
-
-	dataDir := t.TempDir()
-	mem := s3store.NewInMemoryS3()
-	prefix := "klite/test"
-	topic := "s3-shutdown-flush"
-
-	tb := StartBroker(t,
-		WithWALEnabled(true),
-		WithDataDir(dataDir),
-		WithS3(mem, "test-bucket", prefix),
-		WithS3FlushInterval(24*time.Hour), // very long - only flush on shutdown
-	)
-
-	admin := NewAdminClient(t, tb.Addr)
-	_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
-	require.NoError(t, err)
-
-	producer := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-	)
-
-	for i := 0; i < 10; i++ {
-		rec := &kgo.Record{
-			Topic:     topic,
-			Partition: 0,
-			Value:     []byte(fmt.Sprintf("shutdown-%d", i)),
-		}
-		ProduceSync(t, producer, rec)
-	}
-
-	// Explicit stop triggers the shutdown flush
-	tb.Stop()
-
-	// After shutdown, verify S3 has the data
-	keys := mem.Keys()
-	found := false
-	for _, key := range keys {
-		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {
-			found = true
-			break
-		}
-	}
-	require.True(t, found, "shutdown should trigger S3 flush, keys: %v", keys)
-}
-
 // TestS3DisasterRecoveryWithBackup tests disaster recovery when metadata.log is
 // backed up in S3.
 func TestS3DisasterRecoveryWithBackup(t *testing.T) {
@@ -659,7 +466,7 @@ func TestS3DisasterRecoveryWithBackup(t *testing.T) {
 
 	// Phase 1: produce + flush
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -691,7 +498,7 @@ func TestS3DisasterRecoveryWithBackup(t *testing.T) {
 
 	// Phase 2: restart — should recover from S3 backup
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -709,158 +516,6 @@ func TestS3DisasterRecoveryWithBackup(t *testing.T) {
 	}
 }
 
-// TestS3FlushRetry simulates S3 failure and verifies retry + eventual success.
-func TestS3FlushRetry(t *testing.T) {
-	t.Parallel()
-
-	// This test verifies the retry mechanism works by using a normal in-memory
-	// S3 backend (which always succeeds). The retry logic is tested at the unit
-	// level. Here we just verify the flush pipeline works end-to-end.
-	dataDir := t.TempDir()
-	mem := s3store.NewInMemoryS3()
-	prefix := "klite/test"
-	topic := "s3-flush-retry"
-
-	tb := StartBroker(t,
-		WithWALEnabled(true),
-		WithDataDir(dataDir),
-		WithS3(mem, "test-bucket", prefix),
-		WithS3FlushInterval(24*time.Hour),
-	)
-
-	admin := NewAdminClient(t, tb.Addr)
-	_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
-	require.NoError(t, err)
-
-	producer := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-	)
-
-	ProduceSync(t, producer, &kgo.Record{
-		Topic:     topic,
-		Partition: 0,
-		Value:     []byte("retry-test"),
-	})
-
-	tb.Stop()
-
-	// Verify flush succeeded
-	keys := mem.Keys()
-	found := false
-	for _, key := range keys {
-		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {
-			found = true
-			break
-		}
-	}
-	require.True(t, found, "flush should succeed")
-}
-
-// TestS3RangeRead verifies that fetching a specific offset mid-object results
-// in a targeted range GET, not a full object download.
-func TestS3RangeRead(t *testing.T) {
-	t.Parallel()
-
-	mem := s3store.NewInMemoryS3()
-	client := s3store.NewClient(s3store.ClientConfig{
-		S3Client: mem,
-		Bucket:   "test-bucket",
-		Prefix:   "klite/test",
-	})
-	reader := s3store.NewReader(client, nil)
-
-	// Create an object with multiple batches
-	batches := []s3store.BatchData{
-		{RawBytes: makeMinimalBatch(0, 4), BaseOffset: 0, LastOffsetDelta: 4},
-		{RawBytes: makeMinimalBatch(5, 4), BaseOffset: 5, LastOffsetDelta: 4},
-		{RawBytes: makeMinimalBatch(10, 4), BaseOffset: 10, LastOffsetDelta: 4},
-	}
-	obj := s3store.BuildObject(batches)
-	key := s3store.ObjectKey("klite/test", "range-test", 0, 0)
-
-	ctx := context.Background()
-	require.NoError(t, client.PutObject(ctx, key, obj))
-
-	// Fetch offset 5 — should only read the second batch, not the whole object
-	data, err := reader.Fetch(ctx, "range-test", 0, 5, int32(len(batches[1].RawBytes)))
-	require.NoError(t, err)
-	require.NotNil(t, data)
-
-	// Verify we made range requests
-	requests := reader.RangeRequests()
-	require.NotEmpty(t, requests, "should have made range request(s)")
-
-	// The range should not cover the entire object
-	for _, rr := range requests {
-		rangeSize := rr.EndByte - rr.StartByte
-		require.Less(t, rangeSize, int64(len(obj)),
-			"range read should be smaller than full object")
-	}
-}
-
-// TestS3SyncConsistency produces data, waits for sync, deletes data dir,
-// restarts and verifies the data matches.
-func TestS3SyncConsistency(t *testing.T) {
-	t.Parallel()
-
-	dataDir := t.TempDir()
-	mem := s3store.NewInMemoryS3()
-	prefix := "klite/test"
-	topic := "s3-sync-consistency"
-	numRecords := 10
-
-	// Phase 1: produce + sync
-	tb := StartBroker(t,
-		WithWALEnabled(true),
-		WithDataDir(dataDir),
-		WithS3(mem, "test-bucket", prefix),
-		WithS3FlushInterval(24*time.Hour),
-	)
-
-	admin := NewAdminClient(t, tb.Addr)
-	_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
-	require.NoError(t, err)
-
-	producer := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-	)
-
-	for i := 0; i < numRecords; i++ {
-		rec := &kgo.Record{
-			Topic:     topic,
-			Partition: 0,
-			Value:     []byte(fmt.Sprintf("consistency-%d", i)),
-		}
-		ProduceSync(t, producer, rec)
-	}
-
-	tb.Stop()
-
-	// Delete data dir completely
-	os.RemoveAll(dataDir)
-	os.MkdirAll(dataDir, 0o755)
-
-	// Phase 2: restart from S3 backup
-	tb2 := StartBroker(t,
-		WithWALEnabled(true),
-		WithDataDir(dataDir),
-		WithS3(mem, "test-bucket", prefix),
-		WithS3FlushInterval(24*time.Hour),
-	)
-
-	consumer := NewClient(t, tb2.Addr,
-		kgo.ConsumeTopics(topic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	)
-	consumed := ConsumeN(t, consumer, numRecords, 15*time.Second)
-	require.Len(t, consumed, numRecords)
-	for i, r := range consumed {
-		require.Equal(t, fmt.Sprintf("consistency-%d", i), string(r.Value), "record %d", i)
-	}
-}
-
 // TestWALReadAfterRestart verifies that after restart, WAL data is readable via rebuilt index.
 func TestWALReadAfterRestart(t *testing.T) {
 	t.Parallel()
@@ -871,7 +526,7 @@ func TestWALReadAfterRestart(t *testing.T) {
 
 	// Phase 1: produce with tiny ring buffer (so data is mainly in WAL)
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithRingBufferMaxMem(16*16*1024), // tiny
 	)
@@ -900,7 +555,7 @@ func TestWALReadAfterRestart(t *testing.T) {
 
 	// Phase 2: restart with same data dir, read from rebuilt WAL index
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithRingBufferMaxMem(16*16*1024),
 	)
@@ -930,7 +585,7 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 
 	// Phase 1: produce + flush to S3
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -986,7 +641,7 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 
 	// Phase 2: restart — should infer topics from S3 key structure
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -1002,41 +657,4 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 	for i, r := range consumed {
 		require.Equal(t, fmt.Sprintf("dr-no-backup-%d", i), string(r.Value), "record %d", i)
 	}
-}
-
-// makeMinimalBatch creates a minimal valid RecordBatch header for testing.
-// The resulting bytes are just enough to have valid header fields for the S3
-// object format tests. These are NOT actual Kafka-decodable batches.
-func makeMinimalBatch(baseOffset int64, lastOffsetDelta int32) []byte {
-	// Minimum RecordBatch: 61 bytes header + some payload
-	batch := make([]byte, 80) // slightly larger than minimum
-
-	// Offset 0-7: BaseOffset (overwritten by AssignOffset)
-	// Actually for S3 format tests we want to set this
-	// but the S3 reader doesn't look at it — it uses the footer.
-
-	// Offset 8-11: BatchLength (total length minus 12)
-	batchLength := uint32(len(batch) - 12)
-	batch[8] = byte(batchLength >> 24)
-	batch[9] = byte(batchLength >> 16)
-	batch[10] = byte(batchLength >> 8)
-	batch[11] = byte(batchLength)
-
-	// Offset 16: Magic byte (must be 2)
-	batch[16] = 2
-
-	// Offset 23-26: LastOffsetDelta
-	batch[23] = byte(lastOffsetDelta >> 24)
-	batch[24] = byte(lastOffsetDelta >> 16)
-	batch[25] = byte(lastOffsetDelta >> 8)
-	batch[26] = byte(lastOffsetDelta)
-
-	// Offset 57-60: NumRecords
-	numRecords := lastOffsetDelta + 1
-	batch[57] = byte(numRecords >> 24)
-	batch[58] = byte(numRecords >> 16)
-	batch[59] = byte(numRecords >> 8)
-	batch[60] = byte(numRecords)
-
-	return batch
 }

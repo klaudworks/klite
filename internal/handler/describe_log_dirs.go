@@ -14,8 +14,8 @@ func HandleDescribeLogDirs(state *cluster.State, dataDir string) server.Handler 
 
 		rd := kmsg.NewDescribeLogDirsResponseDir()
 		rd.Dir = dataDir
-		rd.TotalBytes = -1  // Unknown for in-memory
-		rd.UsableBytes = -1 // Unknown for in-memory
+		rd.TotalBytes = -1  // TODO: report actual WAL disk usage
+		rd.UsableBytes = -1 // TODO: report actual WAL disk available
 
 		if r.Topics == nil {
 			// Return all partitions

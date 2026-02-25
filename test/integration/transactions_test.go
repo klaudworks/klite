@@ -635,3 +635,55 @@ func TestIdempotentOutOfOrder(t *testing.T) {
 	_ = admin
 	_ = kerr.OutOfOrderSequenceNumber
 }
+
+// TestIdempotentProduceConcurrent fires many records concurrently using
+// async Produce (not ProduceSync) with idempotent writes enabled. This
+// exercises the code path where multiple produce requests are in-flight
+// on the same connection simultaneously — the scenario that triggered
+// the buffer-reuse CORRUPT_MESSAGE bug.
+func TestIdempotentProduceConcurrent(t *testing.T) {
+	t.Parallel()
+	tb := StartBroker(t)
+
+	topic := "test-idempotent-concurrent"
+	createTopic(t, tb.Addr, topic)
+
+	const numRecords = 2000
+
+	cl := NewClient(t, tb.Addr,
+		kgo.DefaultProduceTopic(topic),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		// Idempotent writes are enabled by default with AllISRAcks()
+		kgo.MaxBufferedRecords(numRecords),
+		kgo.ProducerBatchMaxBytes(16384), // small batches → more concurrent requests
+		kgo.ProducerLinger(time.Millisecond),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		kgo.RequestRetries(3),
+		kgo.RetryBackoffFn(func(int) time.Duration { return 50 * time.Millisecond }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var errCount int64
+	payload := make([]byte, 200)
+	for i := 0; i < numRecords; i++ {
+		rec := &kgo.Record{Partition: 0, Value: payload}
+		cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
+			if err != nil {
+				errCount++
+			}
+		})
+	}
+
+	require.NoError(t, cl.Flush(ctx))
+	require.Zero(t, errCount, "expected zero produce errors with idempotent writes")
+
+	// Consume and verify all records arrived
+	consumer := NewClient(t, tb.Addr,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	records := ConsumeN(t, consumer, numRecords, 10*time.Second)
+	require.Len(t, records, numRecords)
+}

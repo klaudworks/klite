@@ -20,7 +20,7 @@ var topicConfigDefaults = map[string]string{
 	"message.timestamp.type": "CreateTime",
 	"min.compaction.lag.ms":  "0",
 	"max.compaction.lag.ms":  "9223372036854775807",
-	"delete.retention.ms":   "86400000",
+	"delete.retention.ms":    "86400000",
 }
 
 // DescribeConfigsConfig holds config for the DescribeConfigs handler.

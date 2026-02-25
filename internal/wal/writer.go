@@ -29,7 +29,7 @@ type WriterConfig struct {
 func DefaultWriterConfig() WriterConfig {
 	return WriterConfig{
 		SyncInterval:    2 * time.Millisecond,
-		SegmentMaxBytes: 64 * 1024 * 1024,  // 64 MiB
+		SegmentMaxBytes: 64 * 1024 * 1024,   // 64 MiB
 		MaxDiskSize:     1024 * 1024 * 1024, // 1 GiB
 		FsyncEnabled:    true,
 		Clock:           clock.RealClock{},
@@ -39,18 +39,18 @@ func DefaultWriterConfig() WriterConfig {
 
 // writeRequest is sent from handler goroutines to the WAL writer.
 type writeRequest struct {
-	entry  []byte       // serialized WAL entry (MarshalEntry output)
+	entry  []byte        // serialized WAL entry (MarshalEntry output)
 	doneCh chan struct{} // closed after fsync completes
 }
 
 // segmentInfo tracks a single WAL segment file.
 type segmentInfo struct {
-	seq      uint64   // starting sequence number
-	file     *os.File // open file handle
-	size     int64    // current file size
-	path     string   // file path
-	minSeq   uint64   // minimum WAL sequence in this segment
-	maxSeq   uint64   // maximum WAL sequence in this segment
+	seq    uint64   // starting sequence number
+	file   *os.File // open file handle
+	size   int64    // current file size
+	path   string   // file path
+	minSeq uint64   // minimum WAL sequence in this segment
+	maxSeq uint64   // maximum WAL sequence in this segment
 }
 
 // Writer is the WAL writer goroutine. It serializes all WAL writes,
@@ -60,19 +60,20 @@ type Writer struct {
 	idx    *Index
 	logger *slog.Logger
 
-	writeCh chan writeRequest
-	stopCh  chan struct{}
-	done    chan struct{}
+	writeCh   chan writeRequest
+	cleanupCh chan struct{} // signals TryCleanupSegments
+	stopCh    chan struct{}
+	done      chan struct{}
 
 	// Segment state (owned exclusively by the writer goroutine)
-	segments   []*segmentInfo
-	current    *segmentInfo
-	nextSeq    atomic.Uint64
-	walDir     string
+	segments []*segmentInfo
+	current  *segmentInfo
+	nextSeq  atomic.Uint64
+	walDir   string
 
 	// For external callers to check
-	mu       sync.Mutex
-	stopped  bool
+	mu      sync.Mutex
+	stopped bool
 }
 
 // NewWriter creates a new WAL writer. Call Start() to begin the writer goroutine.
@@ -99,13 +100,14 @@ func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
 	}
 
 	w := &Writer{
-		cfg:     cfg,
-		idx:     idx,
-		logger:  cfg.Logger,
-		writeCh: make(chan writeRequest, 4096),
-		stopCh:  make(chan struct{}),
-		done:    make(chan struct{}),
-		walDir:  walDir,
+		cfg:       cfg,
+		idx:       idx,
+		logger:    cfg.Logger,
+		writeCh:   make(chan writeRequest, 4096),
+		cleanupCh: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
+		walDir:    walDir,
 	}
 
 	return w, nil
@@ -259,6 +261,9 @@ func (w *Writer) run() {
 			pending = append(pending, req)
 		case <-ticker.C:
 			// fall through to drain
+		case <-w.cleanupCh:
+			w.tryCleanupSegmentsLocked()
+			continue
 		case <-w.stopCh:
 			w.flushAndSync(pending)
 			w.closeSegments()
@@ -366,7 +371,9 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 		}
 	}
 	if w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
-		w.current.file.Sync()
+		if err := w.current.file.Sync(); err != nil {
+			w.logger.Error("WAL fsync error during flush", "err", err)
+		}
 	}
 	for _, req := range pending {
 		close(req.doneCh)
@@ -377,9 +384,13 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 func (w *Writer) rotateSegment() error {
 	// Fsync and close current segment
 	if w.cfg.FsyncEnabled {
-		w.current.file.Sync()
+		if err := w.current.file.Sync(); err != nil {
+			w.logger.Warn("WAL segment rotation: fsync error on old segment", "err", err)
+		}
 	}
-	w.current.file.Close()
+	if err := w.current.file.Close(); err != nil {
+		w.logger.Warn("WAL segment rotation: close error on old segment", "err", err)
+	}
 
 	// Create new segment
 	newSeq := w.nextSeq.Load()
@@ -398,7 +409,76 @@ func (w *Writer) rotateSegment() error {
 		dir.Close()
 	}
 
+	w.tryCleanupSegmentsLocked()
 	return nil
+}
+
+// TryCleanupSegments signals the writer goroutine to scan the segment list
+// and delete segments no longer referenced by the WAL index. Safe to call
+// from any goroutine. Non-blocking — if a cleanup signal is already pending,
+// this is a no-op.
+func (w *Writer) TryCleanupSegments() {
+	select {
+	case w.cleanupCh <- struct{}{}:
+	default:
+	}
+}
+
+// tryCleanupSegmentsLocked is called from the writer goroutine.
+// It deletes segments with no remaining WAL index references.
+func (w *Writer) tryCleanupSegmentsLocked() {
+	if len(w.segments) <= 1 {
+		return
+	}
+
+	var kept []*segmentInfo
+	for _, seg := range w.segments {
+		// Never delete the current segment
+		if seg == w.current {
+			kept = append(kept, seg)
+			continue
+		}
+
+		if w.idx.SegmentReferenced(seg.seq) {
+			kept = append(kept, seg)
+			continue
+		}
+
+		// No references — safe to delete
+		if seg.file != nil {
+			seg.file.Close()
+			seg.file = nil
+		}
+		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+			w.logger.Warn("failed to delete WAL segment", "path", seg.path, "err", err)
+			kept = append(kept, seg) // keep on failure
+		} else {
+			w.logger.Info("deleted unreferenced WAL segment", "seq", seg.seq, "path", seg.path)
+		}
+	}
+	w.segments = kept
+
+	// Enforce MaxDiskSize: if total size still exceeds the limit, force-delete
+	// oldest segments (pruning their index entries).
+	for len(w.segments) > 1 && w.TotalDiskSize() > w.cfg.MaxDiskSize {
+		oldest := w.segments[0]
+		if oldest == w.current {
+			break
+		}
+
+		w.idx.PruneSegment(oldest.seq)
+		if oldest.file != nil {
+			oldest.file.Close()
+			oldest.file = nil
+		}
+		if err := os.Remove(oldest.path); err != nil && !os.IsNotExist(err) {
+			w.logger.Warn("failed to force-delete WAL segment", "path", oldest.path, "err", err)
+			break
+		}
+		w.logger.Warn("force-deleted WAL segment (disk limit exceeded)",
+			"seq", oldest.seq, "path", oldest.path)
+		w.segments = w.segments[1:]
+	}
 }
 
 // createSegment creates a new segment file with the given starting sequence.
@@ -567,8 +647,8 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 			return fmt.Errorf("open segment %d for replay: %w", seq, err)
 		}
 
-		var offset int64      // tracks current valid scan position
-		var lastValid int64   // position after last valid entry
+		var offset int64    // tracks current valid scan position
+		var lastValid int64 // position after last valid entry
 
 		_, scanErr := ScanFramedEntries(f, func(payload []byte) bool {
 			entry, parseErr := UnmarshalEntry(payload)

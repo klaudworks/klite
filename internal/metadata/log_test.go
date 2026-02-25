@@ -454,7 +454,7 @@ func TestLogCrashSafety(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Write([]byte{0x00, 0x00, 0x00, 0x10}) // length prefix saying 16 bytes
-	f.Write([]byte{0xFF, 0xFF, 0xFF})        // truncated entry
+	f.Write([]byte{0xFF, 0xFF, 0xFF})       // truncated entry
 	f.Close()
 
 	// Replay should recover the good entry and stop at the corrupt one

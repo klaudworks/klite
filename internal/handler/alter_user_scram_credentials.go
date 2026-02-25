@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/sasl"
 	"github.com/klaudworks/klite/internal/server"
@@ -84,7 +86,10 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 					Mechanism: d.Mechanism,
 					MechName:  mech,
 				})
-				metaLog.AppendSync(entry)
+				if err := metaLog.AppendSync(entry); err != nil {
+					slog.Warn("metadata.log: failed to persist SCRAM credential delete",
+						"user", d.Name, "err", err)
+				}
 			}
 			resp.Results = append(resp.Results, sr)
 		}
@@ -105,16 +110,19 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 				store.AddScram512(u.Name, auth)
 			}
 
-			if metaLog != nil {
-				entry := metadata.MarshalScramCredential(&metadata.ScramCredentialEntry{
-					Username:   u.Name,
-					Mechanism:  u.Mechanism,
-					Iterations: u.Iterations,
-					Salt:       u.Salt,
-					SaltedPass: u.SaltedPassword,
-				})
-				metaLog.AppendSync(entry)
+		if metaLog != nil {
+			entry := metadata.MarshalScramCredential(&metadata.ScramCredentialEntry{
+				Username:   u.Name,
+				Mechanism:  u.Mechanism,
+				Iterations: u.Iterations,
+				Salt:       u.Salt,
+				SaltedPass: u.SaltedPassword,
+			})
+			if err := metaLog.AppendSync(entry); err != nil {
+				slog.Warn("metadata.log: failed to persist SCRAM credential upsert",
+					"user", u.Name, "err", err)
 			}
+		}
 
 			sr := kmsg.NewAlterUserSCRAMCredentialsResponseResult()
 			sr.User = u.Name

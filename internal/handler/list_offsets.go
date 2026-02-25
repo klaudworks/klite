@@ -8,10 +8,8 @@ import (
 )
 
 // HandleListOffsets returns the ListOffsets handler (API key 2).
-// Supports v1-8.
-//
-// This is a minimal implementation for Phase 1. Task 10-list-offsets will
-// add the full implementation.
+// Supports v1-8. IsolationLevel (v2+) controls whether Latest (-1) returns
+// HW (read_uncommitted) or LSO (read_committed).
 func HandleListOffsets(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ListOffsetsRequest)
@@ -52,7 +50,7 @@ func HandleListOffsets(state *cluster.State) server.Handler {
 				pd := td.Partitions[rp.Partition]
 
 				pd.RLock()
-				offset, ts := pd.ListOffsets(rp.Timestamp)
+				offset, ts := pd.ListOffsets(rp.Timestamp, r.IsolationLevel)
 				sp.LeaderEpoch = 0 // single broker, always epoch 0
 				pd.RUnlock()
 

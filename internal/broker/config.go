@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 // Config holds all broker configuration.
@@ -19,13 +21,13 @@ type Config struct {
 	DefaultPartitions int
 	AutoCreateTopics  bool
 	LogLevel          string
+	HealthAddr        string // HTTP health endpoint address (empty = disabled)
 
-	// WAL configuration (Phase 3)
-	WALEnabled         bool   // Enable WAL persistence (default false)
-	WALSyncIntervalMs  int    // Fsync batch window in milliseconds (default 2)
-	WALSegmentMaxBytes int64  // Max segment size before rotation (default 64 MiB)
-	WALMaxDiskSize     int64  // Max total WAL on disk (default 1 GiB)
-	RingBufferMaxMem   int64  // Global memory budget for ring buffers (default 512 MiB)
+	// WAL configuration
+	WALSyncIntervalMs  int   // Fsync batch window in milliseconds (default 2)
+	WALSegmentMaxBytes int64 // Max segment size before rotation (default 64 MiB)
+	WALMaxDiskSize     int64 // Max total WAL on disk (default 1 GiB)
+	RingBufferMaxMem   int64 // Global memory budget for ring buffers (default 512 MiB)
 
 	// S3 configuration (Phase 4)
 	S3Bucket        string        // S3 bucket name (empty = S3 disabled)
@@ -38,37 +40,49 @@ type Config struct {
 	S3API interface{} // s3.S3API when set
 
 	// SASL configuration (Phase 5)
-	SASLEnabled  bool   // Enable SASL authentication
+	SASLEnabled   bool   // Enable SASL authentication
 	SASLMechanism string // Mechanism for CLI-specified user: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
-	SASLUser     string // Username for CLI-specified bootstrap user
-	SASLPassword string // Password for CLI-specified bootstrap user
+	SASLUser      string // Username for CLI-specified bootstrap user
+	SASLPassword  string // Password for CLI-specified bootstrap user
 
 	// Retention configuration (Phase 6)
-	RetentionCheckInterval time.Duration // How often the retention goroutine runs (default 5m)
+	RetentionCheckInterval time.Duration // How often the retention goroutine runs (default 1h)
 
 	// Compaction configuration (Phase 6)
-	CompactionCheckInterval  time.Duration // How often to scan dirty counters (default 30s)
-	CompactionMinDirtyObjects int          // Min dirty objects before compaction triggers (default 4)
-	CompactionWindowBytes    int64         // Max source object size per window (default 256 MiB)
-	CompactionS3Concurrency  int           // Max concurrent S3 GETs for compaction (default 4)
+	CompactionCheckInterval   time.Duration // How often to scan dirty counters (default 30s)
+	CompactionMinDirtyObjects int           // Min dirty objects before compaction triggers (default 4)
+	CompactionWindowBytes     int64         // Max source object size per window (default 256 MiB)
+	CompactionS3Concurrency   int           // Max concurrent S3 GETs for compaction (default 4)
+	CompactionReadRate        int           // Max S3 read bytes/sec for compaction (default 50 MiB/s, 0 = unlimited)
 
 	// SASLStore allows injecting a pre-configured SASL credential store (for tests).
 	SASLStore interface{} // *sasl.Store when set
 
+	// Clock allows injecting a controllable clock for tests.
+	// If nil, defaults to clock.RealClock{}.
+	Clock clock.Clock
+
 	// Listener allows injecting a pre-created listener (for tests).
 	// If non-nil, the broker uses this instead of opening Listen.
 	Listener net.Listener
+
+	// HealthListener allows injecting a pre-created listener for the HTTP
+	// health server (for tests). If non-nil and HealthAddr is set, the
+	// broker uses this instead of opening HealthAddr.
+	HealthListener net.Listener
 }
 
 // DefaultConfig returns a Config with production defaults.
 func DefaultConfig() Config {
 	return Config{
-		Listen:            ":9092",
-		DataDir:           "./data",
-		NodeID:            0,
-		DefaultPartitions: 1,
-		AutoCreateTopics:  true,
-		LogLevel:          "info",
+		Listen:             ":9092",
+		DataDir:            "./data",
+		NodeID:             0,
+		DefaultPartitions:  1,
+		AutoCreateTopics:   true,
+		LogLevel:           "info",
+		CompactionReadRate: 50 * 1024 * 1024, // 50 MiB/s
+		// HealthAddr left empty — health server is opt-in via --health-addr.
 	}
 }
 
@@ -103,9 +117,7 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.IntVar(&cfg.DefaultPartitions, "default-partitions", cfg.DefaultPartitions, "Default partition count for auto-created topics")
 	fs.BoolVar(&cfg.AutoCreateTopics, "auto-create-topics", cfg.AutoCreateTopics, "Auto-create topics on Metadata/Produce")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error")
-
-	// WAL flags
-	fs.BoolVar(&cfg.WALEnabled, "wal-enabled", cfg.WALEnabled, "Enable WAL persistence")
+	fs.StringVar(&cfg.HealthAddr, "health-addr", cfg.HealthAddr, "HTTP health endpoint address (empty = disabled, e.g. :8080)")
 
 	// S3 flags
 	fs.StringVar(&cfg.S3Bucket, "s3-bucket", cfg.S3Bucket, "S3 bucket name (empty = S3 disabled)")
@@ -114,12 +126,19 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.S3Prefix, "s3-prefix", cfg.S3Prefix, "S3 key prefix (default: klite/<clusterID>)")
 	fs.DurationVar(&cfg.S3FlushInterval, "s3-flush-interval", cfg.S3FlushInterval, "S3 flush interval (default: 10m)")
 
+	// WAL flags
+	fs.IntVar(&cfg.WALSyncIntervalMs, "wal-sync-interval", cfg.WALSyncIntervalMs, "WAL fsync batch window in milliseconds (default: 2)")
+	fs.Int64Var(&cfg.WALSegmentMaxBytes, "wal-segment-max-bytes", cfg.WALSegmentMaxBytes, "Max WAL segment size before rotation in bytes (default: 67108864 = 64 MiB)")
+	fs.Int64Var(&cfg.WALMaxDiskSize, "wal-max-disk-size", cfg.WALMaxDiskSize, "Max total WAL on disk in bytes (default: 1 GiB)")
+	fs.Int64Var(&cfg.RingBufferMaxMem, "ring-buffer-max-memory", cfg.RingBufferMaxMem, "Global memory budget for ring buffers in bytes (default: 536870912 = 512 MiB)")
+
 	// Retention flags
-	fs.DurationVar(&cfg.RetentionCheckInterval, "retention-check-interval", cfg.RetentionCheckInterval, "How often the retention goroutine runs (default: 5m)")
+	fs.DurationVar(&cfg.RetentionCheckInterval, "retention-check-interval", cfg.RetentionCheckInterval, "How often the retention goroutine runs (default: 1h)")
 
 	// Compaction flags
 	fs.DurationVar(&cfg.CompactionCheckInterval, "compaction-check-interval", cfg.CompactionCheckInterval, "How often to scan dirty counters for eligible partitions (default: 30s)")
 	fs.IntVar(&cfg.CompactionMinDirtyObjects, "compaction-min-dirty-objects", cfg.CompactionMinDirtyObjects, "Min dirty S3 objects before compaction triggers (default: 4)")
+	fs.IntVar(&cfg.CompactionReadRate, "compaction-read-rate", cfg.CompactionReadRate, "Max S3 read bytes/sec for compaction (default: 52428800 = 50 MiB/s, 0 = unlimited)")
 
 	// SASL flags
 	fs.BoolVar(&cfg.SASLEnabled, "sasl-enabled", cfg.SASLEnabled, "Enable SASL authentication")
@@ -140,6 +159,7 @@ func (cfg *Config) ApplyEnvOverrides() {
 		{"KLITE_DATA_DIR", &cfg.DataDir},
 		{"KLITE_CLUSTER_ID", &cfg.ClusterID},
 		{"KLITE_LOG_LEVEL", &cfg.LogLevel},
+		{"KLITE_HEALTH_ADDR", &cfg.HealthAddr},
 	}
 	for _, eo := range envOverrides {
 		if v := os.Getenv(eo.env); v != "" {
@@ -161,6 +181,12 @@ func (cfg *Config) ApplyEnvOverrides() {
 	}
 	if v := os.Getenv("KLITE_AUTO_CREATE_TOPICS"); v != "" {
 		cfg.AutoCreateTopics = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("KLITE_WAL_MAX_DISK_SIZE"); v != "" {
+		var n int64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+			cfg.WALMaxDiskSize = n
+		}
 	}
 }
 

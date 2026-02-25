@@ -45,8 +45,9 @@ plan/              Implementation plans (one subdirectory per plan)
     18-s3-storage.md            S3 object format, flush pipeline, read path, disaster recovery
     19-transactions.md          Idempotency, transactional produce, EndTxn
 
-docs/              Documentation content (pure Markdown)
+docs/              Symlink → docs-site/src/content/docs/ (for discoverability)
 docs-site/         Astro/Starlight docs build project (see docs-site/AGENTS.md)
+  src/content/docs/  Documentation content (.md and .mdx files live here)
 
 bin/               Build output directory (gitignored)
 

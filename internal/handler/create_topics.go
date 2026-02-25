@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
@@ -20,7 +22,7 @@ var validTopicConfigs = map[string]bool{
 	"message.timestamp.type": true,
 	"min.compaction.lag.ms":  true,
 	"max.compaction.lag.ms":  true,
-	"delete.retention.ms":   true,
+	"delete.retention.ms":    true,
 }
 
 // HandleCreateTopics returns the CreateTopics handler (API key 19).
@@ -191,10 +193,10 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 					TopicID:        td.ID,
 					Configs:        td.Configs,
 				})
-				if err := ml.AppendSync(entry); err != nil {
-					// Log error but don't fail the request — in-memory state is already created
-					// On restart, this topic will be missing and clients will need to recreate it
-				}
+			if err := ml.AppendSync(entry); err != nil {
+				slog.Warn("metadata.log: failed to persist CreateTopic (topic will be lost on restart)",
+					"topic", td.Name, "err", err)
+			}
 			}
 
 			// 9. Populate response

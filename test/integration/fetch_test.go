@@ -242,7 +242,7 @@ func TestCompression(t *testing.T) {
 	t.Parallel()
 
 	compressions := []struct {
-		name string
+		name  string
 		codec kgo.CompressionCodec
 	}{
 		{"gzip", kgo.GzipCompression()},

@@ -12,52 +12,52 @@ import (
 // must add their entry here.
 var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	// Phase 1: Core data path
-	{ApiKey: 0, MinVersion: 3, MaxVersion: 11},  // Produce
-	{ApiKey: 1, MinVersion: 4, MaxVersion: 16},  // Fetch
-	{ApiKey: 2, MinVersion: 1, MaxVersion: 8},   // ListOffsets
-	{ApiKey: 3, MinVersion: 4, MaxVersion: 12},  // Metadata
-	{ApiKey: 18, MinVersion: 0, MaxVersion: 4},  // ApiVersions
-	{ApiKey: 19, MinVersion: 2, MaxVersion: 7},  // CreateTopics
+	{ApiKey: 0, MinVersion: 3, MaxVersion: 11}, // Produce
+	{ApiKey: 1, MinVersion: 4, MaxVersion: 16}, // Fetch
+	{ApiKey: 2, MinVersion: 1, MaxVersion: 8},  // ListOffsets
+	{ApiKey: 3, MinVersion: 4, MaxVersion: 12}, // Metadata
+	{ApiKey: 18, MinVersion: 0, MaxVersion: 4}, // ApiVersions
+	{ApiKey: 19, MinVersion: 2, MaxVersion: 7}, // CreateTopics
 
 	// Phase 2: Consumer groups
-	{ApiKey: 8, MinVersion: 0, MaxVersion: 9},   // OffsetCommit
-	{ApiKey: 9, MinVersion: 0, MaxVersion: 9},   // OffsetFetch
-	{ApiKey: 10, MinVersion: 0, MaxVersion: 6},  // FindCoordinator
-	{ApiKey: 11, MinVersion: 0, MaxVersion: 9},  // JoinGroup
-	{ApiKey: 12, MinVersion: 0, MaxVersion: 4},  // Heartbeat
-	{ApiKey: 13, MinVersion: 0, MaxVersion: 5},  // LeaveGroup
-	{ApiKey: 14, MinVersion: 0, MaxVersion: 5},  // SyncGroup
-	{ApiKey: 47, MinVersion: 0, MaxVersion: 0},  // OffsetDelete
+	{ApiKey: 8, MinVersion: 0, MaxVersion: 9},  // OffsetCommit
+	{ApiKey: 9, MinVersion: 0, MaxVersion: 9},  // OffsetFetch
+	{ApiKey: 10, MinVersion: 0, MaxVersion: 6}, // FindCoordinator
+	{ApiKey: 11, MinVersion: 0, MaxVersion: 9}, // JoinGroup
+	{ApiKey: 12, MinVersion: 0, MaxVersion: 4}, // Heartbeat
+	{ApiKey: 13, MinVersion: 0, MaxVersion: 5}, // LeaveGroup
+	{ApiKey: 14, MinVersion: 0, MaxVersion: 5}, // SyncGroup
+	{ApiKey: 47, MinVersion: 0, MaxVersion: 0}, // OffsetDelete
 
 	// Phase 3: Admin APIs
-	{ApiKey: 15, MinVersion: 0, MaxVersion: 6},  // DescribeGroups
-	{ApiKey: 16, MinVersion: 0, MaxVersion: 5},  // ListGroups
-	{ApiKey: 20, MinVersion: 0, MaxVersion: 6},  // DeleteTopics
-	{ApiKey: 21, MinVersion: 0, MaxVersion: 2},  // DeleteRecords
-	{ApiKey: 23, MinVersion: 3, MaxVersion: 4},  // OffsetForLeaderEpoch
-	{ApiKey: 32, MinVersion: 0, MaxVersion: 4},  // DescribeConfigs
-	{ApiKey: 33, MinVersion: 0, MaxVersion: 2},  // AlterConfigs
-	{ApiKey: 35, MinVersion: 0, MaxVersion: 4},  // DescribeLogDirs
-	{ApiKey: 37, MinVersion: 0, MaxVersion: 3},  // CreatePartitions
-	{ApiKey: 42, MinVersion: 0, MaxVersion: 2},  // DeleteGroups
-	{ApiKey: 44, MinVersion: 0, MaxVersion: 1},  // IncrementalAlterConfigs
-	{ApiKey: 60, MinVersion: 0, MaxVersion: 2},  // DescribeCluster
+	{ApiKey: 15, MinVersion: 0, MaxVersion: 6}, // DescribeGroups
+	{ApiKey: 16, MinVersion: 0, MaxVersion: 5}, // ListGroups
+	{ApiKey: 20, MinVersion: 0, MaxVersion: 6}, // DeleteTopics
+	{ApiKey: 21, MinVersion: 0, MaxVersion: 2}, // DeleteRecords
+	{ApiKey: 23, MinVersion: 3, MaxVersion: 4}, // OffsetForLeaderEpoch
+	{ApiKey: 32, MinVersion: 0, MaxVersion: 4}, // DescribeConfigs
+	{ApiKey: 33, MinVersion: 0, MaxVersion: 2}, // AlterConfigs
+	{ApiKey: 35, MinVersion: 0, MaxVersion: 4}, // DescribeLogDirs
+	{ApiKey: 37, MinVersion: 0, MaxVersion: 3}, // CreatePartitions
+	{ApiKey: 42, MinVersion: 0, MaxVersion: 2}, // DeleteGroups
+	{ApiKey: 44, MinVersion: 0, MaxVersion: 1}, // IncrementalAlterConfigs
+	{ApiKey: 60, MinVersion: 0, MaxVersion: 2}, // DescribeCluster
 
 	// Phase 4: Transactions
-	{ApiKey: 22, MinVersion: 0, MaxVersion: 5},  // InitProducerID
-	{ApiKey: 24, MinVersion: 0, MaxVersion: 4},  // AddPartitionsToTxn
-	{ApiKey: 25, MinVersion: 0, MaxVersion: 3},  // AddOffsetsToTxn
-	{ApiKey: 26, MinVersion: 0, MaxVersion: 4},  // EndTxn
-	{ApiKey: 28, MinVersion: 0, MaxVersion: 4},  // TxnOffsetCommit
-	{ApiKey: 61, MinVersion: 0, MaxVersion: 0},  // DescribeProducers
-	{ApiKey: 65, MinVersion: 0, MaxVersion: 0},  // DescribeTransactions
-	{ApiKey: 66, MinVersion: 0, MaxVersion: 1},  // ListTransactions
+	{ApiKey: 22, MinVersion: 0, MaxVersion: 5}, // InitProducerID
+	{ApiKey: 24, MinVersion: 0, MaxVersion: 4}, // AddPartitionsToTxn
+	{ApiKey: 25, MinVersion: 0, MaxVersion: 3}, // AddOffsetsToTxn
+	{ApiKey: 26, MinVersion: 0, MaxVersion: 4}, // EndTxn
+	{ApiKey: 28, MinVersion: 0, MaxVersion: 4}, // TxnOffsetCommit
+	{ApiKey: 61, MinVersion: 0, MaxVersion: 0}, // DescribeProducers
+	{ApiKey: 65, MinVersion: 0, MaxVersion: 0}, // DescribeTransactions
+	{ApiKey: 66, MinVersion: 0, MaxVersion: 1}, // ListTransactions
 
 	// Phase 5: SASL Authentication
-	{ApiKey: 17, MinVersion: 1, MaxVersion: 1},  // SASLHandshake (v0 not supported)
-	{ApiKey: 36, MinVersion: 0, MaxVersion: 2},  // SASLAuthenticate
-	{ApiKey: 50, MinVersion: 0, MaxVersion: 0},  // DescribeUserScramCredentials
-	{ApiKey: 51, MinVersion: 0, MaxVersion: 0},  // AlterUserScramCredentials
+	{ApiKey: 17, MinVersion: 1, MaxVersion: 1}, // SASLHandshake (v0 not supported)
+	{ApiKey: 36, MinVersion: 0, MaxVersion: 2}, // SASLAuthenticate
+	{ApiKey: 50, MinVersion: 0, MaxVersion: 0}, // DescribeUserScramCredentials
+	{ApiKey: 51, MinVersion: 0, MaxVersion: 0}, // AlterUserScramCredentials
 }
 
 // apiVersionsMap is a lookup table built from apiVersions for fast version

@@ -18,19 +18,19 @@ import (
 type SASLStage uint8
 
 const (
-	SASLStageBegin       SASLStage = iota // Only ApiVersions + SASLHandshake allowed
-	SASLStageAuthPlain                    // SASLAuthenticate: 1 round (PLAIN)
-	SASLStageAuthScram256                 // SASLAuthenticate: round 1 of 2 (SCRAM-SHA-256)
-	SASLStageAuthScram512                 // SASLAuthenticate: round 1 of 2 (SCRAM-SHA-512)
-	SASLStageAuthScram1                   // SASLAuthenticate: round 2 of 2 (SCRAM)
-	SASLStageComplete                     // Authenticated -- all requests allowed
+	SASLStageBegin        SASLStage = iota // Only ApiVersions + SASLHandshake allowed
+	SASLStageAuthPlain                     // SASLAuthenticate: 1 round (PLAIN)
+	SASLStageAuthScram256                  // SASLAuthenticate: round 1 of 2 (SCRAM-SHA-256)
+	SASLStageAuthScram512                  // SASLAuthenticate: round 1 of 2 (SCRAM-SHA-512)
+	SASLStageAuthScram1                    // SASLAuthenticate: round 2 of 2 (SCRAM)
+	SASLStageComplete                      // Authenticated -- all requests allowed
 )
 
 const (
-	connReadBufSize  = 64 * 1024  // 64KB read buffer
-	connWriteBufSize = 64 * 1024  // 64KB write buffer
-	maxFrameSize     = 100 << 20  // 100MB max frame size
-	maxInFlight      = 100        // max pipelined requests per connection
+	connReadBufSize  = 64 * 1024 // 64KB read buffer
+	connWriteBufSize = 64 * 1024 // 64KB write buffer
+	maxFrameSize     = 100 << 20 // 100MB max frame size
+	maxInFlight      = 100       // max pipelined requests per connection
 )
 
 // clientResp is a response to be written to the client, sent from handler
@@ -123,16 +123,12 @@ func newClientConn(s *Server, nc net.Conn) *clientConn {
 // serve runs the read and write goroutines for this connection.
 // It blocks until the connection is closed.
 func (cc *clientConn) serve() {
-	done := make(chan struct{}) // closed when readLoop returns
-	go func() {
-		cc.writeLoop(done)
-	}()
+	go cc.writeLoop()
 	cc.readLoop()
 	// readLoop returned: wait for all handlers to finish,
 	// then close respCh so writeLoop drains and exits.
 	cc.wg.Wait()
 	close(cc.respCh)
-	close(done)
 }
 
 // readLoop reads frames from the connection, parses them, and spawns
@@ -182,12 +178,19 @@ func (cc *clientConn) readLoop() {
 			kmsg.SkipTags(&reader)
 		}
 
-		// Parse request body (copies data out of frame buffer).
+		// Copy the remaining body bytes so the parsed request owns its
+		// memory. ReadFrom returns sub-slices (e.g. Records []byte) that
+		// alias the input — without this copy, the next readFrame() call
+		// would overwrite the reusable frame buffer and corrupt in-flight
+		// handler data.
+		bodyCopy := make([]byte, len(reader.Src))
+		copy(bodyCopy, reader.Src)
+
 		// ApiVersions (key 18) is special: if parsing fails due to an
 		// unsupported version, we still dispatch to the handler so it can
 		// return the version list with UNSUPPORTED_VERSION error code.
 		// This lets the client negotiate down to a supported version.
-		if err := kreq.ReadFrom(reader.Src); err != nil {
+		if err := kreq.ReadFrom(bodyCopy); err != nil {
 			if apiKey == 18 {
 				// For ApiVersions, ignore parse errors from unsupported versions.
 				// The handler will detect the version mismatch and respond accordingly.
@@ -209,9 +212,38 @@ func (cc *clientConn) readLoop() {
 			}
 		}
 
-		// Assign sequence number in arrival order BEFORE spawning handler
+		// Assign sequence number in arrival order BEFORE dispatching
 		seq := nextSeq
 		nextSeq++
+
+		// Produce requests (API key 0) are handled inline in the
+		// read loop to preserve arrival order. Kafka does the same:
+		// it mutes the socket after reading a request and only
+		// unmutes after the response is sent, ensuring at most one
+		// in-flight request per connection. Handling produce inline
+		// is critical for idempotent writes where the sequence
+		// window must see batches in wire order.
+		//
+		// All other requests are dispatched to goroutines so that
+		// long-running operations (e.g. fetch long-polling) don't
+		// block the connection.
+		if apiKey == 0 {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						cc.logger.Error("handler panic", "remote", who, "api_key", apiKey, "panic", r)
+						cc.sendResp(clientResp{seq: seq, err: fmt.Errorf("handler panic: %v", r)})
+					}
+				}()
+				resp, err := cc.dispatchReq(kreq)
+				if resp == nil && err == nil {
+					cc.sendResp(clientResp{seq: seq, skip: true})
+					return
+				}
+				cc.sendResp(clientResp{kresp: resp, corr: corrID, seq: seq, err: err})
+			}()
+			continue
+		}
 
 		// Acquire in-flight semaphore (backpressure on misbehaving clients)
 		select {
@@ -220,7 +252,7 @@ func (cc *clientConn) readLoop() {
 			return
 		}
 
-		// Spawn handler goroutine
+		// Spawn handler goroutine for non-produce requests
 		cc.wg.Add(1)
 		go func(corrID int32, kreq kmsg.Request, seq uint32) {
 			defer cc.wg.Done()
@@ -281,7 +313,7 @@ func (cc *clientConn) sendResp(resp clientResp) {
 
 // writeLoop receives responses from handler goroutines, reorders them by
 // sequence number, and writes them to the connection in request order.
-func (cc *clientConn) writeLoop(done <-chan struct{}) {
+func (cc *clientConn) writeLoop() {
 	defer cc.conn.Close()
 
 	var (
@@ -304,8 +336,6 @@ func (cc *clientConn) writeLoop(done <-chan struct{}) {
 				if !open {
 					return // readLoop finished and all handlers done
 				}
-			case <-done:
-				return
 			case <-cc.shutdownCh:
 				return
 			}

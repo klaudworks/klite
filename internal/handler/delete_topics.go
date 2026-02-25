@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
@@ -64,7 +66,10 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 						entry := metadata.MarshalDeleteTopic(&metadata.DeleteTopicEntry{
 							TopicName: topicName,
 						})
-						ml.AppendSync(entry) //nolint:errcheck
+						if err := ml.AppendSync(entry); err != nil {
+						slog.Warn("metadata.log: failed to persist DeleteTopic",
+							"topic", topicName, "err", err)
+					}
 					}
 				}
 			}

@@ -195,4 +195,4 @@ If you need to switch back to Kafka:
 
 - [Compatibility](/concepts/compatibility/) -- full API and feature compatibility matrix
 - [Architecture](/concepts/architecture/) -- how klite differs from Kafka
-- [Configuration reference](/reference/configuration/) -- tune klite for your workload
+- [Configuration](/guides/configuration/) -- tune klite for your workload

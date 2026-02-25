@@ -86,7 +86,7 @@ func produceFlushProduce(
 
 	// Start broker with short flush interval but NO compaction
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(200*time.Millisecond),
@@ -143,7 +143,7 @@ func TestCompactionEndToEnd(t *testing.T) {
 	tb.Stop()
 
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -158,7 +158,7 @@ func TestCompactionEndToEnd(t *testing.T) {
 	os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -193,7 +193,7 @@ func TestCompactDeletePolicy(t *testing.T) {
 
 	// Start broker with short flush and no compaction
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(200*time.Millisecond),
@@ -231,7 +231,7 @@ func TestCompactDeletePolicy(t *testing.T) {
 
 	// Restart with compaction enabled
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -246,7 +246,7 @@ func TestCompactDeletePolicy(t *testing.T) {
 	os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -291,7 +291,7 @@ func TestCompactionS3ObjectCount(t *testing.T) {
 
 	// Restart with compaction
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -309,7 +309,7 @@ func TestCompactionS3ObjectCount(t *testing.T) {
 	os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -346,7 +346,7 @@ func TestCompactionIdempotentIntegration(t *testing.T) {
 
 	// Restart with compaction
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -368,7 +368,7 @@ func TestCompactionIdempotentIntegration(t *testing.T) {
 	os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -412,7 +412,7 @@ func TestCompactionWatermarkSurvivesRestart(t *testing.T) {
 
 	// Phase 2: restart with compaction, wait for it to complete, then stop
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -429,7 +429,7 @@ func TestCompactionWatermarkSurvivesRestart(t *testing.T) {
 	os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -480,7 +480,7 @@ func TestCompactionDirtyCounterRestart(t *testing.T) {
 	// Restart WITH compaction enabled. The dirty counter should be rehydrated
 	// from LIST, and compaction should trigger WITHOUT any new writes.
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -499,7 +499,7 @@ func TestCompactionDirtyCounterRestart(t *testing.T) {
 	os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),

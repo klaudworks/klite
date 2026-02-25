@@ -65,9 +65,9 @@ func TestMetadataInvalidApiKey(t *testing.T) {
 	// Build a minimal Kafka request frame with an invalid API key (999).
 	// Header: apiKey(2) + apiVersion(2) + corrID(4) + clientIDLen(2) = 10 bytes
 	var frame [10]byte
-	binary.BigEndian.PutUint16(frame[0:2], 999)  // api_key = 999 (invalid)
-	binary.BigEndian.PutUint16(frame[2:4], 0)     // api_version = 0
-	binary.BigEndian.PutUint32(frame[4:8], 1)     // correlation_id = 1
+	binary.BigEndian.PutUint16(frame[0:2], 999)     // api_key = 999 (invalid)
+	binary.BigEndian.PutUint16(frame[2:4], 0)       // api_version = 0
+	binary.BigEndian.PutUint32(frame[4:8], 1)       // correlation_id = 1
 	binary.BigEndian.PutUint16(frame[8:10], 0xFFFF) // client_id = null (-1)
 
 	// Send length-prefixed frame

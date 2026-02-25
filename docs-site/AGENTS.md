@@ -5,10 +5,10 @@ This directory contains the Astro/Starlight project that builds the klite docume
 ## Architecture
 
 - **`docs-site/`** — Astro/Starlight project (config, dependencies, build tooling)
-- **`docs/`** (parent directory) — Pure Markdown content files
-- Content is linked via symlink: `src/content/docs → ../../../docs`
+- **`docs-site/src/content/docs/`** — Documentation content lives here (`.md` and `.mdx` files)
+- **`docs/`** (repo root) — Symlink → `docs-site/src/content/docs/` for discoverability
 
-Docs content lives in `../docs/` as plain Markdown. This directory only contains build infrastructure.
+Content lives inside the Astro project so that `.mdx` files can resolve Starlight component imports.
 
 ## Commands
 
@@ -27,8 +27,8 @@ pnpm run preview    # Preview production build
 
 ## Content Rules
 
-- Docs pages go in `../docs/`, not in this directory.
-- Use `.md` files only (not `.mdx`) — `.mdx` files outside the project root cannot resolve Starlight component imports.
+- Docs pages go in `src/content/docs/`. The repo-root `docs/` symlink points here for discoverability.
+- Use `.md` files by default. Use `.mdx` when you need Starlight components (e.g., `<Tabs>`, `<Card>`). Import with `import { Tabs, TabItem } from '@astrojs/starlight/components';`.
 - Frontmatter is required: at minimum `title` and `description`.
 - Sidebar is auto-generated from directory structure via `autogenerate` in `astro.config.mjs`. Add new sidebar sections there when creating new top-level directories in `docs/`.
 

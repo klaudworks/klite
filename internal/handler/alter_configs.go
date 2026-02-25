@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
@@ -43,7 +45,10 @@ func HandleIncrementalAlterConfigs(state *cluster.State) server.Handler {
 										Key:       rc.Name,
 										Value:     *rc.Value,
 									})
-									ml.Append(entry) //nolint:errcheck
+								if err := ml.Append(entry); err != nil {
+									slog.Warn("metadata.log: failed to persist AlterConfig",
+										"topic", rr.ResourceName, "key", rc.Name, "err", err)
+								}
 								}
 							}
 						case kmsg.IncrementalAlterConfigOpDelete:
@@ -103,7 +108,10 @@ func HandleAlterConfigs(state *cluster.State) server.Handler {
 									Key:       c.Name,
 									Value:     *c.Value,
 								})
-								ml.Append(entry) //nolint:errcheck
+								if err := ml.Append(entry); err != nil {
+								slog.Warn("metadata.log: failed to persist AlterConfig",
+									"topic", rr.ResourceName, "key", c.Name, "err", err)
+							}
 							}
 						}
 					}

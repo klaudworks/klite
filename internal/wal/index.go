@@ -129,6 +129,20 @@ func (idx *Index) PartitionEntries(tp TopicPartition) []IndexEntry {
 	return result
 }
 
+// SegmentReferenced returns true if any index entry references the given segment.
+func (idx *Index) SegmentReferenced(segmentSeq uint64) bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for _, entries := range idx.partitions {
+		for _, e := range entries {
+			if e.SegmentSeq == segmentSeq {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // AllPartitions returns all tracked topic-partitions.
 func (idx *Index) AllPartitions() []TopicPartition {
 	idx.mu.RLock()

@@ -24,14 +24,14 @@ func HandleOffsetForLeaderEpoch(state *cluster.State) server.Handler {
 				sp := kmsg.NewOffsetForLeaderEpochResponseTopicPartition()
 				sp.Partition = rp.Partition
 
-			// Only consumer requests are supported (ReplicaID < 0).
-			// ReplicaID -1 = normal consumer, -2 = debug consumer (kadm default).
-			// ReplicaID >= 0 = inter-broker replication, not supported.
-			if r.ReplicaID >= 0 {
-				sp.ErrorCode = kerr.UnknownServerError.Code
-				st.Partitions = append(st.Partitions, sp)
-				continue
-			}
+				// Only consumer requests are supported (ReplicaID < 0).
+				// ReplicaID -1 = normal consumer, -2 = debug consumer (kadm default).
+				// ReplicaID >= 0 = inter-broker replication, not supported.
+				if r.ReplicaID >= 0 {
+					sp.ErrorCode = kerr.UnknownServerError.Code
+					st.Partitions = append(st.Partitions, sp)
+					continue
+				}
 
 				if td == nil {
 					sp.ErrorCode = kerr.UnknownTopicOrPartition.Code

@@ -31,32 +31,17 @@ func HandleDescribeProducers(state *cluster.State) server.Handler {
 				}
 
 				// Get producers that have written to this partition
-				producers := state.PIDManager().GetProducersForPartition(rt.Topic, p)
-				for _, ps := range producers {
+				snapshots := state.PIDManager().GetProducersForPartition(rt.Topic, p)
+				for _, snap := range snapshots {
 					active := kmsg.NewDescribeProducersResponseTopicPartitionActiveProducer()
-					active.ProducerID = ps.ProducerID
-					active.ProducerEpoch = int32(ps.Epoch)
+					active.ProducerID = snap.ProducerID
+					active.ProducerEpoch = int32(snap.Epoch)
 					active.CoordinatorEpoch = -1
+					active.LastSequence = int32(snap.LastSequence)
+					active.CurrentTxnStartOffset = snap.TxnStartOffset
 
-					tp := cluster.TopicPartition{Topic: rt.Topic, Partition: p}
-
-					// Get last sequence
-					if w, ok := ps.Sequences[tp]; ok {
-						active.LastSequence = int32(w.LastSequence())
-					} else {
-						active.LastSequence = -1
-					}
-
-					// Transaction start offset
-					active.CurrentTxnStartOffset = -1
-					if ps.TxnState == cluster.TxnOngoing {
-						if firstOff, ok := ps.TxnFirstOffsets[tp]; ok {
-							active.CurrentTxnStartOffset = firstOff
-						}
-					}
-
-					if !ps.TxnStartTime.IsZero() {
-						active.LastTimestamp = ps.TxnStartTime.UnixMilli()
+					if !snap.TxnStartTime.IsZero() {
+						active.LastTimestamp = snap.TxnStartTime.UnixMilli()
 					} else {
 						active.LastTimestamp = -1
 					}

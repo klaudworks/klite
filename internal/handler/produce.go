@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -14,13 +15,9 @@ import (
 // HandleProduce returns the Produce handler (API key 0).
 // Supports v3-11.
 //
-// If walWriter is non-nil, uses the durable path:
+// Uses the durable WAL path:
 //
 //	reserveOffset -> WAL append -> fsync -> commitBatch
-//
-// If walWriter is nil, uses the Phase 1 in-memory path:
-//
-//	PushBatch (assign + store + advance HW)
 func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ProduceRequest)
@@ -84,6 +81,8 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 
 				// Step 1: Validate minimum size and parse batch header
 				if len(raw) < 61 {
+					slog.Debug("corrupt message: too short",
+						"topic", rt.Topic, "partition", rp.Partition, "len", len(raw))
 					sp.ErrorCode = kerr.CorruptMessage.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
@@ -91,6 +90,8 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 
 				meta, parseErr := cluster.ParseBatchHeader(raw)
 				if parseErr != nil {
+					slog.Debug("corrupt message: parse error",
+						"topic", rt.Topic, "partition", rp.Partition, "error", parseErr)
 					sp.ErrorCode = kerr.CorruptMessage.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
@@ -98,68 +99,79 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 
 				// Step 2: Validate the batch covers the full Records slice
 				if int(meta.BatchLength) != len(raw)-12 {
+					slog.Debug("corrupt message: batch length mismatch",
+						"topic", rt.Topic, "partition", rp.Partition,
+						"batchLength", meta.BatchLength, "rawLen", len(raw),
+						"expected", len(raw)-12)
 					sp.ErrorCode = kerr.CorruptMessage.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
 				}
 
-			// Step 3: Validate batch contents (BEFORE taking partition lock)
-			if meta.Magic != 2 {
-				sp.ErrorCode = kerr.UnsupportedForMessageFormat.Code
-				st.Partitions = append(st.Partitions, sp)
-				continue
-			}
-
-			if len(raw) > maxMessageBytes {
-				sp.ErrorCode = kerr.MessageTooLarge.Code
-				st.Partitions = append(st.Partitions, sp)
-				continue
-			}
-
-			if isLogAppendTime {
-				cluster.SetLogAppendTime(raw, now, &meta)
-			}
-
-			// Idempotent / transactional produce dedup check
-			isIdempotent := meta.ProducerID >= 0
-			isTransactional := meta.Attributes&0x0010 != 0
-			tp := cluster.TopicPartition{Topic: rt.Topic, Partition: rp.Partition}
-
-			if isIdempotent {
-				// Pre-check: get a tentative baseOffset for dedup.
-				// We need the current HW to pass to dedup validation.
-				pd.RLock()
-				tentativeOffset := pd.HW()
-				pd.RUnlock()
-
-				errCode, isDup, dupOffset := state.PIDManager().ValidateAndDedup(
-					meta.ProducerID, meta.ProducerEpoch, tp,
-					meta.BaseSequence, meta.NumRecords, tentativeOffset,
-				)
-				if errCode != 0 {
-					sp.ErrorCode = errCode
+				// Step 3: Validate batch contents (BEFORE taking partition lock)
+				if meta.Magic != 2 {
+					sp.ErrorCode = kerr.UnsupportedForMessageFormat.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
 				}
-				if isDup {
-					sp.BaseOffset = dupOffset
-					sp.LogAppendTime = -1
-					if isLogAppendTime {
-						sp.LogAppendTime = now
-					}
+
+				if len(raw) > maxMessageBytes {
+					sp.ErrorCode = kerr.MessageTooLarge.Code
+					st.Partitions = append(st.Partitions, sp)
+					continue
+				}
+
+				if isLogAppendTime {
+					cluster.SetLogAppendTime(raw, now, &meta)
+				}
+
+				// Idempotent / transactional produce dedup check.
+				// Produce requests are handled inline in the connection's
+				// read loop (not in a goroutine), so requests from the same
+				// connection are naturally serialized in wire order. This
+				// guarantees the sequence window sees batches in the order
+				// the client sent them — matching Kafka's per-connection
+				// serialization model.
+				isIdempotent := meta.ProducerID >= 0
+				isTransactional := meta.Attributes&0x0010 != 0
+				tp := cluster.TopicPartition{Topic: rt.Topic, Partition: rp.Partition}
+
+				if isIdempotent {
 					pd.RLock()
-					if r.Version >= 5 {
-						sp.LogStartOffset = pd.LogStart()
-					}
+					tentativeOffset := pd.HW()
 					pd.RUnlock()
-					st.Partitions = append(st.Partitions, sp)
-					continue
-				}
-			}
 
-			// Step 4: Append to partition
-			if walWriter != nil && pd.HasWAL() {
-				// Phase 3: WAL-aware path
+					errCode, isDup, dupOffset := state.PIDManager().ValidateAndDedup(
+						meta.ProducerID, meta.ProducerEpoch, tp,
+						meta.BaseSequence, meta.NumRecords, tentativeOffset,
+					)
+					if errCode != 0 {
+						slog.Debug("idempotent produce rejected",
+							"topic", rt.Topic, "partition", rp.Partition,
+							"pid", meta.ProducerID, "epoch", meta.ProducerEpoch,
+							"baseSeq", meta.BaseSequence, "numRecords", meta.NumRecords,
+							"errCode", errCode)
+						sp.ErrorCode = errCode
+						st.Partitions = append(st.Partitions, sp)
+						continue
+					}
+					if isDup {
+						sp.BaseOffset = dupOffset
+						sp.LogAppendTime = -1
+						if isLogAppendTime {
+							sp.LogAppendTime = now
+						}
+						pd.RLock()
+						if r.Version >= 5 {
+							sp.LogStartOffset = pd.LogStart()
+						}
+						pd.RUnlock()
+						st.Partitions = append(st.Partitions, sp)
+						continue
+					}
+				}
+
+				// Step 4: Append to partition via WAL
 				baseOffset, logStart, walErr := produceWithWAL(pd, td, raw, meta, walWriter)
 				if walErr != nil {
 					sp.ErrorCode = kerr.KafkaStorageError.Code
@@ -188,39 +200,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 				if r.Version >= 5 {
 					sp.LogStartOffset = logStart
 				}
-			} else {
-				// Phase 1: in-memory path
-				pd.Lock()
-				baseOffset := pd.PushBatch(raw, meta)
-				logStart := pd.LogStart()
-
-				// Track transactional batch
-				if isTransactional && meta.ProducerID >= 0 {
-					pd.AddOpenTxn(meta.ProducerID, baseOffset)
-				}
-				pd.Unlock()
-
-				// Update dedup window with actual offset
-				if isIdempotent {
-					state.PIDManager().UpdateDedupOffset(meta.ProducerID, tp, meta.BaseSequence, baseOffset)
-				}
-
-				// Record txn batch reference
-				if isTransactional && meta.ProducerID >= 0 {
-					state.PIDManager().RecordTxnBatch(meta.ProducerID, rt.Topic, rp.Partition, baseOffset)
-				}
-
-				pd.NotifyWaiters()
-
-				sp.BaseOffset = baseOffset
-				sp.LogAppendTime = -1
-				if isLogAppendTime {
-					sp.LogAppendTime = now
-				}
-				if r.Version >= 5 {
-					sp.LogStartOffset = logStart
-				}
-			}
 
 				st.Partitions = append(st.Partitions, sp)
 			}

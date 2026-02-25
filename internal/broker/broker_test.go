@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+func testHealthListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln
+}
+
 func TestBrokerStartStop(t *testing.T) {
 	t.Parallel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -18,6 +27,7 @@ func TestBrokerStartStop(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Listener = ln
+	cfg.HealthListener = testHealthListener(t)
 	cfg.DataDir = t.TempDir()
 	cfg.LogLevel = "debug"
 
@@ -86,6 +96,7 @@ func TestBrokerReusesClusterID(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Listener = ln1
+	cfg.HealthListener = testHealthListener(t)
 	cfg.DataDir = dataDir
 	cfg.LogLevel = "error"
 
@@ -105,6 +116,7 @@ func TestBrokerReusesClusterID(t *testing.T) {
 	}
 
 	cfg.Listener = ln2
+	cfg.HealthListener = testHealthListener(t)
 	b2 := New(cfg)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan error, 1)
@@ -128,6 +140,7 @@ func TestBrokerConfiguredClusterID(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Listener = ln
+	cfg.HealthListener = testHealthListener(t)
 	cfg.DataDir = t.TempDir()
 	cfg.ClusterID = "my-custom-cluster-id-22"
 	cfg.LogLevel = "error"
@@ -193,5 +206,8 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
+	}
+	if cfg.HealthAddr != "" {
+		t.Errorf("HealthAddr = %q, want %q (disabled by default)", cfg.HealthAddr, "")
 	}
 }

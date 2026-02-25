@@ -147,7 +147,6 @@ func startBroker(t *testing.T, binary, dataDir, s3Prefix string, extraArgs ...st
 	args := []string{
 		"--listen", "127.0.0.1:0",
 		"--data-dir", dataDir,
-		"--wal-enabled",
 		"--s3-bucket", testBucket,
 		"--s3-region", testRegion,
 		"--s3-endpoint", localstackEndpoint,
@@ -275,22 +274,6 @@ func produceSync(t *testing.T, cl *kgo.Client, records ...*kgo.Record) {
 	for _, r := range results {
 		require.NoError(t, r.Err)
 	}
-}
-
-// consumeN consumes n records with a timeout.
-func consumeN(t *testing.T, cl *kgo.Client, n int, timeout time.Duration) []*kgo.Record {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	var records []*kgo.Record
-	for len(records) < n {
-		fetches := cl.PollFetches(ctx)
-		require.NoError(t, ctx.Err(), "timed out waiting for %d records, got %d", n, len(records))
-		fetches.EachRecord(func(r *kgo.Record) {
-			records = append(records, r)
-		})
-	}
-	return records[:n]
 }
 
 // listS3Objects returns all object keys in the test bucket under the given prefix.

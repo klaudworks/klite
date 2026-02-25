@@ -20,13 +20,13 @@ func makeTestBatch(numRecords int32, maxTimestamp int64) []byte {
 	}
 	raw := make([]byte, 61)
 	binary.BigEndian.PutUint32(raw[8:12], 49) // batchLength
-	raw[16] = 2                                // magic
+	raw[16] = 2                               // magic
 	binary.BigEndian.PutUint32(raw[23:27], uint32(lastDelta))
 	binary.BigEndian.PutUint64(raw[27:35], uint64(1000))
 	binary.BigEndian.PutUint64(raw[35:43], uint64(maxTimestamp))
 	binary.BigEndian.PutUint64(raw[43:51], ^uint64(0)) // producerID = -1
-	binary.BigEndian.PutUint16(raw[51:53], ^uint16(0))  // producerEpoch = -1
-	binary.BigEndian.PutUint32(raw[53:57], ^uint32(0))  // baseSequence = -1
+	binary.BigEndian.PutUint16(raw[51:53], ^uint16(0)) // producerEpoch = -1
+	binary.BigEndian.PutUint32(raw[53:57], ^uint32(0)) // baseSequence = -1
 	binary.BigEndian.PutUint32(raw[57:61], uint32(numRecords))
 	return raw
 }
@@ -607,7 +607,7 @@ func TestIndexLookup(t *testing.T) {
 
 	t.Run("maxBytes limits", func(t *testing.T) {
 		entries := idx.Lookup(tp, 0, 150) // first batch 100 bytes, adding second (200 total) > 150
-		if len(entries) != 1 { // KIP-74: first batch always included, but second exceeds limit
+		if len(entries) != 1 {            // KIP-74: first batch always included, but second exceeds limit
 			t.Errorf("got %d entries, want 1", len(entries))
 		}
 	})
@@ -618,6 +618,83 @@ func TestIndexLookup(t *testing.T) {
 			t.Errorf("got %d entries, want 0", len(entries))
 		}
 	})
+}
+
+func TestTryCleanupSegments(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	idx := NewIndex()
+	cfg := DefaultWriterConfig()
+	cfg.Dir = dir
+	cfg.SegmentMaxBytes = 200 // small segments to force rotation
+	cfg.FsyncEnabled = false
+	cfg.Clock = &clock.FakeClock{}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	topicID := [16]byte{1, 2, 3}
+	tp := TopicPartition{TopicID: topicID, Partition: 0}
+
+	// Write enough entries to force segment rotation
+	for i := 0; i < 20; i++ {
+		batch := makeTestBatch(1, int64(1000+i))
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      batch,
+		}
+		if err := w.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Count WAL files on disk before cleanup
+	filesBefore := countWALFiles(t, dir)
+	if filesBefore < 2 {
+		t.Skipf("need at least 2 segment files for test, got %d", filesBefore)
+	}
+
+	// Prune all entries from the index for this partition
+	idx.PruneBefore(tp, 100) // prune everything (all offsets < 100)
+
+	// Signal cleanup and wait for it to process
+	w.TryCleanupSegments()
+	time.Sleep(50 * time.Millisecond) // allow writer goroutine to process
+
+	// Verify by counting files on disk (avoids racing on w.segments)
+	filesAfter := countWALFiles(t, dir)
+	if filesAfter >= filesBefore {
+		t.Errorf("expected WAL files to be cleaned up: before=%d, after=%d", filesBefore, filesAfter)
+	}
+
+	// The current segment should always be preserved
+	if filesAfter < 1 {
+		t.Error("current segment was deleted")
+	}
+}
+
+func countWALFiles(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".wal" {
+			count++
+		}
+	}
+	return count
 }
 
 func TestIndexPruneBefore(t *testing.T) {

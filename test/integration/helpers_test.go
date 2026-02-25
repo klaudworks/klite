@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/klaudworks/klite/internal/broker"
-	"github.com/klaudworks/klite/internal/sasl"
 	s3store "github.com/klaudworks/klite/internal/s3"
+	"github.com/klaudworks/klite/internal/sasl"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -35,11 +35,6 @@ func WithAutoCreateTopics(v bool) BrokerOpt {
 // WithDefaultPartitions sets the default partition count.
 func WithDefaultPartitions(n int) BrokerOpt {
 	return func(c *broker.Config) { c.DefaultPartitions = n }
-}
-
-// WithWALEnabled enables or disables WAL persistence.
-func WithWALEnabled(v bool) BrokerOpt {
-	return func(c *broker.Config) { c.WALEnabled = v }
 }
 
 // WithDataDir sets the data directory (for restart tests using the same dir).
@@ -126,8 +121,12 @@ func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
+	healthLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
 	cfg := broker.DefaultConfig()
 	cfg.Listener = ln
+	cfg.HealthListener = healthLn
 	cfg.DataDir = t.TempDir()
 	cfg.LogLevel = "debug"
 	for _, o := range opts {

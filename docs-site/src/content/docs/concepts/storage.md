@@ -180,5 +180,4 @@ The recovery point objective (RPO) depends on the fsync window:
 ## Next steps
 
 - [Architecture](/concepts/architecture/) -- overall system design
-- [Configuration](/reference/configuration/) -- storage-related flags
-- [Monitoring](/guides/monitoring/) -- disk usage and S3 health
+- [Configuration](/guides/configuration/) -- storage-related flags

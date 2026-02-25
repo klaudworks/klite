@@ -62,7 +62,7 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int32, offse
 	}
 
 	// 2. Read the footer (cached after first access)
-	footer, err := r.getFooter(ctx, key, objectSize)
+	footer, err := r.GetFooter(ctx, key, objectSize)
 	if err != nil {
 		return nil, fmt.Errorf("read footer for %s: %w", key, err)
 	}
@@ -112,7 +112,7 @@ func (r *Reader) FetchBatches(ctx context.Context, topic string, partition int32
 		return nil, nil
 	}
 
-	footer, err := r.getFooter(ctx, key, objectSize)
+	footer, err := r.GetFooter(ctx, key, objectSize)
 	if err != nil {
 		return nil, fmt.Errorf("read footer for %s: %w", key, err)
 	}
@@ -240,8 +240,8 @@ func (r *Reader) getObjectListing(ctx context.Context, prefix string) ([]ObjectI
 	return objects, nil
 }
 
-// getFooter returns the cached footer for an S3 object key.
-func (r *Reader) getFooter(ctx context.Context, key string, objectSize int64) (*Footer, error) {
+// GetFooter returns the cached footer for an S3 object key.
+func (r *Reader) GetFooter(ctx context.Context, key string, objectSize int64) (*Footer, error) {
 	r.footerMu.RLock()
 	footer, ok := r.footerCache[key]
 	r.footerMu.RUnlock()
@@ -359,7 +359,7 @@ func (r *Reader) DiscoverHW(ctx context.Context, topic string, partition int32) 
 
 	// Last object contains the highest offsets
 	lastObj := objects[len(objects)-1]
-	footer, err := r.getFooter(ctx, lastObj.Key, lastObj.Size)
+	footer, err := r.GetFooter(ctx, lastObj.Key, lastObj.Size)
 	if err != nil {
 		return 0, fmt.Errorf("read footer for %s: %w", lastObj.Key, err)
 	}
