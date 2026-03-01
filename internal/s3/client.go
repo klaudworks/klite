@@ -37,7 +37,7 @@ type S3API interface {
 type ClientConfig struct {
 	S3Client S3API
 	Bucket   string
-	Prefix   string // e.g., "klite/<clusterID>"
+	Prefix   string // Resolved prefix, e.g. "klite-<clusterID>" or "myprefix/klite-<clusterID>"
 	Logger   *slog.Logger
 }
 

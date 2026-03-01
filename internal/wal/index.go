@@ -143,6 +143,39 @@ func (idx *Index) SegmentReferenced(segmentSeq uint64) bool {
 	return false
 }
 
+// UnflushedBytes returns the total bytes of WAL entries for a partition
+// that have not yet been flushed to S3 (entries where LastOffset >= s3Watermark).
+func (idx *Index) UnflushedBytes(tp TopicPartition, s3Watermark int64) int64 {
+	idx.mu.RLock()
+	entries := idx.partitions[tp]
+	idx.mu.RUnlock()
+
+	var total int64
+	for _, e := range entries {
+		if e.LastOffset >= s3Watermark {
+			total += int64(e.BatchSize)
+		}
+	}
+	return total
+}
+
+// OldestUnflushedTimestamp returns the WAL sequence number of the oldest
+// unflushed entry for a partition (entries where LastOffset >= s3Watermark).
+// Returns 0 if no unflushed entries exist. The WAL sequence can be used
+// as a monotonic proxy for age (assigned at write time).
+func (idx *Index) OldestUnflushedSequence(tp TopicPartition, s3Watermark int64) uint64 {
+	idx.mu.RLock()
+	entries := idx.partitions[tp]
+	idx.mu.RUnlock()
+
+	for _, e := range entries {
+		if e.LastOffset >= s3Watermark {
+			return e.WALSequence
+		}
+	}
+	return 0
+}
+
 // AllPartitions returns all tracked topic-partitions.
 func (idx *Index) AllPartitions() []TopicPartition {
 	idx.mu.RLock()

@@ -5,6 +5,7 @@ package s3
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -255,14 +256,44 @@ func ParseFooter(tailData []byte, objectSize int64) (*Footer, error) {
 	return &Footer{Entries: entries}, nil
 }
 
+// TopicDir returns the directory component for a topic, encoding both the
+// name and UUID so that delete-then-recreate produces a distinct prefix.
+// Format: "topicName-hexTopicID"
+func TopicDir(topic string, topicID [16]byte) string {
+	return topic + "-" + hex.EncodeToString(topicID[:])
+}
+
+// ParseTopicDir extracts the topic name and topic ID from a topic directory
+// component of the format "topicName-hexTopicID". Returns ("", zero) if
+// the format is invalid.
+func ParseTopicDir(dir string) (string, [16]byte) {
+	var zeroID [16]byte
+	// The hex-encoded topic ID is always 32 chars at the end, preceded by "-"
+	if len(dir) < 34 { // at least 1 char name + "-" + 32 hex chars
+		return dir, zeroID // legacy format without topic ID
+	}
+	sep := len(dir) - 33 // position of the "-" before the 32-char hex ID
+	if dir[sep] != '-' {
+		return dir, zeroID
+	}
+	hexStr := dir[sep+1:]
+	idBytes, err := hex.DecodeString(hexStr)
+	if err != nil || len(idBytes) != 16 {
+		return dir, zeroID
+	}
+	var id [16]byte
+	copy(id[:], idBytes)
+	return dir[:sep], id
+}
+
 // ObjectKeyPrefix returns the S3 key prefix for a topic/partition.
-func ObjectKeyPrefix(prefix, topic string, partition int32) string {
-	return fmt.Sprintf("%s/%s/%d/", prefix, topic, partition)
+func ObjectKeyPrefix(prefix, topic string, topicID [16]byte, partition int32) string {
+	return fmt.Sprintf("%s/%s/%d/", prefix, TopicDir(topic, topicID), partition)
 }
 
 // ObjectKey returns the full S3 key for a partition object at the given base offset.
-func ObjectKey(prefix, topic string, partition int32, baseOffset int64) string {
-	return fmt.Sprintf("%s/%s/%d/%020d.obj", prefix, topic, partition, baseOffset)
+func ObjectKey(prefix, topic string, topicID [16]byte, partition int32, baseOffset int64) string {
+	return fmt.Sprintf("%s/%s/%d/%020d.obj", prefix, TopicDir(topic, topicID), partition, baseOffset)
 }
 
 // ZeroPadOffset returns a 20-digit zero-padded string for an offset.

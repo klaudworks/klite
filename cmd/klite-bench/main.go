@@ -32,6 +32,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "produce-consume":
+		if err := runProduceConsume(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "create-topic":
 		if err := runCreateTopic(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -55,10 +60,11 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `klite-bench — Kafka-compatible performance testing tool
 
 Usage:
-  klite-bench produce [flags]        Run producer throughput/latency test
-  klite-bench consume [flags]        Run consumer throughput test
-  klite-bench create-topic [flags]   Create a topic
-  klite-bench delete-topic [flags]   Delete a topic
+  klite-bench produce [flags]           Run producer throughput/latency test
+  klite-bench consume [flags]           Run consumer throughput test
+  klite-bench produce-consume [flags]   Run both, measure e2e latency
+  klite-bench create-topic [flags]      Create a topic
+  klite-bench delete-topic [flags]      Delete a topic
 
 Run 'klite-bench <command> --help' for command-specific flags.
 `)
@@ -79,6 +85,7 @@ func runProduce(args []string) error {
 	batchMax := fs.Int("batch-max-bytes", int(cfg.BatchMaxBytes), "Max bytes per batch")
 	fs.IntVar(&cfg.LingerMs, "linger-ms", cfg.LingerMs, "Producer linger in milliseconds")
 	fs.IntVar(&cfg.NumProducers, "producers", cfg.NumProducers, "Number of concurrent producer clients")
+	fs.IntVar(&cfg.MaxBufferedRecords, "max-buffered-records", cfg.MaxBufferedRecords, "Max records buffered in client (controls backpressure)")
 	fs.Int64Var(&cfg.WarmupRecords, "warmup-records", 0, "Number of initial records to discard from stats")
 	reportingMs := fs.Int64("reporting-interval", 5000, "Reporting interval in milliseconds")
 	fs.StringVar(&jsonOut, "json-output", "", "Path to write JSON results (optional)")
@@ -89,14 +96,21 @@ func runProduce(args []string) error {
 	cfg.BatchMaxBytes = int32(*batchMax)
 	cfg.ReportingInterval = time.Duration(*reportingMs) * time.Millisecond
 
+	// Open JSON Lines output file if requested.
+	if jsonOut != "" {
+		f, err := os.Create(jsonOut)
+		if err != nil {
+			return fmt.Errorf("creating json output file: %w", err)
+		}
+		defer f.Close()
+		cfg.JSONOut = f
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	result, err := bench.RunProducer(ctx, cfg)
-
-	if jsonOut != "" && result != nil {
-		writeProducerJSON(jsonOut, cfg, result)
-	}
+	_ = result
 
 	return err
 }
@@ -133,6 +147,51 @@ func runConsume(args []string) error {
 		writeConsumerJSON(jsonOut, cfg, result)
 	}
 
+	return err
+}
+
+func runProduceConsume(args []string) error {
+	cfg := bench.DefaultProduceConsumeConfig()
+
+	fs := flag.NewFlagSet("produce-consume", flag.ExitOnError)
+	var brokers string
+	var jsonOut string
+	fs.StringVar(&brokers, "bootstrap-server", "localhost:9092", "Broker address(es), comma-separated")
+	fs.StringVar(&cfg.Topic, "topic", cfg.Topic, "Topic to produce to and consume from")
+	fs.Int64Var(&cfg.NumRecords, "num-records", cfg.NumRecords, "Number of records to produce")
+	fs.IntVar(&cfg.RecordSize, "record-size", cfg.RecordSize, "Record value size in bytes")
+	fs.Float64Var(&cfg.Throughput, "throughput", cfg.Throughput, "Records/sec cap (-1 = unlimited)")
+	fs.IntVar(&cfg.Acks, "acks", cfg.Acks, "Required acks: -1 (all), 0, 1")
+	batchMax := fs.Int("batch-max-bytes", int(cfg.BatchMaxBytes), "Max bytes per batch")
+	fs.IntVar(&cfg.LingerMs, "linger-ms", cfg.LingerMs, "Producer linger in milliseconds")
+	fs.IntVar(&cfg.NumProducers, "producers", cfg.NumProducers, "Number of concurrent producers")
+	fs.IntVar(&cfg.NumConsumers, "consumers", cfg.NumConsumers, "Number of concurrent consumers")
+	fs.IntVar(&cfg.MaxBufferedRecords, "max-buffered-records", cfg.MaxBufferedRecords, "Max records buffered in client")
+	fs.Int64Var(&cfg.WarmupRecords, "warmup-records", 0, "Records to discard from stats")
+	reportingMs := fs.Int64("reporting-interval", 5000, "Reporting interval in milliseconds")
+	drainMs := fs.Int64("drain-timeout", 30000, "Max ms to wait for consumers after produce finishes")
+	fs.StringVar(&jsonOut, "json-output", "", "Path to write JSON Lines results")
+
+	fs.Parse(args)
+
+	cfg.Brokers = splitBrokers(brokers)
+	cfg.BatchMaxBytes = int32(*batchMax)
+	cfg.ReportingInterval = time.Duration(*reportingMs) * time.Millisecond
+	cfg.DrainTimeout = time.Duration(*drainMs) * time.Millisecond
+
+	if jsonOut != "" {
+		f, err := os.Create(jsonOut)
+		if err != nil {
+			return fmt.Errorf("creating json output file: %w", err)
+		}
+		defer f.Close()
+		cfg.JSONOut = f
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	_, err := bench.RunProduceConsume(ctx, cfg)
 	return err
 }
 
@@ -184,9 +243,10 @@ type produceJSON struct {
 	Producers  int     `json:"producers"`
 	RecordSize int     `json:"record_size"`
 	Acks       int     `json:"acks"`
-	BatchMax   int     `json:"batch_max_bytes"`
-	LingerMs   int     `json:"linger_ms"`
-	Throughput float64 `json:"throughput_cap"`
+	BatchMax           int     `json:"batch_max_bytes"`
+	LingerMs           int     `json:"linger_ms"`
+	MaxBufferedRecords int     `json:"max_buffered_records"`
+	Throughput         float64 `json:"throughput_cap"`
 
 	Records     int64   `json:"records"`
 	Errors      int64   `json:"errors"`
@@ -223,9 +283,10 @@ func writeProducerJSON(path string, cfg bench.ProducerConfig, r *bench.ProducerR
 		Producers:   cfg.NumProducers,
 		RecordSize:  cfg.RecordSize,
 		Acks:        cfg.Acks,
-		BatchMax:    int(cfg.BatchMaxBytes),
-		LingerMs:    cfg.LingerMs,
-		Throughput:  cfg.Throughput,
+		BatchMax:           int(cfg.BatchMaxBytes),
+		LingerMs:           cfg.LingerMs,
+		MaxBufferedRecords: cfg.MaxBufferedRecords,
+		Throughput:         cfg.Throughput,
 		Records:     r.Records,
 		Errors:      r.Errors,
 		ElapsedMs:   r.ElapsedMs,

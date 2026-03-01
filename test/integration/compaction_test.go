@@ -30,11 +30,14 @@ func createCompactedTopic(t *testing.T, addr, topic string, partitions int32, ex
 }
 
 // countS3Objects counts .obj files for a topic/partition in InMemoryS3.
+// Matches the key format: prefix/topicName-topicID/partition/offset.obj
 func countS3Objects(mem *s3store.InMemoryS3, topic string, partition int) int {
 	count := 0
-	partStr := fmt.Sprintf("%s/%d/", topic, partition)
+	// Match "topicName-" (prefix of the topic dir) and "/partition/"
+	topicPrefix := fmt.Sprintf("%s-", topic)
+	partSuffix := fmt.Sprintf("/%d/", partition)
 	for _, k := range mem.Keys() {
-		if strings.Contains(k, partStr) && strings.HasSuffix(k, ".obj") {
+		if strings.Contains(k, topicPrefix) && strings.Contains(k, partSuffix) && strings.HasSuffix(k, ".obj") {
 			count++
 		}
 	}

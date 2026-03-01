@@ -2,7 +2,6 @@ package bench
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -23,10 +22,12 @@ type ProducerConfig struct {
 	Acks              int     // -1 (all), 0, 1
 	BatchMaxBytes     int32
 	LingerMs          int
+	MaxBufferedRecords int
 	NumProducers      int // number of concurrent producer clients
 	WarmupRecords     int64
 	ReportingInterval time.Duration
 	Out               io.Writer
+	JSONOut           io.Writer // JSON Lines time-series output (nil = disabled)
 }
 
 // DefaultProducerConfig returns sensible defaults.
@@ -38,9 +39,10 @@ func DefaultProducerConfig() ProducerConfig {
 		RecordSize:        1000,
 		Throughput:        -1,
 		Acks:              -1,
-		BatchMaxBytes:     1_048_576, // 1 MiB
-		LingerMs:          5,
-		NumProducers:      1,
+		BatchMaxBytes:      1_048_576, // 1 MiB
+		LingerMs:           5,
+		MaxBufferedRecords: 8192,
+		NumProducers:       1,
 		ReportingInterval: 5 * time.Second,
 		Out:               os.Stdout,
 	}
@@ -71,16 +73,18 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 		cfg.NumProducers = 1
 	}
 
-	// Generate random payload (same approach as Kafka's perf test).
-	payload := make([]byte, cfg.RecordSize)
-	rand.Read(payload)
-
 	stats := NewStats(cfg.NumRecords, cfg.WarmupRecords, cfg.ReportingInterval, cfg.Out)
+	if cfg.JSONOut != nil {
+		stats.SetJSONOutput(cfg.JSONOut)
+	}
 	var totalErrors atomic.Int64
 
-	// Divide records and throughput across producers.
-	baseRecords := cfg.NumRecords / int64(cfg.NumProducers)
-	remainder := cfg.NumRecords % int64(cfg.NumProducers)
+	// Divide measured records, warmup, and throughput across producers.
+	// Each producer sends warmup + measured records (warmup first).
+	baseMeasured := cfg.NumRecords / int64(cfg.NumProducers)
+	measuredRemainder := cfg.NumRecords % int64(cfg.NumProducers)
+	baseWarmup := cfg.WarmupRecords / int64(cfg.NumProducers)
+	warmupRemainder := cfg.WarmupRecords % int64(cfg.NumProducers)
 	perProducerThroughput := cfg.Throughput
 	if cfg.Throughput > 0 {
 		perProducerThroughput = cfg.Throughput / float64(cfg.NumProducers)
@@ -90,17 +94,22 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 	errs := make([]error, cfg.NumProducers)
 
 	for p := 0; p < cfg.NumProducers; p++ {
-		records := baseRecords
-		if int64(p) < remainder {
-			records++
+		measured := baseMeasured
+		if int64(p) < measuredRemainder {
+			measured++
 		}
+		warmup := baseWarmup
+		if int64(p) < warmupRemainder {
+			warmup++
+		}
+		totalForProducer := warmup + measured
 
 		wg.Add(1)
-		go func(producerIdx int, numRecords int64) {
+		go func(producerIdx int, total, warmupCount int64) {
 			defer wg.Done()
-			errs[producerIdx] = runSingleProducer(ctx, cfg, payload, numRecords,
+			errs[producerIdx] = runSingleProducer(ctx, cfg, total, warmupCount,
 				perProducerThroughput, stats, &totalErrors)
-		}(p, records)
+		}(p, totalForProducer, warmup)
 	}
 
 	wg.Wait()
@@ -123,8 +132,10 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 	return result, nil
 }
 
-func runSingleProducer(ctx context.Context, cfg ProducerConfig, payload []byte,
-	numRecords int64, throughput float64, stats *Stats, errorCount *atomic.Int64) error {
+func runSingleProducer(ctx context.Context, cfg ProducerConfig,
+	numRecords, warmupRecords int64, throughput float64, stats *Stats, errorCount *atomic.Int64) error {
+
+	gen := NewPayloadGenerator(cfg.RecordSize)
 
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
@@ -132,7 +143,7 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig, payload []byte,
 		kgo.ProducerBatchMaxBytes(cfg.BatchMaxBytes),
 		kgo.ProducerLinger(time.Duration(cfg.LingerMs) * time.Millisecond),
 		kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
-		kgo.MaxBufferedRecords(256 * 1024),
+		kgo.MaxBufferedRecords(cfg.MaxBufferedRecords),
 		kgo.RetryBackoffFn(func(int) time.Duration { return 100 * time.Millisecond }),
 		kgo.RequestRetries(10),
 	}
@@ -162,8 +173,11 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig, payload []byte,
 			break
 		}
 
+		val := gen.GenerateCopy()
+		isWarmup := i < warmupRecords
+
 		record := &kgo.Record{
-			Value: payload,
+			Value: val,
 		}
 
 		sendStart := time.Now()
@@ -174,7 +188,9 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig, payload []byte,
 				errorCount.Add(1)
 				return
 			}
-			stats.Record(latencyMs, len(payload), now)
+			if !isWarmup {
+				stats.Record(latencyMs, len(val), now)
+			}
 		})
 
 		if throttler.ShouldThrottle(i+1, sendStart) {

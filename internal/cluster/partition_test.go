@@ -3,14 +3,19 @@ package cluster
 import (
 	"sync"
 	"testing"
+
+	"github.com/klaudworks/klite/internal/chunk"
 )
 
-// newTestPartition creates a PartData with a ring buffer for testing.
+// testPool is a shared chunk pool for tests. 64 MiB budget with default chunk size.
+var testPool = chunk.NewPool(64*1024*1024, DefaultMaxMessageBytes)
+
+// newTestPartition creates a PartData with a chunk pool for testing.
 func newTestPartition() *PartData {
 	return &PartData{
-		Topic: "test-topic",
-		Index: 0,
-		ring:  NewRingBuffer(64),
+		Topic:     "test-topic",
+		Index:     0,
+		chunkPool: testPool,
 	}
 }
 
@@ -639,14 +644,14 @@ func TestMaxTimestampTracking(t *testing.T) {
 	})
 }
 
-// --- Phase 3 tests: Ring Buffer, ReserveOffset, CommitBatch ---
+// --- Phase 3 tests: ChunkPool, ReserveOffset, CommitBatch ---
 
-func newTestPartitionWithRing(slots int) *PartData {
+func newTestPartitionWithChunks() *PartData {
 	pd := &PartData{
-		Topic:   "test-topic",
-		Index:   0,
-		TopicID: [16]byte{1, 2, 3},
-		ring:    NewRingBuffer(slots),
+		Topic:     "test-topic",
+		Index:     0,
+		TopicID:   [16]byte{1, 2, 3},
+		chunkPool: testPool,
 	}
 	return pd
 }
@@ -654,7 +659,7 @@ func newTestPartitionWithRing(slots int) *PartData {
 func TestReserveOffset(t *testing.T) {
 	t.Parallel()
 
-	pd := newTestPartitionWithRing(64)
+	pd := newTestPartitionWithChunks()
 
 	pd.Lock()
 	// Reserve 3 records: offsets 0, 1, 2
@@ -674,7 +679,7 @@ func TestReserveOffset(t *testing.T) {
 func TestCommitBatchInOrder(t *testing.T) {
 	t.Parallel()
 
-	pd := newTestPartitionWithRing(64)
+	pd := newTestPartitionWithChunks()
 
 	raw0 := makeSimpleBatch(3, 1000)
 	raw1 := makeSimpleBatch(2, 2000)
@@ -715,7 +720,7 @@ func TestCommitBatchInOrder(t *testing.T) {
 func TestCommitBatchOutOfOrder(t *testing.T) {
 	t.Parallel()
 
-	pd := newTestPartitionWithRing(64)
+	pd := newTestPartitionWithChunks()
 
 	pd.Lock()
 	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2}) // offsets 0-2
@@ -774,7 +779,7 @@ func TestCommitBatchOutOfOrder(t *testing.T) {
 func TestReadCascadeRingBuffer(t *testing.T) {
 	t.Parallel()
 
-	pd := newTestPartitionWithRing(64)
+	pd := newTestPartitionWithChunks()
 
 	// Push some batches
 	pd.Lock()
@@ -798,7 +803,7 @@ func TestReadCascadeRingBuffer(t *testing.T) {
 func TestReadCascadeFetchFromMiddle(t *testing.T) {
 	t.Parallel()
 
-	pd := newTestPartitionWithRing(64)
+	pd := newTestPartitionWithChunks()
 
 	pd.Lock()
 	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3})

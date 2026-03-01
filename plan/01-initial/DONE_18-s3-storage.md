@@ -391,7 +391,7 @@ complexity.
 | `s3.endpoint` | (empty) | Custom S3 endpoint (MinIO, LocalStack) |
 | `s3.prefix` | `klite/<clusterID>` | S3 key prefix |
 | `--s3-flush-interval` | 10m | Unified S3 sync interval (also runs on graceful shutdown) |
-| `s3.upload.concurrency` | 4 | Parallel S3 PUT calls |
+| `s3.upload.concurrency` | 8 | Parallel S3 PUT calls |
 | `s3.read.concurrency` | 64 | Parallel S3 GET calls (semaphore) |
 
 ---

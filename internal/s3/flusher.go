@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -15,7 +16,7 @@ import (
 // PartitionProvider provides per-partition data to the S3 flusher.
 // Implemented by a broker-level adapter to avoid circular dependencies.
 type PartitionProvider interface {
-	// FlushablePartitions returns all partitions with unflushed WAL data.
+	// FlushablePartitions returns all partitions with unflushed chunk data.
 	FlushablePartitions() []FlushPartition
 }
 
@@ -27,8 +28,16 @@ type FlushPartition struct {
 	S3Watermark int64
 	HW          int64
 
-	// Batches to flush (collected by the provider)
-	Batches []BatchData
+	// SealedBytes is the total bytes in sealed chunks (used for size threshold).
+	SealedBytes int64
+
+	// OldestChunkTime is the creation time of the oldest sealed/current chunk.
+	OldestChunkTime time.Time
+
+	// DetachChunks detaches sealed chunks from the partition under lock.
+	// If flushAll is true, also seals and detaches the current chunk.
+	// Returns the detached chunks and the chunk pool for release after upload.
+	DetachChunks func(flushAll bool) ([]*chunk.Chunk, *chunk.Pool)
 
 	// AdvanceWatermark is called after successful flush to advance the watermark.
 	AdvanceWatermark func(newWatermark int64)
@@ -39,17 +48,24 @@ type FlusherConfig struct {
 	Client            *Client
 	WALWriter         *wal.Writer
 	WALIndex          *wal.Index
-	FlushInterval     time.Duration // Default 10m
-	UploadConcurrency int           // Default 4
+	FlushInterval     time.Duration // Max age before flush (default 60s)
+	CheckInterval     time.Duration // How often to scan partitions (default 5s)
+	TargetObjectSize  int64         // Flush when unflushed bytes >= this (default 64 MiB)
+	UploadConcurrency int           // Default 8
 	Clock             clock.Clock
 	Logger            *slog.Logger
 
-	// MetadataUploader is called after all partitions are flushed to upload metadata.log.
+	// TriggerCh receives signals from the chunk pool for emergency flush
+	// when pool pressure reaches 75%.
+	TriggerCh <-chan struct{}
+
+	// MetadataUploader is called periodically to upload metadata.log.
 	MetadataUploader func(ctx context.Context) error
 }
 
-// Flusher manages the S3 flush pipeline. It periodically flushes all partitions
-// with unflushed data to S3, then uploads metadata.log.
+// Flusher manages the S3 flush pipeline. It periodically scans partitions
+// and flushes those that exceed size or age thresholds. Reads batch data
+// from the chunk pool (zero disk I/O).
 type Flusher struct {
 	cfg      FlusherConfig
 	client   *Client
@@ -63,10 +79,19 @@ type Flusher struct {
 // NewFlusher creates a new S3 flusher.
 func NewFlusher(cfg FlusherConfig, provider PartitionProvider) *Flusher {
 	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = 10 * time.Minute
+		cfg.FlushInterval = 60 * time.Second
+	}
+	if cfg.CheckInterval == 0 {
+		cfg.CheckInterval = 5 * time.Second
+	}
+	if cfg.CheckInterval > cfg.FlushInterval {
+		cfg.CheckInterval = cfg.FlushInterval
+	}
+	if cfg.TargetObjectSize == 0 {
+		cfg.TargetObjectSize = 64 * 1024 * 1024 // 64 MiB
 	}
 	if cfg.UploadConcurrency == 0 {
-		cfg.UploadConcurrency = 4
+		cfg.UploadConcurrency = 8
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = clock.RealClock{}
@@ -96,31 +121,58 @@ func (f *Flusher) Stop() {
 	<-f.done
 }
 
-// FlushAll performs a unified S3 sync cycle: flush all partitions + upload metadata.
-// Can be called externally (e.g., for graceful shutdown).
+// FlushAll flushes all partitions with any unflushed data plus metadata.
+// Used for graceful shutdown.
 func (f *Flusher) FlushAll(ctx context.Context) error {
-	return f.unifiedSync(ctx)
+	return f.scanAndFlush(ctx, true)
 }
 
 func (f *Flusher) run() {
 	defer close(f.done)
 
-	ticker := f.cfg.Clock.NewTicker(f.cfg.FlushInterval)
-	defer ticker.Stop()
+	checkTicker := f.cfg.Clock.NewTicker(f.cfg.CheckInterval)
+	defer checkTicker.Stop()
+
+	metaTicker := f.cfg.Clock.NewTicker(f.cfg.FlushInterval)
+	defer metaTicker.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-checkTicker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			if err := f.unifiedSync(ctx); err != nil {
-				f.logger.Error("S3 unified sync failed", "err", err)
+			if err := f.scanAndFlush(ctx, false); err != nil {
+				f.logger.Error("S3 flush scan failed", "err", err)
 			}
 			cancel()
-		case <-f.stopCh:
-			// Final flush on stop
+
+		case <-f.triggerCh():
+			// Emergency flush from chunk pool pressure
+			f.logger.Warn("emergency flush triggered by chunk pool pressure")
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			if err := f.unifiedSync(ctx); err != nil {
+			if err := f.scanAndFlush(ctx, true); err != nil {
+				f.logger.Error("S3 emergency flush failed", "err", err)
+			}
+			cancel()
+
+		case <-metaTicker.C:
+			if f.cfg.MetadataUploader != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := f.cfg.MetadataUploader(ctx); err != nil {
+					f.logger.Error("metadata.log upload failed", "err", err)
+				}
+				cancel()
+			}
+
+		case <-f.stopCh:
+			// Final flush on stop: flush all partitions + metadata
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if err := f.scanAndFlush(ctx, true); err != nil {
 				f.logger.Error("S3 shutdown flush failed", "err", err)
+			}
+			if f.cfg.MetadataUploader != nil {
+				if err := f.cfg.MetadataUploader(ctx); err != nil {
+					f.logger.Error("S3 shutdown metadata upload failed", "err", err)
+				}
 			}
 			cancel()
 			return
@@ -128,29 +180,82 @@ func (f *Flusher) run() {
 	}
 }
 
-// unifiedSync performs the unified S3 sync cycle:
-//  1. Flush all partitions with unflushed data
-//  2. Upload metadata.log
-func (f *Flusher) unifiedSync(ctx context.Context) error {
-	partitions := f.provider.FlushablePartitions()
+// triggerCh returns the emergency trigger channel, or a nil channel if not configured.
+func (f *Flusher) triggerCh() <-chan struct{} {
+	return f.cfg.TriggerCh
+}
 
-	// Filter to only those with batches
-	var toFlush []FlushPartition
+// scanAndFlush scans all partitions and flushes those that meet criteria.
+// If flushAll is true, all partitions with any unflushed data are flushed.
+func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
+	partitions := f.provider.FlushablePartitions()
+	if len(partitions) == 0 {
+		return nil
+	}
+
+	now := f.cfg.Clock.Now()
+
+	// Determine which partitions to flush based on size/age thresholds.
+	// Track whether each partition needs to include the current chunk
+	// (age-triggered and flushAll both require it; size-triggered only
+	// needs sealed chunks since the current chunk is still being filled).
+	type flushCandidate struct {
+		fp             FlushPartition
+		includeCurrent bool // true = detach current chunk too
+	}
+	var toFlush []flushCandidate
 	for _, fp := range partitions {
-		if len(fp.Batches) > 0 {
-			toFlush = append(toFlush, fp)
+		if flushAll {
+			toFlush = append(toFlush, flushCandidate{fp, true})
+			continue
+		}
+
+		// Size threshold: sealed chunk bytes >= target object size
+		if fp.SealedBytes >= f.cfg.TargetObjectSize {
+			toFlush = append(toFlush, flushCandidate{fp, false})
+			continue
+		}
+
+		// Age threshold: oldest chunk age >= flush interval.
+		// Include the current chunk because in low-throughput scenarios
+		// the current chunk may never fill up and seal on its own.
+		if !fp.OldestChunkTime.IsZero() {
+			age := now.Sub(fp.OldestChunkTime)
+			if age >= f.cfg.FlushInterval {
+				toFlush = append(toFlush, flushCandidate{fp, true})
+				continue
+			}
 		}
 	}
 
 	if len(toFlush) == 0 {
-		// Still upload metadata.log even if no partition data to flush
-		if f.cfg.MetadataUploader != nil {
-			return f.cfg.MetadataUploader(ctx)
-		}
 		return nil
 	}
 
-	f.logger.Info("S3 unified sync starting", "partitions", len(toFlush))
+	// Detach chunks from each partition (brief lock per partition)
+	type flushJob struct {
+		FlushPartition
+		chunks []*chunk.Chunk
+		pool   *chunk.Pool
+	}
+	var jobs []flushJob
+	for _, fc := range toFlush {
+		chunks, pool := fc.fp.DetachChunks(fc.includeCurrent)
+		if len(chunks) == 0 {
+			continue
+		}
+		jobs = append(jobs, flushJob{
+			FlushPartition: fc.fp,
+			chunks:         chunks,
+			pool:           pool,
+		})
+	}
+
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	f.logger.Info("S3 flush: flushing partitions", "count", len(jobs), "flush_all", flushAll)
 	start := time.Now()
 
 	// Flush partitions with bounded concurrency
@@ -159,8 +264,8 @@ func (f *Flusher) unifiedSync(ctx context.Context) error {
 	var errMu sync.Mutex
 	var firstErr error
 
-	for _, fp := range toFlush {
-		fp := fp // capture loop var
+	for _, job := range jobs {
+		job := job
 
 		wg.Add(1)
 		sem <- struct{}{}
@@ -168,67 +273,89 @@ func (f *Flusher) unifiedSync(ctx context.Context) error {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			if err := f.flushPartition(ctx, fp); err != nil {
+			// Build batch data from chunks (zero disk I/O — reading from memory)
+			batches := collectBatchesFromChunks(job.chunks)
+
+			if len(batches) == 0 {
+				// Release chunks back to pool even if no valid batches
+				job.pool.ReleaseMany(job.chunks)
+				return
+			}
+
+			// Build and upload S3 object
+			objectData := BuildObject(batches)
+			baseOffset := batches[0].BaseOffset
+			key := ObjectKey(f.client.prefix, job.Topic, job.TopicID, job.Partition, baseOffset)
+
+			if err := f.uploadWithRetry(ctx, key, objectData); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
 				}
 				errMu.Unlock()
 				f.logger.Error("S3 partition flush failed",
-					"topic", fp.Topic, "partition", fp.Partition, "err", err)
+					"topic", job.Topic, "partition", job.Partition, "err", err)
+				// On failure, release chunks back to pool (data is still in WAL for retry)
+				job.pool.ReleaseMany(job.chunks)
+				return
 			}
+
+			// Advance the S3 flush watermark
+			lastBatch := batches[len(batches)-1]
+			newWatermark := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta) + 1
+			if job.AdvanceWatermark != nil {
+				job.AdvanceWatermark(newWatermark)
+			}
+
+			// Release chunks back to pool after successful upload
+			job.pool.ReleaseMany(job.chunks)
+
+			f.logger.Debug("S3 partition flushed",
+				"topic", job.Topic, "partition", job.Partition,
+				"base_offset", baseOffset, "watermark", newWatermark,
+				"batches", len(batches), "bytes", len(objectData))
 		}()
 	}
 
 	wg.Wait()
 
+	// After all partitions flushed, signal WAL cleanup
+	if f.cfg.WALWriter != nil {
+		f.cfg.WALWriter.TryCleanupSegments()
+	}
+
+	f.logger.Info("S3 flush complete",
+		"partitions", len(jobs),
+		"duration", time.Since(start).Round(time.Millisecond))
+
 	if firstErr != nil {
 		return fmt.Errorf("partition flush: %w", firstErr)
 	}
 
-	// Upload metadata.log
-	if f.cfg.MetadataUploader != nil {
-		if err := f.cfg.MetadataUploader(ctx); err != nil {
-			return fmt.Errorf("metadata upload: %w", err)
-		}
-	}
-
-	f.logger.Info("S3 unified sync complete",
-		"partitions", len(toFlush),
-		"duration", time.Since(start).Round(time.Millisecond))
-
 	return nil
 }
 
-// flushPartition builds and uploads an S3 object for a single partition.
-func (f *Flusher) flushPartition(ctx context.Context, fp FlushPartition) error {
-	if len(fp.Batches) == 0 {
-		return nil
+// collectBatchesFromChunks extracts BatchData from detached chunks.
+// Reads from memory only — zero disk I/O.
+func collectBatchesFromChunks(chunks []*chunk.Chunk) []BatchData {
+	var batches []BatchData
+	for _, c := range chunks {
+		for _, b := range c.Batches {
+			raw := make([]byte, b.Size)
+			copy(raw, c.Data[b.Offset:b.Offset+b.Size])
+
+			if len(raw) < RecordBatchHeaderSize {
+				continue
+			}
+
+			batches = append(batches, BatchData{
+				RawBytes:        raw,
+				BaseOffset:      b.BaseOffset,
+				LastOffsetDelta: b.LastOffsetDelta,
+			})
+		}
 	}
-
-	// Build the S3 object (data + footer)
-	objectData := BuildObject(fp.Batches)
-	baseOffset := fp.Batches[0].BaseOffset
-	key := ObjectKey(f.client.prefix, fp.Topic, fp.Partition, baseOffset)
-
-	// Upload with retry
-	if err := f.uploadWithRetry(ctx, key, objectData); err != nil {
-		return err
-	}
-
-	// Advance the S3 flush watermark
-	lastBatch := fp.Batches[len(fp.Batches)-1]
-	newWatermark := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta) + 1
-	if fp.AdvanceWatermark != nil {
-		fp.AdvanceWatermark(newWatermark)
-	}
-
-	f.logger.Debug("S3 partition flushed",
-		"topic", fp.Topic, "partition", fp.Partition,
-		"base_offset", baseOffset, "watermark", newWatermark,
-		"batches", len(fp.Batches), "bytes", len(objectData))
-
-	return nil
+	return batches
 }
 
 // uploadWithRetry uploads data to S3 with exponential backoff retry.
@@ -268,19 +395,18 @@ func (f *Flusher) uploadWithRetry(ctx context.Context, key string, data []byte) 
 }
 
 // CollectWALBatches collects unflushed batches from the WAL index for a partition.
-// Returns BatchData slices suitable for building an S3 object.
+// Retained for WAL replay and fallback paths. No rate limiting (reads during
+// recovery only).
 func CollectWALBatches(walWriter *wal.Writer, walIndex *wal.Index, topicID [16]byte, partition int32, s3Watermark int64) []BatchData {
 	tp := wal.TopicPartition{TopicID: topicID, Partition: partition}
 	entries := walIndex.PartitionEntries(tp)
 
 	var batches []BatchData
 	for _, e := range entries {
-		// Skip entries already flushed to S3
 		if e.LastOffset < s3Watermark {
 			continue
 		}
 
-		// Read batch from WAL
 		data, err := walWriter.ReadBatch(e)
 		if err != nil {
 			slog.Warn("S3 flush: skipping unreadable WAL batch",

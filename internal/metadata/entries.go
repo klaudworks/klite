@@ -29,6 +29,7 @@ type CreateTopicEntry struct {
 // DeleteTopicEntry records a topic deletion.
 type DeleteTopicEntry struct {
 	TopicName string
+	TopicID   [16]byte
 }
 
 // AlterConfigEntry records a single config change on a topic.
@@ -162,10 +163,11 @@ func UnmarshalCreateTopic(payload []byte) (CreateTopicEntry, error) {
 
 // MarshalDeleteTopic serializes a DeleteTopicEntry.
 func MarshalDeleteTopic(e *DeleteTopicEntry) []byte {
-	size := 1 + 2 + len(e.TopicName)
+	size := 1 + 2 + len(e.TopicName) + 16
 	buf := make([]byte, size)
 	buf[0] = EntryDeleteTopic
-	putString(buf, 1, e.TopicName)
+	off := putString(buf, 1, e.TopicName)
+	copy(buf[off:off+16], e.TopicID[:])
 	return buf
 }
 
@@ -173,8 +175,15 @@ func MarshalDeleteTopic(e *DeleteTopicEntry) []byte {
 func UnmarshalDeleteTopic(payload []byte) (DeleteTopicEntry, error) {
 	var e DeleteTopicEntry
 	var err error
-	e.TopicName, _, err = getString(payload, 0)
-	return e, err
+	var off int
+	e.TopicName, off, err = getString(payload, 0)
+	if err != nil {
+		return e, err
+	}
+	if off+16 <= len(payload) {
+		copy(e.TopicID[:], payload[off:off+16])
+	}
+	return e, nil
 }
 
 // MarshalAlterConfig serializes an AlterConfigEntry.

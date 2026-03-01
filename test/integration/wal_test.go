@@ -120,7 +120,7 @@ func TestWALReadTier(t *testing.T) {
 	tb := StartBroker(t,
 
 		// Use a tiny ring buffer: 16 slots * 1 partition * ~16 KiB est = very small
-		WithRingBufferMaxMem(16*16*1024),
+		WithChunkPoolMemory(16*16*1024),
 	)
 
 	admin := NewAdminClient(t, tb.Addr)
