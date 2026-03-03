@@ -323,7 +323,3 @@ kubectl run test --rm -it --image=alpine -- sh -c "apk add netcat-openbsd && nc 
 
 See [Troubleshooting](/guides/troubleshooting/) for more common issues.
 
-## Next steps
-
-- [Configuration](/guides/configuration/) -- all flags and environment variables
-- [Architecture](/concepts/architecture/) -- understand klite internals

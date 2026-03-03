@@ -568,6 +568,9 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 			return nil
 		}
 
+		// Pre-acquire spare chunk before taking the partition lock.
+		spare := pd.AcquireSpareChunk(len(entry.Data))
+
 		// Rebuild partition state: append to chunk pool and advance HW.
 		pd.Lock()
 
@@ -579,13 +582,14 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 
 		// Append batch data to chunk pool (replaces ring buffer push).
 		// Data is already offset-assigned in the WAL.
-		pd.AppendToChunk(entry.Data, chunk.ChunkBatch{
+		spare = pd.AppendToChunk(entry.Data, chunk.ChunkBatch{
 			BaseOffset:      entry.Offset,
 			LastOffsetDelta: meta.LastOffsetDelta,
 			MaxTimestamp:    meta.MaxTimestamp,
 			NumRecords:      meta.NumRecords,
-		})
+		}, spare)
 		pd.Unlock()
+		pd.ReleaseSpareChunk(spare)
 
 		// Add to WAL index
 		tp := wal.TopicPartition{TopicID: entry.TopicID, Partition: entry.Partition}

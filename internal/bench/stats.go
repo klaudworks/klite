@@ -197,24 +197,28 @@ func (s *Stats) emitWindow(now time.Time) {
 	s.allWindowP999 = append(s.allWindowP999, percs[3])
 
 	// Snapshot e2e stats under separate lock.
+	// Swap the slice out quickly, then sort outside the lock so consumer
+	// goroutines calling RecordE2E() are never blocked during the sort.
 	var e2ePercs []int
 	var e2eMax int
 	var wConsumed, cConsumed int64
+	var e2eSnap []int
 	if s.e2eEnabled {
 		s.e2eMu.Lock()
-		e2ePercs = percentiles(s.windowE2ELatencies, 0.5, 0.95, 0.99, 0.999)
+		e2eSnap = s.windowE2ELatencies
+		s.windowE2ELatencies = make([]int, 0, len(e2eSnap))
 		e2eMax = s.windowE2EMax
 		wConsumed = s.windowConsumed
 		cConsumed = s.cumConsumed
+		s.windowE2EMax = 0
+		s.windowConsumed = 0
+		s.e2eMu.Unlock()
+
+		e2ePercs = percentiles(e2eSnap, 0.5, 0.95, 0.99, 0.999)
 		s.allWindowE2EP50 = append(s.allWindowE2EP50, e2ePercs[0])
 		s.allWindowE2EP95 = append(s.allWindowE2EP95, e2ePercs[1])
 		s.allWindowE2EP99 = append(s.allWindowE2EP99, e2ePercs[2])
 		s.allWindowE2EP999 = append(s.allWindowE2EP999, e2ePercs[3])
-		// Reset e2e window.
-		s.windowE2ELatencies = s.windowE2ELatencies[:0]
-		s.windowE2EMax = 0
-		s.windowConsumed = 0
-		s.e2eMu.Unlock()
 	}
 
 	// Cumulative.

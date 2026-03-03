@@ -175,8 +175,6 @@ docker run -d --name seaweedfs -p 8333:8333 \
 
 ### 2. Start klite with S3
 
-Stop any running klite container, then restart with S3 enabled:
-
 ```bash
 docker run --network host \
   -e AWS_ACCESS_KEY_ID=klite \
@@ -195,8 +193,3 @@ INFO S3 storage initialized bucket=klite-data
 
 Produce and consume work exactly the same as before. klite writes to the local WAL first, then periodically flushes data to SeaweedFS.
 
-## Next steps
-
-- [Configuration](/guides/configuration/) -- networking, storage, S3, authentication
-- [Deploy to Kubernetes](/guides/kubernetes/) -- Helm chart with StatefulSet and PVCs
-- [Architecture](/concepts/architecture/) -- understand how klite works under the hood

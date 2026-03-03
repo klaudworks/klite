@@ -1,0 +1,44 @@
+---
+title: Benchmarks
+description: End-to-end latency benchmarks for klite under sustained 100K events/sec load.
+---
+
+import { Tabs, TabItem, LinkButton } from '@astrojs/starlight/components';
+
+Sustained 100K events/sec over one hour, including network round-trips to and from klite (acks=1). We chose 100K because shortly above that, AWS network-attached EBS volumes become the bottleneck, not klite.
+
+<Tabs syncKey="metric">
+  <TabItem label="avg">
+    <div style="position:relative;height:320px;">
+      <canvas id="chart-avg"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="p50">
+    <div style="position:relative;height:320px;">
+      <canvas id="chart-p50"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="p95">
+    <div style="position:relative;height:320px;">
+      <canvas id="chart-p95"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="p99">
+    <div style="position:relative;height:320px;">
+      <canvas id="chart-p99"></canvas>
+    </div>
+  </TabItem>
+</Tabs>
+
+## Setup
+
+<LinkButton href="https://github.com/klaudworks/klite/blob/main/infra/bench/README.md" variant="minimal" icon="github">README</LinkButton>
+<LinkButton href="https://github.com/klaudworks/klite/tree/main/cmd/klite-bench" variant="minimal" icon="github">Benchmark code</LinkButton>
+<LinkButton href="https://github.com/klaudworks/klite/tree/main/infra/bench" variant="minimal" icon="github">Terraform</LinkButton>
+
+Two `m7g.xlarge` (ARM, 4 vCPU, 16 GB) instances on AWS in the same availability zone (eu-west-1). One runs klite, the other runs the benchmark client. The machines are independent so the numbers include real network round-trips, not just loopback. Actual memory usage is closer to 6 GB, we chose these instances because AWS throttles EBS network throughput based on instance size, and a smaller instance cannot sustain 100 MB/s of writes to disk.
+
+The benchmark produces 100,000 events per second (each ~1 KB, roughly 97 MB/s) and consumes them back, sustained for one full hour. That's 360 million events total. Acks are set to 1, meaning klite explicitly acknowledges each event after writing it to disk. No fire-and-forget tricks to make the numbers look better.
+
+<script is:inline src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script is:inline src="/bench.js"></script>

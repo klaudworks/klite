@@ -38,9 +38,9 @@ func DefaultProducerConfig() ProducerConfig {
 		NumRecords:        1_000_000,
 		RecordSize:        1000,
 		Throughput:        -1,
-		Acks:              -1,
+		Acks:              1,
 		BatchMaxBytes:      1_048_576, // 1 MiB
-		LingerMs:           5,
+		LingerMs:           0,
 		MaxBufferedRecords: 8192,
 		NumProducers:       1,
 		ReportingInterval: 5 * time.Second,

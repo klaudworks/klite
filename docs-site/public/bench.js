@@ -1,64 +1,65 @@
 (function () {
   var raw = [
-    {m:1,p50:7,p95:10,p99:52,avg:7.51},
-    {m:2,p50:7,p95:10,p99:56,avg:7.64},
-    {m:3,p50:7,p95:10,p99:64,avg:7.80},
-    {m:4,p50:7,p95:10,p99:67,avg:7.84},
-    {m:5,p50:7,p95:10,p99:71,avg:7.95},
-    {m:6,p50:7,p95:10,p99:82,avg:8.66},
-    {m:7,p50:7,p95:10,p99:90,avg:8.72},
-    {m:8,p50:7,p95:10,p99:99,avg:9.07},
-    {m:9,p50:7,p95:13,p99:98,avg:9.18},
-    {m:10,p50:7,p95:10,p99:109,avg:9.24},
-    {m:11,p50:7,p95:14,p99:120,avg:9.70},
-    {m:12,p50:7,p95:13,p99:126,avg:9.91},
-    {m:13,p50:7,p95:17,p99:138,avg:10.43},
-    {m:14,p50:7,p95:27,p99:161,avg:11.64},
-    {m:15,p50:7,p95:53,p99:179,avg:13.61},
-    {m:16,p50:7,p95:62,p99:182,avg:14.08},
-    {m:17,p50:7,p95:37,p99:186,avg:12.41},
-    {m:18,p50:7,p95:41,p99:198,avg:12.96},
-    {m:19,p50:7,p95:53,p99:215,avg:14.27},
-    {m:20,p50:7,p95:47,p99:221,avg:13.95},
-    {m:21,p50:7,p95:53,p99:230,avg:14.56},
-    {m:22,p50:7,p95:61,p99:248,avg:15.61},
-    {m:23,p50:7,p95:80,p99:271,avg:17.27},
-    {m:24,p50:7,p95:78,p99:268,avg:16.98},
-    {m:25,p50:7,p95:102,p99:282,avg:18.61},
-    {m:26,p50:7,p95:114,p99:303,avg:19.55},
-    {m:27,p50:7,p95:101,p99:297,avg:19.20},
-    {m:28,p50:7,p95:136,p99:332,avg:21.37},
-    {m:29,p50:7,p95:146,p99:343,avg:22.13},
-    {m:30,p50:7,p95:157,p99:355,avg:23.29},
-    {m:31,p50:7,p95:196,p99:374,avg:25.61},
-    {m:32,p50:7,p95:192,p99:392,avg:25.64},
-    {m:33,p50:7,p95:207,p99:408,avg:26.83},
-    {m:34,p50:7,p95:281,p99:522,avg:33.59},
-    {m:35,p50:7,p95:302,p99:503,avg:33.81},
-    {m:36,p50:7,p95:297,p99:498,avg:33.93},
-    {m:37,p50:7,p95:316,p99:516,avg:35.23},
-    {m:38,p50:7,p95:293,p99:487,avg:33.12},
-    {m:39,p50:7,p95:255,p99:460,avg:30.68},
-    {m:40,p50:7,p95:272,p99:456,avg:32.10},
-    {m:41,p50:7,p95:208,p99:409,avg:27.02},
-    {m:42,p50:7,p95:185,p99:386,avg:25.52},
-    {m:43,p50:7,p95:165,p99:360,avg:23.33},
-    {m:44,p50:7,p95:156,p99:355,avg:22.89},
-    {m:45,p50:7,p95:163,p99:361,avg:23.57},
-    {m:46,p50:7,p95:172,p99:375,avg:24.15},
-    {m:47,p50:7,p95:10,p99:296,avg:13.40},
-    {m:48,p50:7,p95:16,p99:314,avg:14.90},
-    {m:49,p50:7,p95:10,p99:273,avg:12.70},
-    {m:50,p50:7,p95:10,p99:298,avg:14.11},
-    {m:51,p50:7,p95:21,p99:331,avg:15.57},
-    {m:52,p50:7,p95:16,p99:317,avg:14.26},
-    {m:53,p50:7,p95:27,p99:327,avg:15.44},
-    {m:54,p50:7,p95:17,p99:324,avg:14.47},
-    {m:55,p50:7,p95:19,p99:348,avg:16.06},
-    {m:56,p50:7,p95:32,p99:365,avg:16.86},
-    {m:57,p50:7,p95:10,p99:307,avg:13.83},
-    {m:58,p50:7,p95:14,p99:305,avg:14.50},
-    {m:59,p50:7,p95:13,p99:328,avg:14.48}
+    {m:1,avg:11.1,p50:11,p95:15,p99:37},
+    {m:2,avg:11.2,p50:11,p95:15,p99:37},
+    {m:3,avg:10.9,p50:11,p95:15,p99:28},
+    {m:4,avg:11.0,p50:11,p95:15,p99:36},
+    {m:5,avg:11.2,p50:11,p95:15,p99:35},
+    {m:6,avg:11.2,p50:11,p95:15,p99:35},
+    {m:7,avg:11.1,p50:11,p95:15,p99:39},
+    {m:8,avg:11.2,p50:11,p95:15,p99:40},
+    {m:9,avg:11.0,p50:11,p95:15,p99:46},
+    {m:10,avg:11.1,p50:11,p95:15,p99:28},
+    {m:11,avg:11.1,p50:11,p95:15,p99:31},
+    {m:12,avg:11.1,p50:11,p95:15,p99:33},
+    {m:13,avg:11.1,p50:11,p95:15,p99:31},
+    {m:14,avg:11.1,p50:11,p95:15,p99:30},
+    {m:15,avg:11.3,p50:11,p95:15,p99:39},
+    {m:16,avg:11.2,p50:11,p95:15,p99:39},
+    {m:17,avg:11.2,p50:11,p95:15,p99:42},
+    {m:18,avg:11.1,p50:11,p95:15,p99:26},
+    {m:19,avg:11.3,p50:11,p95:15,p99:35},
+    {m:20,avg:11.2,p50:11,p95:15,p99:35},
+    {m:21,avg:11.2,p50:11,p95:15,p99:37},
+    {m:22,avg:11.1,p50:11,p95:15,p99:37},
+    {m:23,avg:11.2,p50:11,p95:15,p99:33},
+    {m:24,avg:11.3,p50:11,p95:15,p99:38},
+    {m:25,avg:11.1,p50:11,p95:15,p99:27},
+    {m:26,avg:11.0,p50:11,p95:15,p99:34},
+    {m:27,avg:11.0,p50:11,p95:15,p99:27},
+    {m:28,avg:11.0,p50:11,p95:15,p99:26},
+    {m:29,avg:11.0,p50:11,p95:15,p99:29},
+    {m:30,avg:11.2,p50:11,p95:15,p99:34},
+    {m:31,avg:11.1,p50:11,p95:15,p99:27},
+    {m:32,avg:11.2,p50:11,p95:15,p99:35},
+    {m:33,avg:11.4,p50:11,p95:15,p99:37},
+    {m:34,avg:11.2,p50:11,p95:15,p99:42},
+    {m:35,avg:11.0,p50:11,p95:15,p99:26},
+    {m:36,avg:11.2,p50:11,p95:15,p99:36},
+    {m:37,avg:11.2,p50:11,p95:15,p99:37},
+    {m:38,avg:11.1,p50:11,p95:15,p99:32},
+    {m:39,avg:11.3,p50:11,p95:15,p99:41},
+    {m:40,avg:11.1,p50:11,p95:15,p99:34},
+    {m:41,avg:11.3,p50:11,p95:15,p99:33},
+    {m:42,avg:11.2,p50:11,p95:15,p99:43},
+    {m:43,avg:11.2,p50:11,p95:15,p99:34},
+    {m:44,avg:11.0,p50:11,p95:15,p99:30},
+    {m:45,avg:11.3,p50:11,p95:15,p99:34},
+    {m:46,avg:11.1,p50:11,p95:15,p99:28},
+    {m:47,avg:11.1,p50:11,p95:15,p99:34},
+    {m:48,avg:11.0,p50:11,p95:15,p99:34},
+    {m:49,avg:11.1,p50:11,p95:15,p99:29},
+    {m:50,avg:11.2,p50:11,p95:15,p99:31},
+    {m:51,avg:11.3,p50:11,p95:15,p99:36},
+    {m:52,avg:11.0,p50:11,p95:15,p99:29},
+    {m:53,avg:11.1,p50:11,p95:15,p99:29},
+    {m:54,avg:11.1,p50:11,p95:15,p99:33},
+    {m:55,avg:11.2,p50:11,p95:15,p99:39},
+    {m:56,avg:11.2,p50:11,p95:15,p99:36},
+    {m:57,avg:11.2,p50:11,p95:15,p99:36},
+    {m:58,avg:11.1,p50:11,p95:15,p99:34},
+    {m:59,avg:11.2,p50:11,p95:15,p99:34},
+    {m:60,avg:11.6,p50:11,p95:15,p99:38}
   ];
 
   var labels = raw.map(function (d) { return d.m; });
@@ -71,6 +72,13 @@
       animation: { duration: 400 },
       plugins: {
         legend: { display: false },
+        subtitle: {
+          display: true,
+          text: 'End-to-end latency: full round-trip from produce through consume.',
+          color: '#64748b',
+          font: { size: 11, style: 'italic' },
+          padding: { bottom: 10 }
+        },
         tooltip: {
           backgroundColor: 'rgba(15,23,42,0.9)',
           titleColor: '#e2e8f0',
@@ -88,11 +96,19 @@
       scales: {
         x: {
           title: { display: true, text: 'Elapsed (min)', color: '#94a3b8', font: { size: 12 } },
-          ticks: { color: '#94a3b8', maxTicksLimit: 12 },
+          ticks: {
+            color: '#94a3b8',
+            callback: function (val, index) {
+              var label = this.getLabelForValue(val);
+              return label % 5 === 0 ? label : '';
+            },
+            autoSkip: false,
+            maxRotation: 0
+          },
           grid: { color: 'rgba(148,163,184,0.08)' }
         },
         y: {
-          title: { display: true, text: 'Latency (ms)', color: '#94a3b8', font: { size: 12 } },
+          title: { display: true, text: 'End-to-end latency (ms)', color: '#94a3b8', font: { size: 12 } },
           ticks: { color: '#94a3b8' },
           grid: { color: 'rgba(148,163,184,0.12)' },
           beginAtZero: true
@@ -112,10 +128,20 @@
     return g;
   }
 
-  function mkChart(id, data, color, label) {
+  function mkChart(id, data, color, label, note) {
     var el = document.getElementById(id);
     if (!el) return;
     var ctx = el.getContext('2d');
+    var opts = mkOpts(label);
+    if (note) {
+      opts.plugins.title = {
+        display: true,
+        text: note,
+        color: '#64748b',
+        font: { size: 11, style: 'italic', weight: 'normal' },
+        padding: { bottom: 2 }
+      };
+    }
     charts[id] = new Chart(ctx, {
       type: 'line',
       data: {
@@ -129,14 +155,15 @@
           pointBackgroundColor: color
         }]
       },
-      options: mkOpts(label)
+      options: opts
     });
   }
 
-  mkChart('chart-p50', raw.map(function (d) { return d.p50; }), '#22c55e', 'p50');
-  mkChart('chart-p95', raw.map(function (d) { return d.p95; }), '#3b82f6', 'p95');
-  mkChart('chart-p99', raw.map(function (d) { return d.p99; }), '#f59e0b', 'p99');
+  var flat = 'Yes, these are the real numbers. Only p99 fluctuates noticeably. p50 and p95 are rock solid.';
   mkChart('chart-avg', raw.map(function (d) { return d.avg; }), '#06b6d4', 'avg');
+  mkChart('chart-p50', raw.map(function (d) { return d.p50; }), '#22c55e', 'p50', flat);
+  mkChart('chart-p95', raw.map(function (d) { return d.p95; }), '#3b82f6', 'p95', flat);
+  mkChart('chart-p99', raw.map(function (d) { return d.p99; }), '#f59e0b', 'p99');
 
   // Starlight tabs hide canvases — resize charts when a tab becomes visible.
   var observer = new MutationObserver(function () {

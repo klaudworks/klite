@@ -247,13 +247,18 @@ func (pd *PartData) HasS3() bool {
 	return pd.s3Fetch != nil
 }
 
-// PushBatch appends a batch, assigns offset. Returns base offset.
+// PushBatch appends a batch, assigns offset. Returns base offset and any
+// unused spare chunk (caller must release it after releasing pd.mu).
 // Caller must hold pd.mu.Lock(). After releasing mu, caller should
 // call pd.NotifyWaiters() to wake long-polling Fetch requests.
 //
+// spare is a pre-acquired chunk from AcquireSpareChunk (may be nil).
+// Callers should acquire the spare before taking pd.mu to avoid blocking
+// under the partition lock.
+//
 // Used by WAL replay and transaction control batches (EndTxn).
 // The normal produce path uses ReserveOffset + appendToChunk + WAL append + CommitBatch.
-func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
+func (pd *PartData) PushBatch(raw []byte, meta BatchMeta, spare *chunk.Chunk) (int64, *chunk.Chunk) {
 	baseOffset := pd.hw
 
 	// Make a copy of the raw bytes so we own them (the caller's buffer may be reused)
@@ -267,12 +272,12 @@ func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 	pd.hw = baseOffset + int64(meta.LastOffsetDelta) + 1
 
 	// Append to chunk pool
-	pd.appendToChunk(stored, chunk.ChunkBatch{
+	spare = pd.appendToChunk(stored, chunk.ChunkBatch{
 		BaseOffset:      baseOffset,
 		LastOffsetDelta: meta.LastOffsetDelta,
 		MaxTimestamp:    meta.MaxTimestamp,
 		NumRecords:      meta.NumRecords,
-	})
+	}, spare)
 
 	pd.nextReserve = pd.hw
 	pd.nextCommit = pd.hw
@@ -280,7 +285,7 @@ func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 
 	pd.updateMaxTimestamp(baseOffset, meta.LastOffsetDelta, meta.MaxTimestamp)
 
-	return baseOffset
+	return baseOffset, spare
 }
 
 // ReserveOffset reserves an offset range for a batch without storing data.
@@ -291,6 +296,12 @@ func (pd *PartData) ReserveOffset(meta BatchMeta) int64 {
 	base := pd.nextReserve
 	pd.nextReserve = base + int64(meta.LastOffsetDelta) + 1
 	return base
+}
+
+// RollbackReserve undoes offset reservation on WAL submission failure.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) RollbackReserve(baseOffset int64) {
+	pd.nextReserve = baseOffset
 }
 
 // CommitBatch advances HW after WAL fsync completes.
@@ -688,30 +699,77 @@ func (pd *PartData) trimBatchesLocked(newLogStart int64) {
 
 // --- Chunk pool integration ---
 
+// AcquireSpareChunk acquires a chunk from the pool if this partition will
+// need one for the next append of batchSize bytes. This method may block
+// if the pool is exhausted (backpressure), which is safe because the
+// caller must NOT hold pd.mu.
+//
+// Returns a spare chunk if one will be needed, or nil if the current chunk
+// has room. The spare must be passed to AppendToChunk and any unused spare
+// must be released by the caller after releasing pd.mu.
+func (pd *PartData) AcquireSpareChunk(batchSize int) *chunk.Chunk {
+	if pd.chunkPool == nil {
+		return nil
+	}
+
+	pd.mu.RLock()
+	needsNew := pd.chunkCurrent == nil || pd.chunkCurrent.Used+batchSize > pd.chunkPool.ChunkSize()
+	pd.mu.RUnlock()
+
+	if needsNew {
+		return pd.chunkPool.Acquire()
+	}
+	return nil
+}
+
+// ReleaseSpareChunk returns an unused spare chunk to the pool.
+// Safe to call with nil (no-op).
+func (pd *PartData) ReleaseSpareChunk(spare *chunk.Chunk) {
+	if spare != nil && pd.chunkPool != nil {
+		pd.chunkPool.Release(spare)
+	}
+}
+
 // AppendToChunk appends a batch to the partition's current chunk.
-// Acquires a chunk lazily on first call. Seals and acquires a new chunk
-// when the current one is full.
+// Uses the provided spare chunk if a new chunk is needed (current is nil
+// or full), avoiding a blocking Acquire() call while holding pd.mu.
+// Returns the spare chunk if it was not consumed (caller must release it),
+// or nil if it was used.
 // Caller must hold pd.mu.Lock().
-func (pd *PartData) AppendToChunk(raw []byte, meta chunk.ChunkBatch) {
-	pd.appendToChunk(raw, meta)
+func (pd *PartData) AppendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chunk.Chunk) *chunk.Chunk {
+	return pd.appendToChunk(raw, meta, spare)
 }
 
 // appendToChunk is the internal implementation.
-func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch) {
+func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chunk.Chunk) *chunk.Chunk {
 	if pd.chunkPool == nil {
-		return // chunk pool not configured (tests without WAL)
+		return spare
 	}
 
-	// Lazy acquisition: first produce after startup or after flush released current chunk
+	// Lazy acquisition: first produce after startup or after flush released current chunk.
+	// Uses the pre-acquired spare instead of blocking on Acquire().
 	if pd.chunkCurrent == nil {
-		pd.chunkCurrent = pd.chunkPool.Acquire()
+		if spare != nil {
+			pd.chunkCurrent = spare
+			spare = nil
+		} else {
+			// Fallback: caller didn't provide a spare (e.g. tests).
+			// This path still calls Acquire() but should only happen when
+			// the pool has free chunks (no contention risk in practice).
+			pd.chunkCurrent = pd.chunkPool.Acquire()
+		}
 	}
 
 	// Seal if this batch wouldn't fit. Since chunkSize >= max.message.bytes,
 	// a batch always fits in an empty chunk.
 	if pd.chunkCurrent.Used+len(raw) > pd.chunkPool.ChunkSize() {
 		pd.chunkSealed = append(pd.chunkSealed, pd.chunkCurrent)
-		pd.chunkCurrent = pd.chunkPool.Acquire()
+		if spare != nil {
+			pd.chunkCurrent = spare
+			spare = nil
+		} else {
+			pd.chunkCurrent = pd.chunkPool.Acquire()
+		}
 	}
 
 	offset := pd.chunkCurrent.Used
@@ -721,6 +779,8 @@ func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch) {
 	meta.Offset = offset
 	meta.Size = len(raw)
 	pd.chunkCurrent.Batches = append(pd.chunkCurrent.Batches, meta)
+
+	return spare
 }
 
 // fetchFromChunks scans sealed + current chunks for batches matching

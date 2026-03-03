@@ -1,0 +1,318 @@
+/* Solarized Reading Room Theme for Starlight */
+
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+	/* Fonts - Soft sans-serif for reading, crisp mono for code */
+	--sl-font-system: 'Nunito', system-ui, sans-serif;
+	--sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+	/* Brand/Accent Colors - Solarized Yellow/Orange */
+	--sl-hue-accent: 45;
+	/* Warm yellow/orange */
+	--sl-color-accent-high: #b58900;
+	/* Solarized yellow */
+	--sl-color-accent: #cb4b16;
+	/* Solarized orange */
+	--sl-color-accent-low: rgba(203, 75, 22, 0.15);
+	/* Soft transparent orange */
+
+	/* Backgrounds & Text - Solarized Light */
+	--sl-color-bg-nav: #eee8d5;
+	/* Solarized base2 */
+	--sl-color-bg: #fdf6e3;
+	/* Solarized base3 (main bg) */
+	--sl-color-bg-inline-code: #eee8d5;
+	/* Slightly darker than base3 */
+
+	--sl-color-text-accent: var(--sl-color-accent);
+	--sl-color-text: #586e75;
+	/* Solarized base01 (darker body text for better contrast) */
+	--sl-color-text-invert: #fdf6e3;
+
+	/* Headings and UI elements - Darker reading text */
+	--sl-color-white: #073642;
+	/* Solarized base02 - very dark blue-grey for main headings */
+
+	/* Borders - Soft, low contrast lines */
+	--sl-color-hairline-shade: #93a1a1;
+	/* Solarized base1 */
+	--sl-color-hairline-light: rgba(147, 161, 161, 0.2);
+	--sl-color-hairline: #eee8d5;
+	/* Solarized base2 */
+
+	/* Layout nuances */
+	--sl-sidebar-width: 18rem;
+}
+
+/* Solarized Dark Mode Support */
+:root[data-theme='dark'] {
+	/* Solarized Dark */
+	--sl-color-bg-nav: #002b36;
+	/* base03 (Same as bg for a seamless look) */
+	--sl-color-bg-sidebar: #002b36;
+	/* Sidebar matches background */
+	--sl-color-bg: #002b36;
+	/* base03 */
+	--sl-color-bg-inline-code: #073642;
+
+	--sl-color-text-accent: #2aa198;
+	/* Solarized cyan */
+	--sl-color-text: #839496;
+	/* base0 (body text) */
+	--sl-color-text-invert: #002b36;
+
+	--sl-color-white: #fdf6e3;
+	/* base3 (headings, high contrast) */
+
+	--sl-color-hairline-shade: #586e75;
+	/* base01 */
+	--sl-color-hairline-light: rgba(88, 110, 117, 0.3);
+	--sl-color-hairline: #073642;
+	/* base02 */
+}
+
+/* Hero Section Refinements */
+@media (min-width: 50rem) {
+	.hero {
+		grid-template-columns: 4fr 6fr !important;
+	}
+
+	.hero>.hero-html {
+		width: 100%;
+	}
+}
+
+/* The custom HTML adaptive terminal mockup inside the hero */
+.adaptive-terminal {
+	padding: 1.25rem 1.5rem;
+	font-family: var(--sl-font-mono);
+	font-size: 0.85rem;
+	line-height: 1.7;
+	white-space: nowrap;
+	border-radius: 8px !important;
+	border: 1px solid var(--sl-color-hairline-shade) !important;
+
+	/* Light Mode defaults (Solarized) */
+	background: #fdf6e3 !important;
+	/* Base3 */
+	color: #657b83 !important;
+	/* Base00 */
+	box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.1) !important;
+}
+
+:root[data-theme='dark'] .adaptive-terminal {
+	/* Exactly matches the user's dark mode screenshot */
+	background: #01242e !important;
+	color: #7a8f96 !important;
+	border: 1px solid #06313d !important;
+	box-shadow: 0 10px 30px -10px rgba(0, 43, 54, 0.4) !important;
+}
+
+.terminal-header {
+	display: flex;
+	gap: 6px;
+	margin-bottom: 0.75rem;
+}
+
+.terminal-header .dot {
+	width: 12px;
+	height: 12px;
+	border-radius: 50%;
+	display: inline-block;
+}
+
+/* Light Mode Dots */
+.dot-red {
+	background: #dc322f !important;
+}
+
+.dot-yellow {
+	background: #b58900 !important;
+}
+
+.dot-green {
+	background: #859900 !important;
+}
+
+/* Dark Mode Dots (brighter like the screenshot) */
+:root[data-theme='dark'] .dot-red {
+	background: #f24e42 !important;
+}
+
+:root[data-theme='dark'] .dot-yellow {
+	background: #dda200 !important;
+}
+
+:root[data-theme='dark'] .dot-green {
+	background: #739d00 !important;
+}
+
+/* Terminal text elements */
+.terminal-comment {
+	color: #93a1a1 !important;
+	margin-bottom: 0.25rem;
+}
+
+/* Base1 */
+:root[data-theme='dark'] .terminal-comment {
+	color: #586e75 !important;
+}
+
+/* Base01 */
+
+.terminal-string {
+	color: #b58900 !important;
+}
+
+:root[data-theme='dark'] .terminal-string {
+	color: #2aa198 !important;
+}
+
+/* Components Styling - Soft and pleasant */
+.card,
+.link-card {
+	background-color: var(--sl-color-bg-nav) !important;
+	border: 1px solid var(--sl-color-hairline) !important;
+	border-radius: 8px !important;
+	box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03) !important;
+	transition: all 0.2s ease-in-out !important;
+	position: relative;
+	/* For full-card links */
+}
+
+.card:hover,
+.link-card:hover {
+	border-color: var(--sl-color-accent) !important;
+	box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05) !important;
+}
+
+/* Full card clickable link utility */
+.full-card-link::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+	z-index: 10;
+}
+
+.card a.full-card-link {
+	text-decoration: none;
+	color: inherit;
+}
+
+.card a.full-card-link:hover {
+	color: var(--sl-color-text-accent);
+}
+
+/* Subtle link hint at bottom-right of cards */
+.card-link-hint {
+	display: block;
+	margin-top: 0.75rem;
+	text-align: right;
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-text-accent);
+	opacity: 0.6;
+	transition: opacity 0.2s ease;
+}
+
+.card:hover .card-link-hint {
+	opacity: 1;
+}
+
+/* Explicit Inline Code Styling */
+:not(pre)>code {
+	color: #cb4b16 !important;
+	/* Solarized Orange */
+	background-color: #eee8d5 !important;
+	/* Solarized base2 */
+	border: 1px solid rgba(147, 161, 161, 0.3) !important;
+}
+
+:root[data-theme='dark'] :not(pre)>code {
+	color: #b58900 !important;
+	/* Solarized Yellow */
+	background-color: #073642 !important;
+	/* Solarized base02 */
+	border-color: rgba(88, 110, 117, 0.3) !important;
+}
+
+/* Call to action buttons in Hero */
+.sl-flex.actions>a {
+	border-radius: 6px !important;
+	font-weight: 600;
+	transition: all 0.2s ease !important;
+}
+
+/* Primary Action button specific */
+.sl-flex.actions>a[data-variant='primary'] {
+	background-color: var(--sl-color-accent) !important;
+	color: var(--sl-color-text-invert) !important;
+	border-color: var(--sl-color-accent) !important;
+}
+
+.sl-flex.actions>a[data-variant='primary']:hover {
+	background-color: var(--sl-color-accent-high) !important;
+}
+
+/* Minimal Action button specific */
+.sl-flex.actions>a[data-variant='minimal'] {
+	background-color: transparent !important;
+	border: 1px solid var(--sl-color-hairline-shade) !important;
+	color: var(--sl-color-text) !important;
+}
+
+.sl-flex.actions>a[data-variant='minimal']:hover {
+	background-color: var(--sl-color-bg-nav) !important;
+	color: var(--sl-color-white) !important;
+}
+
+/* Typography Overrides */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+	color: var(--sl-color-white);
+	font-weight: 700;
+	letter-spacing: -0.01em;
+}
+
+/* Top Navigation Bar & Sidebar softer borders */
+header.header {
+	border-bottom: 1px solid var(--sl-color-hairline) !important;
+}
+
+/* Center the search bar in the header */
+.header>.header {
+	display: grid;
+	grid-template-columns: 1fr auto 1fr;
+	align-items: center;
+	width: 100%;
+}
+
+.header>.header>.right-group {
+	justify-self: end;
+}
+
+/* Wider, theme-matched search button */
+site-search button[data-open-modal] {
+	min-width: 20rem;
+	background-color: var(--sl-color-bg) !important;
+	border: 1px solid var(--sl-color-hairline-shade) !important;
+	color: var(--sl-color-text) !important;
+}
+
+site-search button[data-open-modal] kbd {
+	border-color: var(--sl-color-hairline-shade) !important;
+	background-color: var(--sl-color-bg-nav) !important;
+	color: var(--sl-color-text) !important;
+}
+
+aside.sidebar {
+	border-right: 1px solid var(--sl-color-hairline) !important;
+}
+
+.right-sidebar-panel {
+	border-left: 1px solid var(--sl-color-hairline) !important;
+}

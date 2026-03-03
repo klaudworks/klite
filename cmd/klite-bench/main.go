@@ -2,16 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/klaudworks/klite/internal/bench"
+	s3fmt "github.com/klaudworks/klite/internal/s3"
 )
 
 func main() {
@@ -47,6 +53,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "s3-count":
+		if err := runS3Count(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -65,6 +76,7 @@ Usage:
   klite-bench produce-consume [flags]   Run both, measure e2e latency
   klite-bench create-topic [flags]      Create a topic
   klite-bench delete-topic [flags]      Delete a topic
+  klite-bench s3-count [flags]          Count records in S3 objects
 
 Run 'klite-bench <command> --help' for command-specific flags.
 `)
@@ -220,6 +232,151 @@ func runDeleteTopic(args []string) error {
 	defer cancel()
 
 	return bench.DeleteTopic(ctx, splitBrokers(brokers), *topic)
+}
+
+func runS3Count(args []string) error {
+	fs := flag.NewFlagSet("s3-count", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "S3 bucket name (required)")
+	prefix := fs.String("prefix", "", "S3 key prefix (e.g. <run_id>/)")
+	region := fs.String("region", "eu-west-1", "AWS region")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	fs.Parse(args)
+
+	if *bucket == "" {
+		return fmt.Errorf("flag -bucket is required")
+	}
+
+	ctx := context.Background()
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(*region))
+	if err != nil {
+		return fmt.Errorf("loading AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(cfg)
+
+	// List all objects under prefix.
+	type objEntry struct {
+		Key  string
+		Size int64
+	}
+	var objects []objEntry
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: bucket,
+		Prefix: aws.String(*prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("listing objects: %w", err)
+		}
+		for _, obj := range page.Contents {
+			objects = append(objects, objEntry{*obj.Key, *obj.Size})
+		}
+	}
+
+	var totalRecords int64
+	var totalObjects int
+	partitionRecords := map[string]int64{}
+
+	for _, obj := range objects {
+		if strings.HasSuffix(obj.Key, "metadata.log") {
+			continue
+		}
+
+		footer, err := fetchFooter(ctx, client, *bucket, obj.Key, obj.Size)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: %s: %v\n", obj.Key, err)
+			continue
+		}
+
+		records := footer.TotalRecordCount()
+		totalRecords += records
+		totalObjects++
+
+		parts := strings.Split(obj.Key, "/")
+		if len(parts) >= 2 {
+			partKey := parts[len(parts)-2]
+			partitionRecords[partKey] += records
+		}
+	}
+
+	if *jsonOutput {
+		out := s3CountJSON{
+			Bucket:     *bucket,
+			Prefix:     *prefix,
+			Objects:    totalObjects,
+			Records:    totalRecords,
+			Partitions: partitionRecords,
+		}
+		data, _ := json.Marshal(out)
+		fmt.Println(string(data))
+	} else {
+		fmt.Printf("Bucket:  s3://%s/%s\n", *bucket, *prefix)
+		fmt.Printf("Objects: %d\n", totalObjects)
+		for p := 0; p < 100; p++ {
+			pk := fmt.Sprintf("%d", p)
+			if recs, ok := partitionRecords[pk]; ok {
+				fmt.Printf("  Partition %s: %d records\n", pk, recs)
+			}
+		}
+		fmt.Printf("Total:   %d records\n", totalRecords)
+	}
+
+	return nil
+}
+
+type s3CountJSON struct {
+	Bucket     string           `json:"bucket"`
+	Prefix     string           `json:"prefix"`
+	Objects    int              `json:"objects"`
+	Records    int64            `json:"records"`
+	Partitions map[string]int64 `json:"partitions"`
+}
+
+// fetchFooter reads the footer of an S3 object. It first tries a 64 KiB tail
+// read; if the footer is larger, it does a second read with the exact size.
+func fetchFooter(ctx context.Context, client *s3.Client, bucket, key string, objectSize int64) (*s3fmt.Footer, error) {
+	readSize := int64(64 * 1024)
+	if readSize > objectSize {
+		readSize = objectSize
+	}
+
+	tailData, err := s3RangeRead(ctx, client, bucket, key, objectSize, readSize)
+	if err != nil {
+		return nil, err
+	}
+
+	footer, err := s3fmt.ParseFooter(tailData, objectSize)
+	if err != nil && strings.Contains(err.Error(), "need second read") {
+		// The trailer tells us the entry count; compute exact footer size.
+		trailerSize := int64(s3fmt.FooterTrailerSize)
+		tailLen := int64(len(tailData))
+		entryCount := int64(binary.BigEndian.Uint32(tailData[tailLen-8 : tailLen-4]))
+		needed := entryCount*int64(s3fmt.IndexEntrySize) + trailerSize
+		if needed > objectSize {
+			needed = objectSize
+		}
+
+		tailData, err = s3RangeRead(ctx, client, bucket, key, objectSize, needed)
+		if err != nil {
+			return nil, err
+		}
+		footer, err = s3fmt.ParseFooter(tailData, objectSize)
+	}
+	return footer, err
+}
+
+func s3RangeRead(ctx context.Context, client *s3.Client, bucket, key string, objectSize, readSize int64) ([]byte, error) {
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", objectSize-readSize, objectSize-1)
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(rangeHeader),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetObject range read: %w", err)
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
 func splitBrokers(s string) []string {

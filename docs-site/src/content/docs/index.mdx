@@ -1,0 +1,59 @@
+---
+title: klite
+description: Kafka without the ops. One binary, S3 durability.
+template: splash
+hero:
+  tagline: Kafka without the ops. One binary, S3 durability.
+  image:
+    html: |
+      <div class="adaptive-terminal">
+        <div class="terminal-header">
+          <span class="dot dot-red"></span>
+          <span class="dot dot-yellow"></span>
+          <span class="dot dot-green"></span>
+        </div>
+        <div class="terminal-comment"># Start klite</div>
+        <div>docker run -p 9092:9092 ghcr.io/klaudworks/klite</div>
+        <div style="height:0.5rem;"></div>
+        <div class="terminal-comment"># Produce &amp; consume</div>
+        <div>echo <span class="terminal-string">"hello klite"</span> | kcat -P -b localhost:9092 -t my-topic</div>
+        <div>kcat -C -b localhost:9092 -t my-topic -e</div>
+      </div>
+  actions:
+    - text: Get Started
+      link: /guides/getting-started/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/klaudworks/klite
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkButton } from '@astrojs/starlight/components';
+
+<CardGrid stagger>
+  <Card title="Performance" icon="rocket">
+    <a href="/performance/benchmarks/" class="full-card-link">
+      100K events/s sustained. 15ms p95 end-to-end latency. Graduate to a full Kafka cluster when you need to.
+      <span class="card-link-hint">Benchmarks →</span>
+    </a>
+  </Card>
+  <Card title="Durable by default" icon="approve-check-circle">
+    <a href="/concepts/storage/" class="full-card-link">
+      Every event is flushed to any S3-compatible object store. S3 is the source of truth.
+      <span class="card-link-hint">Storage →</span>
+    </a>
+  </Card>
+  <Card title="15 MB container" icon="seti:docker">
+    <a href="/concepts/design-philosophy/" class="full-card-link">
+      Single binary, no JVM, no dependencies. Runs anywhere Docker runs.
+      <span class="card-link-hint">Design →</span>
+    </a>
+  </Card>
+  <Card title="Any Kafka client works" icon="puzzle">
+    <a href="/reference/kafka-compatibility/" class="full-card-link">
+      franz-go, librdkafka, Java, Python. No code changes required.
+      <span class="card-link-hint">Compatibility →</span>
+    </a>
+  </Card>
+</CardGrid>

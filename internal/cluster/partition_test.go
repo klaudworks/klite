@@ -3,6 +3,7 @@ package cluster
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
 )
@@ -28,7 +29,8 @@ func pushTestBatch(t *testing.T, pd *PartData, numRecords int32, maxTimestamp in
 	if err != nil {
 		t.Fatalf("ParseBatchHeader failed: %v", err)
 	}
-	return pd.PushBatch(raw, meta)
+	base, _ := pd.PushBatch(raw, meta, nil)
+	return base
 }
 
 func TestPushBatch(t *testing.T) {
@@ -113,7 +115,7 @@ func TestPushBatch(t *testing.T) {
 		}
 
 		pd.Lock()
-		pd.PushBatch(raw, meta)
+		pd.PushBatch(raw, meta, nil)
 		pd.Unlock()
 
 		// Mutate the original raw bytes
@@ -783,8 +785,8 @@ func TestReadCascadeRingBuffer(t *testing.T) {
 
 	// Push some batches
 	pd.Lock()
-	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3})
-	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2})
+	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3}, nil)
+	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2}, nil)
 	pd.Unlock()
 
 	result := pd.FetchFrom(0, 1024*1024)
@@ -806,9 +808,9 @@ func TestReadCascadeFetchFromMiddle(t *testing.T) {
 	pd := newTestPartitionWithChunks()
 
 	pd.Lock()
-	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3})
-	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2})
-	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1})
+	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3}, nil)
+	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2}, nil)
+	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1}, nil)
 	pd.Unlock()
 
 	result := pd.FetchFrom(3, 1024*1024) // Start at offset 3
@@ -929,4 +931,88 @@ func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
 		t.Errorf("batch count: got %d, want 3", pd.BatchCount())
 	}
 	pd.RUnlock()
+}
+
+// TestAcquireSpareChunkDoesNotHoldPartitionLock verifies that when
+// AcquireSpareChunk blocks on an exhausted pool, pd.mu is NOT held.
+// This is the core invariant that prevents deadlock between the produce
+// path and the S3 flusher (which needs pd.mu to detach chunks).
+func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
+	t.Parallel()
+
+	// Small pool: 2 chunks with tiny chunk size so we can fill them easily.
+	chunkSize := 128
+	pool := chunk.NewPool(int64(2*chunkSize), chunkSize)
+	pd := &PartData{
+		Topic:     "test-topic",
+		Index:     0,
+		chunkPool: pool,
+	}
+
+	// Push a batch into the partition so chunkCurrent is non-nil.
+	batchSize := 61
+	spare := pd.AcquireSpareChunk(batchSize)
+	pd.Lock()
+	pd.PushBatch(makeSimpleBatch(1, 1000), BatchMeta{
+		LastOffsetDelta: 0, MaxTimestamp: 1000, NumRecords: 1,
+	}, spare)
+	pd.Unlock()
+	// chunkCurrent now has 61 bytes used out of 128.
+	// A second 61-byte batch won't fit (61+61=122 > 128... actually it fits).
+	// Push another to ensure the chunk is nearly full.
+	spare = pd.AcquireSpareChunk(batchSize)
+	pd.Lock()
+	pd.PushBatch(makeSimpleBatch(1, 2000), BatchMeta{
+		LastOffsetDelta: 0, MaxTimestamp: 2000, NumRecords: 1,
+	}, spare)
+	pd.Unlock()
+	// chunkCurrent now has 122 bytes used. Next 61-byte batch won't fit (122+61=183 > 128).
+	// AcquireSpareChunk will see needsNew=true.
+
+	// Exhaust the pool: one chunk is in chunkCurrent, grab the other.
+	held := pool.Acquire()
+
+	// Pool is now empty. AcquireSpareChunk should block.
+	blocked := make(chan struct{})
+	acquired := make(chan *chunk.Chunk, 1)
+	go func() {
+		close(blocked)
+		c := pd.AcquireSpareChunk(batchSize)
+		acquired <- c
+	}()
+
+	<-blocked
+	time.Sleep(20 * time.Millisecond) // give goroutine time to enter Acquire()
+
+	// The key assertion: pd.Lock() must succeed immediately, proving the
+	// blocked goroutine is NOT holding the partition lock.
+	lockAcquired := make(chan struct{})
+	go func() {
+		pd.Lock()
+		close(lockAcquired)
+		// Simulate flusher: detach sealed chunks
+		pd.DetachSealedChunks(false)
+		pd.Unlock()
+	}()
+
+	select {
+	case <-lockAcquired:
+		// pd.mu was free — no deadlock.
+	case <-time.After(time.Second):
+		t.Fatal("pd.Lock() blocked — AcquireSpareChunk is holding the partition lock (deadlock)")
+	}
+
+	// Release the held chunk to unblock the AcquireSpareChunk goroutine.
+	pool.Release(held)
+
+	select {
+	case c := <-acquired:
+		if c == nil {
+			t.Error("AcquireSpareChunk returned nil after pool was freed")
+		} else {
+			pool.Release(c)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AcquireSpareChunk did not unblock after pool release")
+	}
 }

@@ -114,8 +114,3 @@ The following Kafka topic configs are accepted (stored and returned by DescribeC
 | `max.compaction.lag.ms` | Accepted, behavior may differ. |
 | `min.cleanable.dirty.ratio` | Accepted, behavior may differ. |
 
-## Next steps
-
-- [Configuration](/guides/configuration/) -- broker-level configuration
-- [Supported APIs](/reference/supported-apis/) -- API compatibility reference
-- [Storage](/concepts/storage/) -- how retention and compaction work internally

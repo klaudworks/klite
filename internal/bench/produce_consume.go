@@ -41,9 +41,9 @@ func DefaultProduceConsumeConfig() ProduceConsumeConfig {
 		NumRecords:         1_000_000,
 		RecordSize:         1000,
 		Throughput:         -1,
-		Acks:               -1,
+		Acks:               1,
 		BatchMaxBytes:      1_048_576,
-		LingerMs:           5,
+		LingerMs:           0,
 		MaxBufferedRecords: 8192,
 		NumProducers:       1,
 		NumConsumers:       1,
@@ -98,6 +98,7 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 			kgo.ConsumeTopics(cfg.Topic),
 			kgo.ConsumerGroup(groupID),
 			kgo.FetchMaxPartitionBytes(cfg.BatchMaxBytes),
+			kgo.FetchMaxWait(500 * time.Millisecond),
 			kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 			kgo.InstanceID(fmt.Sprintf("bench-pc-%s-%d", groupID, i)),
 		}
@@ -306,19 +307,19 @@ func consumeLoop(ctx context.Context, client *kgo.Client, epoch time.Time,
 		fetches := client.PollFetches(pollCtx)
 		pollCancel()
 
-		now := time.Now()
-		sinceEpoch := now.Sub(epoch).Nanoseconds()
-
 		fetches.EachRecord(func(r *kgo.Record) {
+			// Timestamp each record individually rather than sharing a
+			// single timestamp across the entire fetch batch.
+			now := time.Since(epoch).Nanoseconds()
+
 			if len(r.Key) != 9 {
 				return
 			}
-			// Skip warmup records.
 			if r.Key[0] == 0x00 {
-				return
+				return // warmup
 			}
 			sendNanos := int64(binary.BigEndian.Uint64(r.Key[1:9]))
-			e2eMs := int((sinceEpoch - sendNanos) / 1_000_000)
+			e2eMs := int((now - sendNanos) / 1_000_000)
 			if e2eMs < 0 {
 				e2eMs = 0
 			}

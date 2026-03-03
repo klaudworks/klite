@@ -7,6 +7,10 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'klite',
+			customCss: ['./src/styles/custom.css'],
+			expressiveCode: {
+				themes: ['solarized-light', 'solarized-dark'],
+			},
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/klaudworks/klite' }],
 			sidebar: [
 				{
@@ -24,24 +28,29 @@ export default defineConfig({
 			},
 				{
 					label: 'Concepts',
-					autogenerate: { directory: 'concepts' },
+					items: [
+						{ label: 'Design Philosophy', slug: 'concepts/design-philosophy' },
+						{ label: 'Architecture', slug: 'concepts/architecture' },
+						{ label: 'Storage', slug: 'concepts/storage' },
+					],
 				},
+		{
+			label: 'Performance',
+			items: [
+				{ label: 'Benchmarks', slug: 'performance/benchmarks' },
+				{ label: 'Optimizations', slug: 'performance/optimizations' },
+			],
+		},
 			{
 				label: 'Guides',
 				items: [
-					{ label: 'Migrating from Kafka', slug: 'guides/migrating-from-kafka' },
+					{ label: 'Migrate from / to Kafka', slug: 'guides/migrating-from-kafka' },
 					{ label: 'Troubleshooting', slug: 'guides/troubleshooting' },
 				],
 			},
 			{
 				label: 'Reference',
 				autogenerate: { directory: 'reference' },
-			},
-			{
-				label: 'Performance',
-				items: [
-					{ label: 'Benchmarks', slug: 'reference/benchmarks' },
-				],
 			},
 			],
 		}),

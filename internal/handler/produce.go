@@ -40,6 +40,25 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 
 		now := time.Now().UnixMilli()
 
+		// Two-phase produce: first submit all WAL writes (phase 1), then
+		// wait for the single fsync and commit all batches (phase 2).
+		// This batches all partition writes in one request into a single
+		// fsync cycle instead of one fsync per partition.
+
+		// pendingCommit ties a pending WAL entry to its response slot.
+		type pendingCommit struct {
+			pending         pendingWAL
+			topicIdx        int
+			partIdx         int
+			isIdempotent    bool
+			isTransactional bool
+			isLogAppendTime bool
+			topic           string
+			partition       int32
+			meta            cluster.BatchMeta
+		}
+		var pendingCommits []pendingCommit
+
 		for _, rt := range r.Topics {
 			st := kmsg.NewProduceResponseTopic()
 			st.Topic = rt.Topic
@@ -47,7 +66,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 			// Look up or auto-create the topic
 			td, _, err := state.GetOrCreateTopic(rt.Topic)
 			if err != nil {
-				// Topic doesn't exist and auto-create is disabled
 				for _, rp := range rt.Partitions {
 					sp := kmsg.NewProduceResponseTopicPartition()
 					sp.Partition = rp.Partition
@@ -60,9 +78,10 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 				continue
 			}
 
-			// Get topic configs for validation
 			maxMessageBytes := getMaxMessageBytes(td)
 			isLogAppendTime := getTimestampType(td) == "LogAppendTime"
+
+			topicIdx := len(resp.Topics)
 
 			for _, rp := range rt.Partitions {
 				sp := kmsg.NewProduceResponseTopicPartition()
@@ -70,7 +89,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 				sp.BaseOffset = -1
 				sp.LogStartOffset = -1
 
-				// Validate partition index
 				if int(rp.Partition) < 0 || int(rp.Partition) >= len(td.Partitions) {
 					sp.ErrorCode = kerr.UnknownTopicOrPartition.Code
 					st.Partitions = append(st.Partitions, sp)
@@ -80,7 +98,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 				pd := td.Partitions[rp.Partition]
 				raw := rp.Records
 
-				// Step 1: Validate minimum size and parse batch header
 				if len(raw) < 61 {
 					slog.Debug("corrupt message: too short",
 						"topic", rt.Topic, "partition", rp.Partition, "len", len(raw))
@@ -98,7 +115,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 					continue
 				}
 
-				// Step 2: Validate the batch covers the full Records slice
 				if int(meta.BatchLength) != len(raw)-12 {
 					slog.Debug("corrupt message: batch length mismatch",
 						"topic", rt.Topic, "partition", rp.Partition,
@@ -109,7 +125,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 					continue
 				}
 
-				// Step 3: Validate batch contents (BEFORE taking partition lock)
 				if meta.Magic != 2 {
 					sp.ErrorCode = kerr.UnsupportedForMessageFormat.Code
 					st.Partitions = append(st.Partitions, sp)
@@ -126,13 +141,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 					cluster.SetLogAppendTime(raw, now, &meta)
 				}
 
-				// Idempotent / transactional produce dedup check.
-				// Produce requests are handled inline in the connection's
-				// read loop (not in a goroutine), so requests from the same
-				// connection are naturally serialized in wire order. This
-				// guarantees the sequence window sees batches in the order
-				// the client sent them — matching Kafka's per-connection
-				// serialization model.
 				isIdempotent := meta.ProducerID >= 0
 				isTransactional := meta.Attributes&0x0010 != 0
 				tp := cluster.TopicPartition{Topic: rt.Topic, Partition: rp.Partition}
@@ -172,40 +180,63 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 					}
 				}
 
-				// Step 4: Append to partition via WAL
-				baseOffset, logStart, walErr := produceWithWAL(pd, td, raw, meta, walWriter)
+				// Phase 1: reserve offset, append to chunk, submit WAL async
+				pending, walErr := produceSubmitWAL(pd, td, raw, meta, walWriter)
 				if walErr != nil {
 					sp.ErrorCode = kerr.KafkaStorageError.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
 				}
 
-				// Update dedup window with actual offset
-				if isIdempotent {
-					state.PIDManager().UpdateDedupOffset(meta.ProducerID, tp, meta.BaseSequence, baseOffset)
-				}
+				partIdx := len(st.Partitions)
 
-				// Track transactional batch
-				if isTransactional && meta.ProducerID >= 0 {
-					state.PIDManager().RecordTxnBatch(meta.ProducerID, rt.Topic, rp.Partition, baseOffset)
-					pd.Lock()
-					pd.AddOpenTxn(meta.ProducerID, baseOffset)
-					pd.Unlock()
-				}
-
-				sp.BaseOffset = baseOffset
-				sp.LogAppendTime = -1
-				if isLogAppendTime {
-					sp.LogAppendTime = now
-				}
-				if r.Version >= 5 {
-					sp.LogStartOffset = logStart
-				}
-
+				// Placeholder response — will be filled in phase 2
 				st.Partitions = append(st.Partitions, sp)
+
+				pendingCommits = append(pendingCommits, pendingCommit{
+					pending:         pending,
+					topicIdx:        topicIdx,
+					partIdx:         partIdx,
+					isIdempotent:    isIdempotent,
+					isTransactional: isTransactional,
+					isLogAppendTime: isLogAppendTime,
+					topic:           rt.Topic,
+					partition:       rp.Partition,
+					meta:            meta,
+				})
 			}
 
 			resp.Topics = append(resp.Topics, st)
+		}
+
+		// Phase 2: wait for fsync and commit all batches.
+		// All pending entries share the same fsync cycle in the WAL writer,
+		// so this is effectively one fsync wait regardless of partition count.
+		for _, pc := range pendingCommits {
+			produceCommitWAL(pc.pending)
+
+			sp := &resp.Topics[pc.topicIdx].Partitions[pc.partIdx]
+			sp.BaseOffset = pc.pending.baseOffset
+			sp.LogAppendTime = -1
+			if pc.isLogAppendTime {
+				sp.LogAppendTime = now
+			}
+			if r.Version >= 5 {
+				sp.LogStartOffset = pc.pending.logStart
+			}
+
+			if pc.isIdempotent {
+				tp := cluster.TopicPartition{Topic: pc.topic, Partition: pc.partition}
+				state.PIDManager().UpdateDedupOffset(pc.meta.ProducerID, tp, pc.meta.BaseSequence, pc.pending.baseOffset)
+			}
+
+			if pc.isTransactional && pc.meta.ProducerID >= 0 {
+				state.PIDManager().RecordTxnBatch(pc.meta.ProducerID, pc.topic, pc.partition, pc.pending.baseOffset)
+				pd := state.GetTopic(pc.topic).Partitions[pc.partition]
+				pd.Lock()
+				pd.AddOpenTxn(pc.meta.ProducerID, pc.pending.baseOffset)
+				pd.Unlock()
+			}
 		}
 
 		if suppressResponse {
@@ -216,62 +247,95 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 	}
 }
 
-// produceWithWAL implements the durable produce path:
-//  1. Reserve offset + append to chunk under partition lock
-//  2. Write to WAL (lock released during fsync wait)
-//  3. Commit batch under partition lock (advances HW in order)
-func produceWithWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (baseOffset int64, logStart int64, err error) {
-	// Make a copy so we own the bytes
+// pendingWAL holds state for a partition batch between the async WAL submit
+// and the post-fsync commit. Used by the two-phase produce path to batch
+// all WAL writes in a single produce request into one fsync cycle.
+type pendingWAL struct {
+	pd         *cluster.PartData
+	baseOffset int64
+	logStart   int64
+	meta       cluster.BatchMeta
+	stored     []byte
+	doneCh     <-chan struct{}
+}
+
+// produceSubmitWAL is phase 1: reserve offset, enqueue the WAL entry, then
+// append to chunk memory. Returns a pendingWAL that the caller must pass to
+// produceCommitWAL after the fsync channel signals.
+//
+// Ordering: AcquireSpareChunk (may block, no lock held) → pd.Lock() →
+// reserve offset → AppendAsync → AppendToChunk → pd.Unlock().
+//
+// The spare chunk is acquired before taking the partition lock so that
+// backpressure blocking never holds pd.mu, preventing deadlock with the
+// S3 flusher which needs pd.mu to detach and release chunks.
+func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (pendingWAL, error) {
 	stored := make([]byte, len(raw))
 	copy(stored, raw)
 
-	// Step 1: Reserve offset + append to chunk (brief write lock)
-	// Data goes into chunk memory immediately so fetch can see it
-	// after HW advances in CommitBatch.
-	pd.Lock()
-	baseOffset = pd.ReserveOffset(meta)
-	logStart = pd.LogStart()
+	// Pre-acquire a spare chunk before taking the partition lock.
+	// This may block if the pool is exhausted (backpressure), which is
+	// safe because we don't hold pd.mu yet.
+	spare := pd.AcquireSpareChunk(len(stored))
 
-	// Assign the server-side offset into the raw bytes (in-place mutation)
+	pd.Lock()
+	baseOffset := pd.ReserveOffset(meta)
+	logStart := pd.LogStart()
 	cluster.AssignOffset(stored, baseOffset)
 
-	// Append offset-assigned bytes to chunk pool (memory)
-	pd.AppendToChunk(stored, chunk.ChunkBatch{
-		BaseOffset:      baseOffset,
-		LastOffsetDelta: meta.LastOffsetDelta,
-		MaxTimestamp:    meta.MaxTimestamp,
-		NumRecords:      meta.NumRecords,
-	})
-	pd.Unlock()
-
-	// Step 2: Write to WAL (pd.mu NOT held — Fetches can proceed)
+	// Submit WAL entry (non-blocking enqueue). On failure, roll back the
+	// offset reservation so no gap is created.
 	walEntry := &wal.Entry{
 		TopicID:   td.ID,
 		Partition: pd.Index,
 		Offset:    baseOffset,
 		Data:      stored,
 	}
-
-	if err := walWriter.Append(walEntry); err != nil {
-		return 0, 0, err
+	doneCh, err := walWriter.AppendAsync(walEntry)
+	if err != nil {
+		pd.RollbackReserve(baseOffset)
+		pd.Unlock()
+		pd.ReleaseSpareChunk(spare)
+		return pendingWAL{}, err
 	}
 
-	// Step 3: Commit batch (brief write lock — advances HW only, no data copy)
-	batch := cluster.StoredBatch{
+	// WAL enqueue succeeded — safe to place data in the chunk.
+	spare = pd.AppendToChunk(stored, chunk.ChunkBatch{
 		BaseOffset:      baseOffset,
 		LastOffsetDelta: meta.LastOffsetDelta,
-		RawBytes:        stored,
 		MaxTimestamp:    meta.MaxTimestamp,
 		NumRecords:      meta.NumRecords,
-	}
-
-	pd.Lock()
-	pd.CommitBatch(batch)
+	}, spare)
 	pd.Unlock()
+	pd.ReleaseSpareChunk(spare)
 
-	pd.NotifyWaiters()
+	return pendingWAL{
+		pd:         pd,
+		baseOffset: baseOffset,
+		logStart:   logStart,
+		meta:       meta,
+		stored:     stored,
+		doneCh:     doneCh,
+	}, nil
+}
 
-	return baseOffset, logStart, nil
+// produceCommitWAL is phase 2: wait for the fsync channel, then commit the
+// batch (advance HW) and notify fetch waiters.
+func produceCommitWAL(p pendingWAL) {
+	<-p.doneCh
+
+	batch := cluster.StoredBatch{
+		BaseOffset:      p.baseOffset,
+		LastOffsetDelta: p.meta.LastOffsetDelta,
+		RawBytes:        p.stored,
+		MaxTimestamp:    p.meta.MaxTimestamp,
+		NumRecords:      p.meta.NumRecords,
+	}
+	p.pd.Lock()
+	p.pd.CommitBatch(batch)
+	p.pd.Unlock()
+
+	p.pd.NotifyWaiters()
 }
 
 // getMaxMessageBytes returns the max.message.bytes config value for the topic.
