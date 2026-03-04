@@ -15,9 +15,28 @@ type StoredBatch struct {
 	NumRecords      int32
 }
 
-// fetchWaiter represents a Fetch request waiting for new data (long polling).
-type fetchWaiter struct {
-	ch chan struct{} // closed when new data is available
+// FetchWaiter represents a Fetch request waiting for new data (long polling).
+// A single FetchWaiter is shared across multiple partitions. Multiple partitions
+// may call CloseOnce concurrently — sync.Once prevents double-close panic.
+type FetchWaiter struct {
+	once sync.Once       // ensures ch is closed exactly once
+	ch   chan struct{}    // closed when data arrives (wake-up signal only, no data)
+}
+
+// NewFetchWaiter creates a new fetch waiter with a fresh wake channel.
+func NewFetchWaiter() *FetchWaiter {
+	return &FetchWaiter{ch: make(chan struct{})}
+}
+
+// Ch returns the wake-up channel. Select on this to be notified when data arrives.
+func (w *FetchWaiter) Ch() <-chan struct{} {
+	return w.ch
+}
+
+// CloseOnce safely closes the wake channel. Multiple partitions may call this
+// concurrently for the same shared waiter — sync.Once prevents double-close panic.
+func (w *FetchWaiter) CloseOnce() {
+	w.once.Do(func() { close(w.ch) })
 }
 
 // PartData holds the state for a single partition.
@@ -40,8 +59,8 @@ type PartData struct {
 	maxTimestampBatchIdx int // -1 if no batches
 
 	// Fetch waiters (long polling) -- see 09-fetch.md
-	waiterMu sync.Mutex     // separate lock for waiter list (not RWMutex)
-	waiters  []*fetchWaiter // each waiter holds a shared wake channel
+	waiterMu sync.Mutex      // separate lock for waiter list (not RWMutex)
+	waiters  []*FetchWaiter  // each waiter holds a shared wake channel
 }
 
 // HW returns the current high watermark (next offset to be assigned).
@@ -120,19 +139,17 @@ func (pd *PartData) NotifyWaiters() {
 	pd.waiterMu.Unlock()
 
 	for _, w := range waiters {
-		close(w.ch)
+		w.CloseOnce() // safe even if another partition already closed it
 	}
 }
 
-// RegisterWaiter registers a fetch waiter and returns a channel that will
-// be closed when new data is available. The caller should select on this
-// channel or a timeout. Caller must NOT hold pd.mu.
-func (pd *PartData) RegisterWaiter() <-chan struct{} {
-	w := &fetchWaiter{ch: make(chan struct{})}
+// RegisterWaiter registers a shared fetch waiter on this partition.
+// The same waiter can be registered on multiple partitions (shared channel).
+// Caller must NOT hold pd.mu.
+func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 	pd.waiterMu.Lock()
 	pd.waiters = append(pd.waiters, w)
 	pd.waiterMu.Unlock()
-	return w.ch
 }
 
 // SearchOffset finds the batch containing the given offset via binary search.

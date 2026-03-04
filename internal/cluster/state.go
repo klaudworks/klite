@@ -70,6 +70,18 @@ func (s *State) GetAllTopics() []*TopicData {
 	return result
 }
 
+// GetTopicByID returns the topic data matching the given UUID, or nil if not found.
+func (s *State) GetTopicByID(id [16]byte) *TopicData {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, td := range s.topics {
+		if td.ID == id {
+			return td
+		}
+	}
+	return nil
+}
+
 // CreateTopic creates a new topic with the given name and partition count.
 // Returns the created topic, or the existing topic if it already exists.
 // The second return value is true if the topic was newly created.
