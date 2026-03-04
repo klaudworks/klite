@@ -120,8 +120,9 @@ func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 	partitions := make([]*PartData, numPartitions)
 	for i := range partitions {
 		partitions[i] = &PartData{
-			Topic: name,
-			Index: int32(i),
+			Topic:                name,
+			Index:                int32(i),
+			maxTimestampBatchIdx: -1,
 		}
 	}
 
@@ -133,21 +134,4 @@ func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 	}
 }
 
-// PartData holds the state for a single partition.
-// Protected by its own RWMutex for concurrent Produce/Fetch.
-type PartData struct {
-	mu       sync.RWMutex
-	Topic    string
-	Index    int32
-	Batches  []StoredBatch
-	HW       int64 // high watermark (next offset to be assigned)
-	LogStart int64 // log start offset
-}
-
-// StoredBatch is a placeholder for a stored record batch.
-// Will be expanded in 06-partition-data-model.md.
-type StoredBatch struct {
-	Records    []byte
-	BaseOffset int64
-	NumRecords int32
-}
+// PartData and StoredBatch are defined in partition.go.
