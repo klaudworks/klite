@@ -20,7 +20,28 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 19, MinVersion: 2, MaxVersion: 7},  // CreateTopics
 
 	// Phase 2: Consumer groups
-	{ApiKey: 10, MinVersion: 0, MaxVersion: 6}, // FindCoordinator
+	{ApiKey: 8, MinVersion: 0, MaxVersion: 9},   // OffsetCommit
+	{ApiKey: 9, MinVersion: 0, MaxVersion: 9},   // OffsetFetch
+	{ApiKey: 10, MinVersion: 0, MaxVersion: 6},  // FindCoordinator
+	{ApiKey: 11, MinVersion: 0, MaxVersion: 9},  // JoinGroup
+	{ApiKey: 12, MinVersion: 0, MaxVersion: 4},  // Heartbeat
+	{ApiKey: 13, MinVersion: 0, MaxVersion: 5},  // LeaveGroup
+	{ApiKey: 14, MinVersion: 0, MaxVersion: 5},  // SyncGroup
+	{ApiKey: 47, MinVersion: 0, MaxVersion: 0},  // OffsetDelete
+
+	// Phase 3: Admin APIs
+	{ApiKey: 15, MinVersion: 0, MaxVersion: 6},  // DescribeGroups
+	{ApiKey: 16, MinVersion: 0, MaxVersion: 5},  // ListGroups
+	{ApiKey: 20, MinVersion: 0, MaxVersion: 6},  // DeleteTopics
+	{ApiKey: 21, MinVersion: 0, MaxVersion: 2},  // DeleteRecords
+	{ApiKey: 23, MinVersion: 3, MaxVersion: 4},  // OffsetForLeaderEpoch
+	{ApiKey: 32, MinVersion: 0, MaxVersion: 4},  // DescribeConfigs
+	{ApiKey: 33, MinVersion: 0, MaxVersion: 2},  // AlterConfigs
+	{ApiKey: 35, MinVersion: 0, MaxVersion: 4},  // DescribeLogDirs
+	{ApiKey: 37, MinVersion: 0, MaxVersion: 3},  // CreatePartitions
+	{ApiKey: 42, MinVersion: 0, MaxVersion: 2},  // DeleteGroups
+	{ApiKey: 44, MinVersion: 0, MaxVersion: 1},  // IncrementalAlterConfigs
+	{ApiKey: 60, MinVersion: 0, MaxVersion: 2},  // DescribeCluster
 }
 
 // apiVersionsMap is a lookup table built from apiVersions for fast version
