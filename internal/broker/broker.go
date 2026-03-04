@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/server"
 )
@@ -21,6 +22,7 @@ type Broker struct {
 	cfg        Config
 	listener   net.Listener
 	clusterID  string
+	state      *cluster.State
 	shutdownCh chan struct{} // closed on shutdown to wake all blockers
 	done       chan struct{} // closed when Run() returns
 	ready      chan struct{} // closed when initialization is complete
@@ -39,8 +41,15 @@ func New(cfg Config) *Broker {
 	shutdownCh := make(chan struct{})
 	srv := server.NewServer(handlers, shutdownCh, logger)
 
+	state := cluster.NewState(cluster.Config{
+		NodeID:            cfg.NodeID,
+		DefaultPartitions: cfg.DefaultPartitions,
+		AutoCreateTopics:  cfg.AutoCreateTopics,
+	})
+
 	b := &Broker{
 		cfg:        cfg,
+		state:      state,
 		shutdownCh: shutdownCh,
 		done:       make(chan struct{}),
 		ready:      make(chan struct{}),
@@ -48,13 +57,24 @@ func New(cfg Config) *Broker {
 		server:     srv,
 		handlers:   handlers,
 	}
-	b.registerHandlers()
+	b.registerBaseHandlers()
 	return b
 }
 
-// registerHandlers wires up all API handlers.
-func (b *Broker) registerHandlers() {
+// registerBaseHandlers wires up handlers that don't depend on runtime state.
+func (b *Broker) registerBaseHandlers() {
 	b.handlers.Register(18, handler.HandleApiVersions())
+}
+
+// registerRuntimeHandlers wires up handlers that depend on runtime state
+// (cluster ID, advertised address, etc.). Must be called after initialization.
+func (b *Broker) registerRuntimeHandlers(advAddr string) {
+	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
+		NodeID:         b.cfg.NodeID,
+		AdvertisedAddr: advAddr,
+		ClusterID:      b.clusterID,
+		State:          b.state,
+	}))
 }
 
 // Run starts the broker and blocks until ctx is cancelled.
@@ -73,14 +93,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.clusterID = cid
 
-	// 3. Resolve advertised address
-	advAddr, warn := b.cfg.ResolveAdvertisedAddr()
-	if warn {
-		b.logger.Warn("--advertised-addr not set, using derived address in Metadata responses; clients outside this host won't be able to connect",
-			"advertised_addr", advAddr)
-	}
-
-	// 4. Start TCP listener
+	// 3. Start TCP listener
 	ln := b.cfg.Listener
 	if ln == nil {
 		ln, err = net.Listen("tcp", b.cfg.Listen)
@@ -90,7 +103,17 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.listener = ln
 
-	// 5. Log startup
+	// 4. Resolve advertised address (after listener is bound so we know the real port)
+	advAddr, warn := b.resolveAdvertisedAddr()
+	if warn {
+		b.logger.Warn("--advertised-addr not set, using derived address in Metadata responses; clients outside this host won't be able to connect",
+			"advertised_addr", advAddr)
+	}
+
+	// 5. Register handlers that depend on runtime state
+	b.registerRuntimeHandlers(advAddr)
+
+	// 6. Log startup
 	b.logger.Info("klite started",
 		"listen", b.listener.Addr().String(),
 		"advertised_addr", advAddr,
@@ -102,25 +125,33 @@ func (b *Broker) Run(ctx context.Context) error {
 	// Signal that initialization is complete
 	close(b.ready)
 
-	// 6. Serve connections (blocks until listener closed)
+	// 7. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- b.server.Serve(b.listener)
 	}()
 
 	// Wait for context cancellation or serve error
+	var serveReturned bool
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
+		serveReturned = true
 		if err != nil {
 			return err
 		}
 	}
 
-	// 7. Shutdown sequence
+	// 8. Shutdown sequence
 	b.shutdown()
 
-	// 8. Wait for all connections to drain
+	// 9. Wait for Serve() to return so no new connections are accepted
+	// (no more wg.Add calls after this point).
+	if !serveReturned {
+		<-errCh
+	}
+
+	// 10. Wait for all connections to drain
 	b.server.Wait()
 
 	b.logger.Info("klite stopped")
@@ -161,6 +192,27 @@ func (b *Broker) Ready() <-chan struct{} {
 // Handlers returns the handler registry for registering API handlers.
 func (b *Broker) Handlers() *server.HandlerRegistry {
 	return b.handlers
+}
+
+// resolveAdvertisedAddr determines the advertised address from config,
+// falling back to the actual listener address if not explicitly configured.
+func (b *Broker) resolveAdvertisedAddr() (addr string, warn bool) {
+	if b.cfg.AdvertisedAddr != "" {
+		return b.cfg.AdvertisedAddr, false
+	}
+	// Use the actual listener address (important for tests with random ports)
+	if b.listener != nil {
+		laddr := b.listener.Addr().String()
+		host, port, err := net.SplitHostPort(laddr)
+		if err == nil {
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				return net.JoinHostPort("localhost", port), true
+			}
+			return laddr, false
+		}
+	}
+	// Fallback to config
+	return b.cfg.ResolveAdvertisedAddr()
 }
 
 func (b *Broker) shutdown() {
