@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/server"
 )
 
@@ -38,7 +39,7 @@ func New(cfg Config) *Broker {
 	shutdownCh := make(chan struct{})
 	srv := server.NewServer(handlers, shutdownCh, logger)
 
-	return &Broker{
+	b := &Broker{
 		cfg:        cfg,
 		shutdownCh: shutdownCh,
 		done:       make(chan struct{}),
@@ -47,6 +48,13 @@ func New(cfg Config) *Broker {
 		server:     srv,
 		handlers:   handlers,
 	}
+	b.registerHandlers()
+	return b
+}
+
+// registerHandlers wires up all API handlers.
+func (b *Broker) registerHandlers() {
+	b.handlers.Register(18, handler.HandleApiVersions())
 }
 
 // Run starts the broker and blocks until ctx is cancelled.

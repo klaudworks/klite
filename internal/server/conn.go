@@ -159,10 +159,21 @@ func (cc *clientConn) readLoop() {
 			kmsg.SkipTags(&reader)
 		}
 
-		// Parse request body (copies data out of frame buffer)
+		// Parse request body (copies data out of frame buffer).
+		// ApiVersions (key 18) is special: if parsing fails due to an
+		// unsupported version, we still dispatch to the handler so it can
+		// return the version list with UNSUPPORTED_VERSION error code.
+		// This lets the client negotiate down to a supported version.
 		if err := kreq.ReadFrom(reader.Src); err != nil {
-			cc.logger.Debug("parse error", "remote", who, "api_key", apiKey, "version", apiVersion, "error", err)
-			return
+			if apiKey == 18 {
+				// For ApiVersions, ignore parse errors from unsupported versions.
+				// The handler will detect the version mismatch and respond accordingly.
+				cc.logger.Debug("ApiVersions parse error (will still dispatch)",
+					"remote", who, "version", apiVersion, "error", err)
+			} else {
+				cc.logger.Debug("parse error", "remote", who, "api_key", apiKey, "version", apiVersion, "error", err)
+				return
+			}
 		}
 
 		// Assign sequence number in arrival order BEFORE spawning handler
