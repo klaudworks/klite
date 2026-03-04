@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/klaudworks/klite/internal/broker"
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -17,6 +18,7 @@ import (
 type TestBroker struct {
 	Addr   string
 	Broker *broker.Broker
+	cancel context.CancelFunc
 }
 
 // BrokerOpt is a functional option for configuring a test broker.
@@ -52,6 +54,20 @@ func WithWALSegmentMaxBytes(n int64) BrokerOpt {
 	return func(c *broker.Config) { c.WALSegmentMaxBytes = n }
 }
 
+// WithS3 configures S3 storage with an in-memory S3 backend.
+func WithS3(s3api s3store.S3API, bucket, prefix string) BrokerOpt {
+	return func(c *broker.Config) {
+		c.S3Bucket = bucket
+		c.S3Prefix = prefix
+		c.S3API = s3api
+	}
+}
+
+// WithS3FlushInterval sets the S3 flush interval.
+func WithS3FlushInterval(d time.Duration) BrokerOpt {
+	return func(c *broker.Config) { c.S3FlushInterval = d }
+}
+
 // StartBroker starts a klite broker in-process on a random port.
 // Registers cleanup with t.Cleanup().
 func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
@@ -82,7 +98,14 @@ func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
 		t.Fatal("broker did not become ready within 5s")
 	}
 
-	return &TestBroker{Addr: ln.Addr().String(), Broker: b}
+	return &TestBroker{Addr: ln.Addr().String(), Broker: b, cancel: cancel}
+}
+
+// Stop gracefully stops the broker, triggering shutdown flush (including S3).
+// Blocks until the broker has fully stopped.
+func (tb *TestBroker) Stop() {
+	tb.cancel()
+	tb.Broker.Wait()
 }
 
 // NewClient creates a franz-go client connected to the given broker address.

@@ -3,11 +3,15 @@ package broker
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +20,7 @@ import (
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/metadata"
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -35,6 +40,9 @@ type Broker struct {
 	walWriter  *wal.Writer    // nil if WAL disabled
 	walIndex   *wal.Index     // nil if WAL disabled
 	metaLog    *metadata.Log  // nil if metadata persistence disabled
+	s3Client   *s3store.Client  // nil if S3 disabled
+	s3Reader   *s3store.Reader  // nil if S3 disabled
+	s3Flusher  *s3store.Flusher // nil if S3 disabled
 
 	mu   sync.Mutex
 	quit bool
@@ -137,6 +145,13 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.clusterID = cid
 
+	// 2b. If S3 is configured, attempt disaster recovery if needed
+	if b.cfg.S3Bucket != "" {
+		if err := b.maybeRecoverFromS3(); err != nil {
+			b.logger.Warn("S3 disaster recovery failed, continuing without", "err", err)
+		}
+	}
+
 	// 3. Initialize metadata.log if WAL is enabled (replay metadata first)
 	if b.cfg.WALEnabled {
 		if err := b.initMetadataLog(); err != nil {
@@ -148,6 +163,13 @@ func (b *Broker) Run(ctx context.Context) error {
 	if b.cfg.WALEnabled {
 		if err := b.initWAL(); err != nil {
 			return fmt.Errorf("init WAL: %w", err)
+		}
+	}
+
+	// 4b. Initialize S3 if configured
+	if b.cfg.S3Bucket != "" && b.cfg.WALEnabled {
+		if err := b.initS3(); err != nil {
+			return fmt.Errorf("init S3: %w", err)
 		}
 	}
 
@@ -215,12 +237,17 @@ func (b *Broker) Run(ctx context.Context) error {
 	// 13. Stop all group goroutines
 	b.state.StopAllGroups()
 
-	// 14. Stop WAL writer (flush pending writes)
+	// 14. Run unified S3 sync (flush all partitions + upload metadata.log)
+	if b.s3Flusher != nil {
+		b.s3Flusher.Stop() // Stop triggers a final flush
+	}
+
+	// 15. Stop WAL writer (flush pending writes)
 	if b.walWriter != nil {
 		b.walWriter.Stop()
 	}
 
-	// 15. Close metadata log
+	// 16. Close metadata log
 	if b.metaLog != nil {
 		b.metaLog.Close()
 	}
@@ -480,6 +507,337 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 		)
 	}
 	return nil
+}
+
+// initS3 initializes the S3 storage layer.
+func (b *Broker) initS3() error {
+	var s3api s3store.S3API
+	if b.cfg.S3API != nil {
+		var ok bool
+		s3api, ok = b.cfg.S3API.(s3store.S3API)
+		if !ok {
+			return fmt.Errorf("S3API config field must implement s3.S3API interface")
+		}
+	} else {
+		// Create a real AWS S3 client
+		var err error
+		s3api, err = createAWSS3Client(b.cfg)
+		if err != nil {
+			return fmt.Errorf("create AWS S3 client: %w", err)
+		}
+	}
+
+	prefix := b.cfg.S3Prefix
+	if prefix == "" {
+		prefix = "klite/" + b.clusterID
+	}
+
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: s3api,
+		Bucket:   b.cfg.S3Bucket,
+		Prefix:   prefix,
+		Logger:   b.logger,
+	})
+
+	b.s3Reader = s3store.NewReader(b.s3Client, b.logger)
+
+	// Set S3 fetcher on all existing partitions
+	fetchAdapter := &s3store.ReaderAdapter{Reader: b.s3Reader}
+	b.state.SetS3Fetcher(fetchAdapter)
+
+	// Set up the flusher
+	flushInterval := b.cfg.S3FlushInterval
+	if flushInterval == 0 {
+		flushInterval = 10 * time.Minute
+	}
+
+	flusherCfg := s3store.FlusherConfig{
+		Client:            b.s3Client,
+		WALWriter:         b.walWriter,
+		WALIndex:          b.walIndex,
+		FlushInterval:     flushInterval,
+		UploadConcurrency: 4,
+		Logger:            b.logger,
+		MetadataUploader:  b.uploadMetadataLog,
+	}
+
+	partAdapter := &s3PartitionAdapter{
+		state:     b.state,
+		walWriter: b.walWriter,
+		walIndex:  b.walIndex,
+	}
+	b.s3Flusher = s3store.NewFlusher(flusherCfg, partAdapter)
+	b.s3Flusher.Start()
+
+	// Probe S3 to discover HW for partitions that have data in S3
+	// but no local WAL data (disaster recovery scenario)
+	b.probeS3Watermarks()
+
+	b.logger.Info("S3 storage initialized",
+		"bucket", b.cfg.S3Bucket,
+		"prefix", prefix,
+		"flush_interval", flushInterval,
+	)
+
+	return nil
+}
+
+// uploadMetadataLog uploads the metadata.log file to S3.
+func (b *Broker) uploadMetadataLog(ctx context.Context) error {
+	if b.metaLog == nil || b.s3Client == nil {
+		return nil
+	}
+
+	data, err := os.ReadFile(b.metaLog.Path())
+	if err != nil {
+		return fmt.Errorf("read metadata.log: %w", err)
+	}
+
+	key := b.s3Client.Prefix() + "/metadata.log"
+	return b.s3Client.PutObject(ctx, key, data)
+}
+
+// maybeRecoverFromS3 checks if metadata.log is missing locally and attempts
+// to download it from S3 (disaster recovery scenario).
+func (b *Broker) maybeRecoverFromS3() error {
+	metaPath := filepath.Join(b.cfg.DataDir, "metadata.log")
+	if _, err := os.Stat(metaPath); err == nil {
+		return nil // metadata.log exists locally, no recovery needed
+	}
+
+	// metadata.log is missing. Try to download from S3.
+	var s3api s3store.S3API
+	if b.cfg.S3API != nil {
+		var ok bool
+		s3api, ok = b.cfg.S3API.(s3store.S3API)
+		if !ok {
+			return fmt.Errorf("S3API must implement s3.S3API")
+		}
+	} else {
+		return fmt.Errorf("no S3 API client available for recovery")
+	}
+
+	prefix := b.cfg.S3Prefix
+	if prefix == "" {
+		prefix = "klite/" + b.clusterID
+	}
+
+	client := s3store.NewClient(s3store.ClientConfig{
+		S3Client: s3api,
+		Bucket:   b.cfg.S3Bucket,
+		Prefix:   prefix,
+		Logger:   b.logger,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	metaKey := prefix + "/metadata.log"
+	data, err := client.GetObject(ctx, metaKey)
+	if err != nil {
+		b.logger.Info("no metadata.log backup found in S3, attempting topic inference from S3 keys", "key", metaKey, "err", err)
+		return b.inferTopicsFromS3(ctx, client, prefix, metaPath)
+	}
+
+	// Write metadata.log to disk
+	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
+		return fmt.Errorf("write recovered metadata.log: %w", err)
+	}
+
+	b.logger.Info("recovered metadata.log from S3",
+		"key", metaKey, "size", len(data))
+
+	return nil
+}
+
+// inferTopicsFromS3 reconstructs a metadata.log from S3 object keys when both
+// the local metadata.log and the S3 backup are missing (full disaster recovery).
+// It lists objects under prefix, parses topic/partition from key structure
+// (prefix/topic/partition/offset.obj), generates new topic IDs, and writes
+// a fresh metadata.log with CREATE_TOPIC entries.
+func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, prefix, metaPath string) error {
+	objects, err := client.ListObjects(ctx, prefix+"/")
+	if err != nil {
+		return fmt.Errorf("list S3 objects for inference: %w", err)
+	}
+
+	if len(objects) == 0 {
+		b.logger.Info("no S3 objects found, nothing to infer")
+		return nil
+	}
+
+	// Parse topic/partition from keys. Key format: prefix/topic/partition/offset.obj
+	// Skip non-data keys like prefix/metadata.log.
+	type topicInfo struct {
+		maxPartition int32
+	}
+	topics := make(map[string]*topicInfo)
+
+	trimPrefix := prefix + "/"
+	for _, obj := range objects {
+		rel := strings.TrimPrefix(obj.Key, trimPrefix)
+		parts := strings.Split(rel, "/")
+		if len(parts) != 3 {
+			continue // not a data object (e.g. metadata.log)
+		}
+		topicName := parts[0]
+		partIdx, err := strconv.Atoi(parts[1])
+		if err != nil {
+			continue
+		}
+		if !strings.HasSuffix(parts[2], ".obj") {
+			continue
+		}
+
+		ti, ok := topics[topicName]
+		if !ok {
+			ti = &topicInfo{maxPartition: -1}
+			topics[topicName] = ti
+		}
+		if int32(partIdx) > ti.maxPartition {
+			ti.maxPartition = int32(partIdx)
+		}
+	}
+
+	if len(topics) == 0 {
+		b.logger.Info("no topic data found in S3 objects")
+		return nil
+	}
+
+	// Sort topic names for deterministic metadata.log output.
+	topicNames := make([]string, 0, len(topics))
+	for name := range topics {
+		topicNames = append(topicNames, name)
+	}
+	sort.Strings(topicNames)
+
+	// Build metadata.log entries with generated topic IDs.
+	crc32cTable := crc32.MakeTable(crc32.Castagnoli)
+	f, err := os.Create(metaPath)
+	if err != nil {
+		return fmt.Errorf("create inferred metadata.log: %w", err)
+	}
+	defer f.Close()
+
+	for _, name := range topicNames {
+		ti := topics[name]
+		topicID := uuid.New()
+		var idBytes [16]byte
+		copy(idBytes[:], topicID[:])
+
+		entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
+			TopicName:      name,
+			PartitionCount: ti.maxPartition + 1,
+			TopicID:        idBytes,
+		})
+
+		// Frame: [4 bytes length][4 bytes CRC32c][payload]
+		frameSize := 4 + 4 + len(entry)
+		frame := make([]byte, frameSize)
+		binary.BigEndian.PutUint32(frame[0:4], uint32(4+len(entry)))
+		binary.BigEndian.PutUint32(frame[4:8], crc32.Checksum(entry, crc32cTable))
+		copy(frame[8:], entry)
+
+		if _, err := f.Write(frame); err != nil {
+			return fmt.Errorf("write inferred metadata entry for %s: %w", name, err)
+		}
+
+		b.logger.Info("inferred topic from S3",
+			"topic", name,
+			"partitions", ti.maxPartition+1,
+			"topic_id", topicID.String())
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync inferred metadata.log: %w", err)
+	}
+
+	b.logger.Info("inferred metadata.log from S3 key structure",
+		"topics", len(topics))
+	return nil
+}
+
+// probeS3Watermarks discovers high-water marks from S3 for each partition
+// and updates the cluster state. This handles the disaster recovery case where
+// metadata.log was restored from S3 backup but WAL data is gone.
+func (b *Broker) probeS3Watermarks() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	topics := b.state.GetAllTopics()
+	updated := 0
+	for _, td := range topics {
+		for _, pd := range td.Partitions {
+			pd.RLock()
+			hw := pd.HW()
+			pd.RUnlock()
+
+			if hw > 0 {
+				continue // already has HW from WAL replay
+			}
+
+			s3HW, err := b.s3Reader.DiscoverHW(ctx, td.Name, pd.Index)
+			if err != nil {
+				b.logger.Debug("S3 HW probe failed", "topic", td.Name, "partition", pd.Index, "err", err)
+				continue
+			}
+			if s3HW > 0 {
+				pd.Lock()
+				pd.SetHW(s3HW)
+				pd.SetS3FlushWatermark(s3HW)
+				pd.Unlock()
+				updated++
+			}
+		}
+	}
+
+	if updated > 0 {
+		b.logger.Info("S3 watermark probe complete", "partitions_updated", updated)
+	}
+}
+
+// createAWSS3Client creates an AWS S3 client from broker config.
+func createAWSS3Client(cfg Config) (s3store.S3API, error) {
+	// Import done at package level via build
+	// For now, return an error if no custom endpoint is set
+	// Production users must set S3API directly or we create via aws-sdk-go-v2
+	return nil, fmt.Errorf("AWS S3 client creation requires S3API to be set in config (use S3Endpoint for custom endpoints)")
+}
+
+// s3PartitionAdapter adapts the cluster state to the s3.PartitionProvider interface.
+type s3PartitionAdapter struct {
+	state     *cluster.State
+	walWriter *wal.Writer
+	walIndex  *wal.Index
+}
+
+func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
+	parts := a.state.FlushablePartitions()
+	var result []s3store.FlushPartition
+
+	for _, fp := range parts {
+		batches := s3store.CollectWALBatches(a.walWriter, a.walIndex, fp.TopicID, fp.Partition, fp.S3Watermark)
+		if len(batches) == 0 {
+			continue
+		}
+
+		pd := fp.Partition_ // captured partition reference
+		result = append(result, s3store.FlushPartition{
+			Topic:       fp.Topic,
+			Partition:   fp.Partition,
+			TopicID:     fp.TopicID,
+			S3Watermark: fp.S3Watermark,
+			HW:          fp.HW,
+			Batches:     batches,
+			AdvanceWatermark: func(newWatermark int64) {
+				pd.Lock()
+				pd.SetS3FlushWatermark(newWatermark)
+				pd.Unlock()
+			},
+		})
+	}
+
+	return result
 }
 
 // Wait blocks until Run() returns.
