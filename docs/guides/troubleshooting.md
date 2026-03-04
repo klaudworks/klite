@@ -205,7 +205,7 @@ klite keeps recent WAL data in the OS page cache. This is normal and managed by 
 
 If your issue isn't covered here:
 
-1. Check the [klite GitHub issues](https://github.com/kliteio/klite/issues)
+1. Check the [klite GitHub issues](https://github.com/klaudworks/klite/issues)
 2. Run klite with `--log-level debug` and include the logs in your report
 3. Include your klite version, OS, and client library version
 
