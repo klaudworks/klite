@@ -85,6 +85,16 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.IntVar(&cfg.DefaultPartitions, "default-partitions", cfg.DefaultPartitions, "Default partition count for auto-created topics")
 	fs.BoolVar(&cfg.AutoCreateTopics, "auto-create-topics", cfg.AutoCreateTopics, "Auto-create topics on Metadata/Produce")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error")
+
+	// WAL flags
+	fs.BoolVar(&cfg.WALEnabled, "wal-enabled", cfg.WALEnabled, "Enable WAL persistence")
+
+	// S3 flags
+	fs.StringVar(&cfg.S3Bucket, "s3-bucket", cfg.S3Bucket, "S3 bucket name (empty = S3 disabled)")
+	fs.StringVar(&cfg.S3Region, "s3-region", cfg.S3Region, "S3 region (default: us-east-1)")
+	fs.StringVar(&cfg.S3Endpoint, "s3-endpoint", cfg.S3Endpoint, "Custom S3 endpoint (for LocalStack/MinIO)")
+	fs.StringVar(&cfg.S3Prefix, "s3-prefix", cfg.S3Prefix, "S3 key prefix (default: klite/<clusterID>)")
+	fs.DurationVar(&cfg.S3FlushInterval, "s3-flush-interval", cfg.S3FlushInterval, "S3 flush interval (default: 10m)")
 }
 
 // ApplyEnvOverrides reads KLITE_* environment variables and applies them to

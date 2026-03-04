@@ -103,6 +103,10 @@ type PartData struct {
 	// Phase 4 (S3)
 	s3FlushWatermark int64          // highest offset+1 flushed to S3
 	s3Fetch          S3Fetcher      // S3 reader for tier 3 reads (nil if S3 not configured)
+
+	// Phase 4 (Transactions)
+	abortedTxns []AbortedTxnEntry // aborted transaction index, sorted by LastOffset
+	openTxnPIDs map[int64]int64   // producerID -> first offset of open txn on this partition
 }
 
 // HW returns the current high watermark (next offset to be assigned).
@@ -593,6 +597,60 @@ func (pd *PartData) listOffsetsRingTimestamp(timestamp int64) (int64, int64) {
 	}
 	// TODO: Phase 3+ could also check WAL index for older data
 	return -1, -1
+}
+
+// LSO returns the last stable offset: min(HW, oldest open transaction's first offset).
+// For read_committed consumers. Caller must hold pd.mu.RLock().
+func (pd *PartData) LSO() int64 {
+	if len(pd.openTxnPIDs) == 0 {
+		return pd.hw
+	}
+	lso := pd.hw
+	for _, firstOffset := range pd.openTxnPIDs {
+		if firstOffset < lso {
+			lso = firstOffset
+		}
+	}
+	return lso
+}
+
+// AddOpenTxn records that a transactional producer has started writing to this partition.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) AddOpenTxn(producerID int64, firstOffset int64) {
+	if pd.openTxnPIDs == nil {
+		pd.openTxnPIDs = make(map[int64]int64)
+	}
+	if _, exists := pd.openTxnPIDs[producerID]; !exists {
+		pd.openTxnPIDs[producerID] = firstOffset
+	}
+}
+
+// RemoveOpenTxn removes the open transaction tracking for a producer.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) RemoveOpenTxn(producerID int64) {
+	delete(pd.openTxnPIDs, producerID)
+}
+
+// AddAbortedTxn adds an aborted transaction entry to this partition.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) AddAbortedTxn(entry AbortedTxnEntry) {
+	pd.abortedTxns = append(pd.abortedTxns, entry)
+}
+
+// AbortedTxnsInRange returns aborted transactions overlapping the given offset range.
+// Caller must hold pd.mu.RLock().
+func (pd *PartData) AbortedTxnsInRange(fetchOffset int64, lastOffset int64) []AbortedTxnEntry {
+	var result []AbortedTxnEntry
+	for _, e := range pd.abortedTxns {
+		if e.LastOffset < fetchOffset {
+			continue
+		}
+		if e.FirstOffset >= lastOffset {
+			continue
+		}
+		result = append(result, e)
+	}
+	return result
 }
 
 // BatchCount returns the number of stored batches.

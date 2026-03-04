@@ -34,6 +34,9 @@ type State struct {
 
 	// Metadata log (Phase 3+)
 	metaLog *metadata.Log
+
+	// Producer ID / transaction management (Phase 4)
+	pidManager *ProducerIDManager
 }
 
 // Config holds cluster-level configuration relevant to state management.
@@ -46,12 +49,18 @@ type Config struct {
 // NewState creates a new empty cluster state.
 func NewState(cfg Config) *State {
 	return &State{
-		topics: make(map[string]*TopicData),
-		tnorms: make(map[string]string),
-		groups: make(map[string]*Group),
-		cfg:    cfg,
-		logger: slog.Default(),
+		topics:     make(map[string]*TopicData),
+		tnorms:     make(map[string]string),
+		groups:     make(map[string]*Group),
+		cfg:        cfg,
+		logger:     slog.Default(),
+		pidManager: NewProducerIDManager(),
 	}
+}
+
+// PIDManager returns the producer ID manager.
+func (s *State) PIDManager() *ProducerIDManager {
+	return s.pidManager
 }
 
 // SetShutdownCh sets the shutdown channel used by group goroutines.
@@ -460,7 +469,16 @@ func (s *State) SnapshotEntries() [][]byte {
 		}
 	}
 
-	// 3. LOG_START_OFFSET entries for partitions with logStart > 0
+	// 3. PRODUCER_ID entry
+	nextPID := s.pidManager.NextPID()
+	if nextPID > 1 {
+		e := metadata.MarshalProducerID(&metadata.ProducerIDEntry{
+			NextProducerID: nextPID,
+		})
+		entries = append(entries, e)
+	}
+
+	// 4. LOG_START_OFFSET entries for partitions with logStart > 0
 	for _, td := range s.topics {
 		for _, pd := range td.Partitions {
 			pd.mu.RLock()

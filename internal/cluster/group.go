@@ -1337,6 +1337,28 @@ func (g *Group) validateInstanceID(instanceID *string, memberID string) *kerr.Er
 	return nil
 }
 
+// ApplyTxnOffset applies a pending transactional offset commit.
+// Must be called within the group goroutine (via Control).
+func (g *Group) ApplyTxnOffset(tp TopicPartition, po PendingTxnOffset) {
+	g.offsets[tp] = CommittedOffset{
+		Offset:      po.Offset,
+		LeaderEpoch: po.LeaderEpoch,
+		Metadata:    po.Metadata,
+		CommitTime:  time.Now(),
+	}
+	// Persist to metadata.log
+	if g.metaLog != nil {
+		entry := metadata.MarshalOffsetCommit(&metadata.OffsetCommitEntry{
+			Group:     g.id,
+			Topic:     tp.Topic,
+			Partition: tp.Partition,
+			Offset:    po.Offset,
+			Metadata:  po.Metadata,
+		})
+		g.metaLog.Append(entry) //nolint:errcheck
+	}
+}
+
 // derefStr dereferences a *string, returning empty string if nil.
 func derefStr(s *string) string {
 	if s == nil {
