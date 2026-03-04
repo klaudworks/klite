@@ -550,6 +550,8 @@ func (w *Writer) ReadBatch(entry IndexEntry) ([]byte, error) {
 
 // Replay scans all WAL segments and calls fn for each valid entry.
 // Used during startup to rebuild in-memory state.
+// If the last segment has a corrupted tail (CRC mismatch or truncated entry),
+// it is truncated at the last valid entry boundary.
 func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64) error) error {
 	seqs, err := w.scanExistingSegments()
 	if err != nil {
@@ -558,18 +560,20 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 
 	var maxSeq uint64
 
-	for _, seq := range seqs {
+	for i, seq := range seqs {
 		segPath := filepath.Join(w.walDir, segmentFilename(seq))
 		f, err := os.Open(segPath)
 		if err != nil {
 			return fmt.Errorf("open segment %d for replay: %w", seq, err)
 		}
 
-		var offset int64
+		var offset int64      // tracks current valid scan position
+		var lastValid int64   // position after last valid entry
+
 		_, scanErr := ScanFramedEntries(f, func(payload []byte) bool {
 			entry, parseErr := UnmarshalEntry(payload)
 			if parseErr != nil {
-				w.logger.Warn("skipping corrupted WAL entry during replay",
+				w.logger.Warn("corrupted WAL entry during replay, stopping scan",
 					"segment", seq, "offset", offset, "err", parseErr)
 				return false // stop scanning this segment
 			}
@@ -586,6 +590,7 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 			}
 
 			offset += entrySize
+			lastValid = offset
 			return true
 		})
 
@@ -593,6 +598,21 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 
 		if scanErr != nil {
 			return fmt.Errorf("scan segment %d: %w", seq, scanErr)
+		}
+
+		// Truncate the last segment at the last valid entry if there's trailing
+		// data (corrupted CRC, truncated entry, or garbage bytes).
+		// Only truncate the last segment — earlier segments should be fully intact.
+		isLast := (i == len(seqs)-1)
+		if isLast {
+			stat, statErr := os.Stat(segPath)
+			if statErr == nil && stat.Size() > lastValid {
+				w.logger.Warn("truncating corrupted tail of last WAL segment",
+					"segment", seq, "valid_size", lastValid, "file_size", stat.Size())
+				if truncErr := os.Truncate(segPath, lastValid); truncErr != nil {
+					w.logger.Error("failed to truncate WAL segment", "err", truncErr)
+				}
+			}
 		}
 	}
 

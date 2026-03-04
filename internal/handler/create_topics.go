@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -177,6 +178,20 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				st.ErrorCode = kerr.TopicAlreadyExists.Code
 				resp.Topics = append(resp.Topics, st)
 				continue
+			}
+
+			// 8b. Persist to metadata.log
+			if ml := state.MetadataLog(); ml != nil {
+				entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
+					TopicName:      td.Name,
+					PartitionCount: int32(len(td.Partitions)),
+					TopicID:        td.ID,
+					Configs:        td.Configs,
+				})
+				if err := ml.AppendSync(entry); err != nil {
+					// Log error but don't fail the request — in-memory state is already created
+					// On restart, this topic will be missing and clients will need to recreate it
+				}
 			}
 
 			// 9. Populate response

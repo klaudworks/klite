@@ -50,17 +50,17 @@ description: Solutions for common klite issues.
 
 1. Ensure you published the port:
    ```bash
-   docker run -p 9092:9092 ghcr.io/kliteio/klite
+   docker run -p 9092:9092 ghcr.io/klaudworks/klite
    ```
 
 2. Set the advertised address:
    ```bash
-   docker run -p 9092:9092 ghcr.io/kliteio/klite --advertised-addr localhost:9092
+   docker run -p 9092:9092 ghcr.io/klaudworks/klite --advertised-addr localhost:9092
    ```
 
 3. On Linux with Docker bridge networking, you may need `--network host`:
    ```bash
-   docker run --network host ghcr.io/kliteio/klite
+   docker run --network host ghcr.io/klaudworks/klite
    ```
 
 ### Docker Compose: services can't reach klite
@@ -72,7 +72,7 @@ description: Solutions for common klite issues.
 ```yaml
 services:
   klite:
-    image: ghcr.io/kliteio/klite
+    image: ghcr.io/klaudworks/klite
     command: ["--advertised-addr", "klite:9092"]
     ports:
       - "9092:9092"
@@ -163,7 +163,7 @@ mkdir -p ./data
 chmod 755 ./data
 
 # In Docker, ensure the container user has access:
-docker run -p 9092:9092 -v ./data:/data --user $(id -u):$(id -g) ghcr.io/kliteio/klite --data-dir /data
+docker run -p 9092:9092 -v ./data:/data --user $(id -u):$(id -g) ghcr.io/klaudworks/klite --data-dir /data
 ```
 
 ## Startup issues

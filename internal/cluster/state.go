@@ -4,8 +4,10 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/wal"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -26,6 +28,9 @@ type State struct {
 	walWriter      *wal.Writer
 	walIndex       *wal.Index
 	ringBufferMem  int64 // global memory budget for ring buffers
+
+	// Metadata log (Phase 3+)
+	metaLog *metadata.Log
 }
 
 // Config holds cluster-level configuration relevant to state management.
@@ -297,6 +302,9 @@ func (s *State) GetOrCreateGroup(groupID string) *Group {
 		return g
 	}
 	g = NewGroup(groupID, s.shutdownCh, s.logger)
+	if s.metaLog != nil {
+		g.SetMetadataLog(s.metaLog)
+	}
 	s.groups[groupID] = g
 	return g
 }
@@ -402,6 +410,157 @@ func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfig
 			td.Configs[c.Name] = *c.Value
 		}
 	}
+}
+
+// SetMetadataLog sets the metadata log reference.
+func (s *State) SetMetadataLog(ml *metadata.Log) {
+	s.metaLog = ml
+}
+
+// MetadataLog returns the metadata log, or nil if not set.
+func (s *State) MetadataLog() *metadata.Log {
+	return s.metaLog
+}
+
+// SnapshotEntries generates serialized metadata entries for all live state.
+// Used by compaction. Caller should acquire cluster state read lock first
+// (or this is called from within the metadata log's compaction lock).
+func (s *State) SnapshotEntries() [][]byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var entries [][]byte
+
+	// 1. CREATE_TOPIC entries for all topics
+	for _, td := range s.topics {
+		e := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
+			TopicName:      td.Name,
+			PartitionCount: int32(len(td.Partitions)),
+			TopicID:        td.ID,
+			Configs:        td.Configs,
+		})
+		entries = append(entries, e)
+	}
+
+	// 2. OFFSET_COMMIT entries for all groups
+	for _, g := range s.groups {
+		offsets := g.GetCommittedOffsets()
+		for tp, co := range offsets {
+			e := metadata.MarshalOffsetCommit(&metadata.OffsetCommitEntry{
+				Group:     g.ID(),
+				Topic:     tp.Topic,
+				Partition: tp.Partition,
+				Offset:    co.Offset,
+				Metadata:  co.Metadata,
+			})
+			entries = append(entries, e)
+		}
+	}
+
+	// 3. LOG_START_OFFSET entries for partitions with logStart > 0
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			pd.mu.RLock()
+			ls := pd.logStart
+			pd.mu.RUnlock()
+			if ls > 0 {
+				e := metadata.MarshalLogStartOffset(&metadata.LogStartOffsetEntry{
+					TopicName:      td.Name,
+					Partition:      pd.Index,
+					LogStartOffset: ls,
+				})
+				entries = append(entries, e)
+			}
+		}
+	}
+
+	return entries
+}
+
+// CreateTopicFromReplay creates a topic during metadata.log replay.
+// Unlike CreateTopic, this accepts a specific topic ID.
+func (s *State) CreateTopicFromReplay(name string, numPartitions int, topicID [16]byte, configs map[string]string) *TopicData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If topic already exists, skip (handles duplicate entries in log)
+	if td, ok := s.topics[name]; ok {
+		return td
+	}
+
+	partitions := make([]*PartData, numPartitions)
+	for i := range partitions {
+		partitions[i] = &PartData{
+			Topic:                name,
+			Index:                int32(i),
+			TopicID:              topicID,
+			maxTimestampBatchIdx: -1,
+		}
+	}
+
+	td := &TopicData{
+		Name:       name,
+		ID:         topicID,
+		Partitions: partitions,
+		Configs:    make(map[string]string),
+	}
+	for k, v := range configs {
+		td.Configs[k] = v
+	}
+
+	s.topics[name] = td
+	s.tnorms[NormalizeTopicName(name)] = name
+
+	return td
+}
+
+// SetCommittedOffsetFromReplay sets a committed offset during replay.
+// This bypasses the group goroutine since it's used during startup.
+func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition int32, offset int64, metadataStr string) {
+	s.mu.Lock()
+	g, ok := s.groups[groupID]
+	if !ok {
+		g = NewGroup(groupID, s.shutdownCh, s.logger)
+		if s.metaLog != nil {
+			g.SetMetadataLog(s.metaLog)
+		}
+		s.groups[groupID] = g
+	}
+	s.mu.Unlock()
+
+	g.Control(func() {
+		g.offsets[TopicPartition{Topic: topic, Partition: partition}] = CommittedOffset{
+			Offset:     offset,
+			Metadata:   metadataStr,
+			CommitTime: time.Now(),
+		}
+	})
+}
+
+// SetLogStartOffsetFromReplay sets the logStartOffset for a partition during replay.
+func (s *State) SetLogStartOffsetFromReplay(topicName string, partition int32, logStart int64) {
+	s.mu.RLock()
+	td, ok := s.topics[topicName]
+	s.mu.RUnlock()
+	if !ok || int(partition) >= len(td.Partitions) {
+		return
+	}
+
+	pd := td.Partitions[partition]
+	pd.mu.Lock()
+	if logStart > pd.logStart {
+		pd.logStart = logStart
+		if pd.hw < logStart {
+			pd.hw = logStart
+			if pd.nextReserve < logStart {
+				pd.nextReserve = logStart
+			}
+			if pd.nextCommit < logStart {
+				pd.nextCommit = logStart
+			}
+		}
+	}
+	pd.mu.Unlock()
 }
 
 // StopAllGroups stops all group goroutines. Called during broker shutdown.

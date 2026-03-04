@@ -1,0 +1,77 @@
+version: 2
+
+project_name: klite
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/klite
+    binary: klite
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/klaudworks/klite:{{ .Version }}-amd64"
+    use: buildx
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source=https://github.com/klaudworks/klite"
+    goarch: amd64
+
+  - image_templates:
+      - "ghcr.io/klaudworks/klite:{{ .Version }}-arm64"
+    use: buildx
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source=https://github.com/klaudworks/klite"
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/klaudworks/klite:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/klaudworks/klite:{{ .Version }}-amd64"
+      - "ghcr.io/klaudworks/klite:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/klaudworks/klite:latest"
+    image_templates:
+      - "ghcr.io/klaudworks/klite:{{ .Version }}-amd64"
+      - "ghcr.io/klaudworks/klite:{{ .Version }}-arm64"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+      - "^test:"
+
+release:
+  github:
+    owner: klaudworks
+    name: klite
+  prerelease: auto

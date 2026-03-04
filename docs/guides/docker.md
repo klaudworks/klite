@@ -8,7 +8,7 @@ Run klite as a container with a single command. The official image is available 
 ## Quick start
 
 ```bash
-docker run -p 9092:9092 ghcr.io/kliteio/klite
+docker run -p 9092:9092 ghcr.io/klaudworks/klite
 ```
 
 Your Kafka clients can now connect to `localhost:9092`.
@@ -20,7 +20,7 @@ By default, data is stored inside the container and lost when it stops. Mount a 
 ```bash
 docker run -p 9092:9092 \
   -v klite-data:/data \
-  ghcr.io/kliteio/klite \
+  ghcr.io/klaudworks/klite \
   --data-dir /data
 ```
 
@@ -29,7 +29,7 @@ Or bind-mount a host directory:
 ```bash
 docker run -p 9092:9092 \
   -v $(pwd)/klite-data:/data \
-  ghcr.io/kliteio/klite \
+  ghcr.io/klaudworks/klite \
   --data-dir /data
 ```
 
@@ -43,7 +43,7 @@ docker run -p 9092:9092 \
   -e KLITE_DEFAULT_PARTITIONS=3 \
   -e KLITE_AUTO_CREATE_TOPICS=true \
   -v klite-data:/data \
-  ghcr.io/kliteio/klite \
+  ghcr.io/klaudworks/klite \
   --data-dir /data
 ```
 
@@ -51,7 +51,7 @@ Or pass flags directly:
 
 ```bash
 docker run -p 9092:9092 \
-  ghcr.io/kliteio/klite \
+  ghcr.io/klaudworks/klite \
   --log-level debug \
   --default-partitions 3 \
   --data-dir /data
@@ -65,7 +65,7 @@ When running in Docker, clients outside the container need to reach the broker. 
 
 ```bash
 docker run -p 9092:9092 \
-  ghcr.io/kliteio/klite \
+  ghcr.io/klaudworks/klite \
   --advertised-addr host.docker.internal:9092
 ```
 
@@ -82,7 +82,7 @@ docker run -p 9092:9092 \
   -e AWS_ACCESS_KEY_ID=your-key \
   -e AWS_SECRET_ACCESS_KEY=your-secret \
   -v klite-data:/data \
-  ghcr.io/kliteio/klite \
+  ghcr.io/klaudworks/klite \
   --data-dir /data
 ```
 
@@ -94,7 +94,7 @@ docker run -p 9092:9092 \
   -e KLITE_S3_ENDPOINT=http://minio:9000 \
   -e AWS_ACCESS_KEY_ID=minioadmin \
   -e AWS_SECRET_ACCESS_KEY=minioadmin \
-  ghcr.io/kliteio/klite
+  ghcr.io/klaudworks/klite
 ```
 
 ## Docker Compose
@@ -105,7 +105,7 @@ A complete local setup with klite, a producer, and a consumer:
 # docker-compose.yml
 services:
   klite:
-    image: ghcr.io/kliteio/klite
+    image: ghcr.io/klaudworks/klite
     ports:
       - "9092:9092"
     volumes:
@@ -131,7 +131,7 @@ volumes:
 # docker-compose.yml
 services:
   klite:
-    image: ghcr.io/kliteio/klite
+    image: ghcr.io/klaudworks/klite
     ports:
       - "9092:9092"
     environment:
