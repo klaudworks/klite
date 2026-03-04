@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 type State struct {
 	mu     sync.RWMutex
 	topics map[string]*TopicData // topic name -> topic
+	tnorms map[string]string     // normalized name -> actual topic name (collision detection)
 	cfg    Config
 }
 
@@ -25,8 +27,27 @@ type Config struct {
 func NewState(cfg Config) *State {
 	return &State{
 		topics: make(map[string]*TopicData),
+		tnorms: make(map[string]string),
 		cfg:    cfg,
 	}
+}
+
+// NormalizeTopicName normalizes a topic name for collision detection.
+// Kafka considers topics that differ only in '.' vs '_' as colliding.
+func NormalizeTopicName(name string) string {
+	return strings.ReplaceAll(name, ".", "_")
+}
+
+// CheckCollision checks whether the given topic name collides with any existing
+// topic after dot/underscore normalization. Returns the colliding existing topic
+// name if a collision exists, or empty string if no collision.
+// Caller must hold s.mu.RLock() or s.mu.Lock().
+func (s *State) checkCollision(name string) string {
+	normalized := NormalizeTopicName(name)
+	if existing, ok := s.tnorms[normalized]; ok && existing != name {
+		return existing
+	}
+	return ""
 }
 
 // GetTopic returns the topic data for the given name, or nil if not found.
@@ -63,7 +84,50 @@ func (s *State) CreateTopic(name string, numPartitions int) (*TopicData, bool) {
 
 	td := newTopicData(name, numPartitions, s.cfg.NodeID)
 	s.topics[name] = td
+	s.tnorms[NormalizeTopicName(name)] = name
 	return td, true
+}
+
+// CreateTopicWithConfigs creates a new topic with the given name, partition count,
+// and configuration. Returns the created topic data and true if newly created.
+// Returns (existing, false) if the topic already exists.
+func (s *State) CreateTopicWithConfigs(name string, numPartitions int, configs map[string]string) (*TopicData, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if td, ok := s.topics[name]; ok {
+		return td, false
+	}
+
+	td := newTopicData(name, numPartitions, s.cfg.NodeID)
+	for k, v := range configs {
+		td.Configs[k] = v
+	}
+	s.topics[name] = td
+	s.tnorms[NormalizeTopicName(name)] = name
+	return td, true
+}
+
+// TopicExists returns whether a topic with the given name exists.
+func (s *State) TopicExists(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.topics[name]
+	return ok
+}
+
+// CheckTopicCollision checks whether the given topic name collides with any
+// existing topic after dot/underscore normalization (e.g., foo.bar vs foo_bar).
+// Returns the colliding topic name, or empty string if no collision.
+func (s *State) CheckTopicCollision(name string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.checkCollision(name)
+}
+
+// DefaultPartitions returns the configured default partition count.
+func (s *State) DefaultPartitions() int {
+	return s.cfg.DefaultPartitions
 }
 
 // GetOrCreateTopic returns the existing topic, or creates it if auto-create
@@ -99,6 +163,7 @@ func (s *State) DeleteTopic(name string) bool {
 	_, ok := s.topics[name]
 	if ok {
 		delete(s.topics, name)
+		delete(s.tnorms, NormalizeTopicName(name))
 	}
 	return ok
 }
