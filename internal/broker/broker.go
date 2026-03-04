@@ -79,6 +79,10 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 		State:          b.state,
 	}))
 	b.handlers.Register(19, handler.HandleCreateTopics(b.state))
+	b.handlers.Register(10, handler.HandleFindCoordinator(handler.FindCoordinatorConfig{
+		NodeID:         b.cfg.NodeID,
+		AdvertisedAddr: advAddr,
+	}))
 }
 
 // Run starts the broker and blocks until ctx is cancelled.
