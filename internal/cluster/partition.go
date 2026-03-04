@@ -79,7 +79,7 @@ func (pd *PartData) RUnlock() {
 // PushBatch appends a batch, assigns offset. Returns base offset.
 // Caller must hold pd.mu.Lock(). After releasing mu, caller should
 // call pd.NotifyWaiters() to wake long-polling Fetch requests.
-func (pd *PartData) PushBatch(raw []byte, meta batchMeta) int64 {
+func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 	baseOffset := pd.hw
 
 	// Make a copy of the raw bytes so we own them (the caller's buffer may be reused)

@@ -1,5 +1,12 @@
 # Fetch Handler (Key 1)
 
+> **NOTE:** A basic Fetch handler was added in `08-produce.md` to support
+> produce-consume integration tests. It lives in `internal/handler/fetch.go`
+> and handles the simple case (return available data, no long-polling, no
+> sessions, no MinBytes wait). This task should **extend** that handler with
+> the full implementation below (long-polling, fetch sessions, MinBytes/MaxWaitMs,
+> size limits, TopicID resolution for v13+).
+
 The most complex Phase 1 handler. After this work unit, clients can consume
 records from topics with long-polling, size limits, and KIP-74 behavior.
 

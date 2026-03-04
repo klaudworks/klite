@@ -18,9 +18,9 @@ func newTestPartition() *PartData {
 func pushTestBatch(t *testing.T, pd *PartData, numRecords int32, maxTimestamp int64) int64 {
 	t.Helper()
 	raw := makeSimpleBatch(numRecords, maxTimestamp)
-	meta, err := parseBatchHeader(raw)
+	meta, err := ParseBatchHeader(raw)
 	if err != nil {
-		t.Fatalf("parseBatchHeader failed: %v", err)
+		t.Fatalf("ParseBatchHeader failed: %v", err)
 	}
 	return pd.PushBatch(raw, meta)
 }
@@ -101,9 +101,9 @@ func TestPushBatch(t *testing.T) {
 		pd := newTestPartition()
 
 		raw := makeSimpleBatch(1, 1000)
-		meta, err := parseBatchHeader(raw)
+		meta, err := ParseBatchHeader(raw)
 		if err != nil {
-			t.Fatalf("parseBatchHeader failed: %v", err)
+			t.Fatalf("ParseBatchHeader failed: %v", err)
 		}
 
 		pd.Lock()
