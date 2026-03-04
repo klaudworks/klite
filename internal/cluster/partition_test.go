@@ -430,10 +430,10 @@ func TestListOffsets(t *testing.T) {
 			t.Errorf("Earliest on empty: got (%d, %d), want (0, -1)", off, ts)
 		}
 
-		// MaxTimestamp (-3)
+		// MaxTimestamp (-3) — empty partition returns (-1, -1) per kfake/Kafka behavior
 		off, ts = pd.ListOffsets(-3)
-		if off != 0 || ts != -1 {
-			t.Errorf("MaxTimestamp on empty: got (%d, %d), want (0, -1)", off, ts)
+		if off != -1 || ts != -1 {
+			t.Errorf("MaxTimestamp on empty: got (%d, %d), want (-1, -1)", off, ts)
 		}
 	})
 
@@ -493,9 +493,8 @@ func TestListOffsets(t *testing.T) {
 		pd.RUnlock()
 
 		// Max timestamp is in batch 1 (ts=5000), last offset in that batch = 3+1 = 4
-		// Return offset after batch = 4+1 = 5
-		if off != 5 {
-			t.Errorf("MaxTimestamp: got offset %d, want 5", off)
+		if off != 4 {
+			t.Errorf("MaxTimestamp: got offset %d, want 4", off)
 		}
 		if ts != 5000 {
 			t.Errorf("MaxTimestamp: got ts %d, want 5000", ts)
@@ -559,8 +558,9 @@ func TestListOffsets(t *testing.T) {
 		off, ts := pd.ListOffsets(3000) // beyond all batches
 		pd.RUnlock()
 
-		if off != 4 {
-			t.Errorf("Timestamp 3000: got offset %d, want 4 (HW)", off)
+		// No match returns (-1, -1) per Kafka/kfake behavior
+		if off != -1 {
+			t.Errorf("Timestamp 3000: got offset %d, want -1", off)
 		}
 		if ts != -1 {
 			t.Errorf("Timestamp 3000: got ts %d, want -1", ts)
@@ -688,7 +688,7 @@ func TestMaxTimestampTracking(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 1, 5000)
+		pushTestBatch(t, pd, 1, 5000) // 1 record: offsets 0-0
 		pd.Unlock()
 
 		pd.RLock()
@@ -698,8 +698,9 @@ func TestMaxTimestampTracking(t *testing.T) {
 		if ts != 5000 {
 			t.Errorf("MaxTimestamp: got %d, want 5000", ts)
 		}
-		if off != 1 {
-			t.Errorf("offset: got %d, want 1", off)
+		// Last offset in batch = BaseOffset(0) + LastOffsetDelta(0) = 0
+		if off != 0 {
+			t.Errorf("offset: got %d, want 0", off)
 		}
 	})
 
@@ -738,10 +739,9 @@ func TestMaxTimestampTracking(t *testing.T) {
 		if ts != 1000 {
 			t.Errorf("MaxTimestamp: got %d, want 1000", ts)
 		}
-		// Should point to the second batch (index 1), which has offset 1
-		// Return offset after batch = 1+0+1 = 2
-		if off != 2 {
-			t.Errorf("offset: got %d, want 2", off)
+		// Should point to the second batch (index 1), last offset = 1+0 = 1
+		if off != 1 {
+			t.Errorf("offset: got %d, want 1", off)
 		}
 	})
 }
