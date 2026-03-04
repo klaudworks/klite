@@ -10,11 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/server"
+	"github.com/klaudworks/klite/internal/wal"
 )
 
 // Broker is the top-level klite broker.
@@ -29,6 +31,8 @@ type Broker struct {
 	logger     *slog.Logger
 	server     *server.Server
 	handlers   *server.HandlerRegistry
+	walWriter  *wal.Writer // nil if WAL disabled
+	walIndex   *wal.Index  // nil if WAL disabled
 
 	mu   sync.Mutex
 	quit bool
@@ -71,7 +75,7 @@ func (b *Broker) registerBaseHandlers() {
 // registerRuntimeHandlers wires up handlers that depend on runtime state
 // (cluster ID, advertised address, etc.). Must be called after initialization.
 func (b *Broker) registerRuntimeHandlers(advAddr string) {
-	b.handlers.Register(0, handler.HandleProduce(b.state))
+	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter))
 	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh))
 	b.handlers.Register(2, handler.HandleListOffsets(b.state))
 	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
@@ -131,7 +135,14 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.clusterID = cid
 
-	// 3. Start TCP listener
+	// 3. Initialize WAL if enabled
+	if b.cfg.WALEnabled {
+		if err := b.initWAL(); err != nil {
+			return fmt.Errorf("init WAL: %w", err)
+		}
+	}
+
+	// 4. Start TCP listener
 	ln := b.cfg.Listener
 	if ln == nil {
 		ln, err = net.Listen("tcp", b.cfg.Listen)
@@ -141,29 +152,30 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.listener = ln
 
-	// 4. Resolve advertised address (after listener is bound so we know the real port)
+	// 5. Resolve advertised address (after listener is bound so we know the real port)
 	advAddr, warn := b.resolveAdvertisedAddr()
 	if warn {
 		b.logger.Warn("--advertised-addr not set, using derived address in Metadata responses; clients outside this host won't be able to connect",
 			"advertised_addr", advAddr)
 	}
 
-	// 5. Register handlers that depend on runtime state
+	// 6. Register handlers that depend on runtime state
 	b.registerRuntimeHandlers(advAddr)
 
-	// 6. Log startup
+	// 7. Log startup
 	b.logger.Info("klite started",
 		"listen", b.listener.Addr().String(),
 		"advertised_addr", advAddr,
 		"cluster_id", b.clusterID,
 		"node_id", b.cfg.NodeID,
 		"data_dir", b.cfg.DataDir,
+		"wal_enabled", b.cfg.WALEnabled,
 	)
 
 	// Signal that initialization is complete
 	close(b.ready)
 
-	// 7. Serve connections (blocks until listener closed)
+	// 8. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- b.server.Serve(b.listener)
@@ -180,22 +192,162 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	// 8. Shutdown sequence
+	// 9. Shutdown sequence
 	b.shutdown()
 
-	// 9. Wait for Serve() to return so no new connections are accepted
-	// (no more wg.Add calls after this point).
+	// 10. Wait for Serve() to return so no new connections are accepted
 	if !serveReturned {
 		<-errCh
 	}
 
-	// 10. Wait for all connections to drain
+	// 11. Wait for all connections to drain
 	b.server.Wait()
 
-	// 11. Stop all group goroutines
+	// 12. Stop all group goroutines
 	b.state.StopAllGroups()
 
+	// 13. Stop WAL writer (flush pending writes)
+	if b.walWriter != nil {
+		b.walWriter.Stop()
+	}
+
 	b.logger.Info("klite stopped")
+	return nil
+}
+
+// initWAL initializes the WAL writer and replays existing WAL segments.
+func (b *Broker) initWAL() error {
+	walDir := filepath.Join(b.cfg.DataDir, "wal")
+
+	idx := wal.NewIndex()
+	b.walIndex = idx
+
+	syncInterval := time.Duration(b.cfg.WALSyncIntervalMs) * time.Millisecond
+	if syncInterval == 0 {
+		syncInterval = 2 * time.Millisecond
+	}
+	segMaxBytes := b.cfg.WALSegmentMaxBytes
+	if segMaxBytes == 0 {
+		segMaxBytes = 64 * 1024 * 1024
+	}
+	maxDiskSize := b.cfg.WALMaxDiskSize
+	if maxDiskSize == 0 {
+		maxDiskSize = 1024 * 1024 * 1024
+	}
+
+	cfg := wal.WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    syncInterval,
+		SegmentMaxBytes: segMaxBytes,
+		MaxDiskSize:     maxDiskSize,
+		FsyncEnabled:    true,
+		Logger:          b.logger,
+	}
+
+	w, err := wal.NewWriter(cfg, idx)
+	if err != nil {
+		return fmt.Errorf("create WAL writer: %w", err)
+	}
+
+	// Replay existing WAL entries to rebuild state
+	if err := b.replayWAL(w); err != nil {
+		return fmt.Errorf("replay WAL: %w", err)
+	}
+
+	// Start the writer goroutine
+	if err := w.Start(); err != nil {
+		return fmt.Errorf("start WAL writer: %w", err)
+	}
+
+	b.walWriter = w
+
+	// Configure cluster state for WAL mode
+	ringMem := b.cfg.RingBufferMaxMem
+	if ringMem == 0 {
+		ringMem = 512 * 1024 * 1024 // 512 MiB
+	}
+	b.state.SetWALConfig(w, idx, ringMem)
+
+	b.logger.Info("WAL initialized",
+		"dir", walDir,
+		"sync_interval", syncInterval,
+		"segment_max_bytes", segMaxBytes,
+	)
+
+	return nil
+}
+
+// replayWAL scans existing WAL segments and rebuilds in-memory state.
+func (b *Broker) replayWAL(w *wal.Writer) error {
+	entryCount := 0
+	err := w.Replay(func(entry wal.Entry, segmentSeq uint64, fileOffset int64) error {
+		// Look up or create the topic by ID
+		td := b.state.GetTopicByID(entry.TopicID)
+		if td == nil {
+			// Topic might not exist yet (metadata.log not replayed).
+			// Skip entries for unknown topics during WAL-only replay.
+			return nil
+		}
+
+		if int(entry.Partition) >= len(td.Partitions) {
+			return nil // skip invalid partition
+		}
+
+		pd := td.Partitions[entry.Partition]
+
+		// Parse batch header to get metadata
+		meta, err := cluster.ParseBatchHeader(entry.Data)
+		if err != nil {
+			return nil // skip corrupted batch
+		}
+
+		// Rebuild partition state
+		pd.Lock()
+		batch := cluster.StoredBatch{
+			BaseOffset:      entry.Offset,
+			LastOffsetDelta: meta.LastOffsetDelta,
+			RawBytes:        entry.Data,
+			MaxTimestamp:    meta.MaxTimestamp,
+			NumRecords:      meta.NumRecords,
+		}
+
+		// Advance HW if needed
+		endOffset := entry.Offset + int64(meta.LastOffsetDelta) + 1
+		if endOffset > pd.HW() {
+			pd.SetHW(endOffset)
+		}
+
+		// If ring buffer is initialized, push to it
+		if pd.HasWAL() {
+			pd.CommitBatch(batch)
+		}
+		pd.Unlock()
+
+		// Add to WAL index
+		tp := wal.TopicPartition{TopicID: entry.TopicID, Partition: entry.Partition}
+		lastOffset := entry.Offset + int64(meta.LastOffsetDelta)
+		idxEntry := wal.IndexEntry{
+			BaseOffset:  entry.Offset,
+			LastOffset:  lastOffset,
+			SegmentSeq:  segmentSeq,
+			FileOffset:  fileOffset,
+			EntrySize:   int32(4 + 4 + 8 + 16 + 4 + 8 + len(entry.Data)), // length + crc + fixed payload + data
+			BatchSize:   int32(len(entry.Data)),
+			WALSequence: entry.Sequence,
+		}
+		b.walIndex.Add(tp, idxEntry)
+
+		entryCount++
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if entryCount > 0 {
+		b.logger.Info("WAL replay complete", "entries", entryCount)
+	}
 	return nil
 }
 

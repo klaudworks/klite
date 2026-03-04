@@ -108,12 +108,12 @@ func ValidateBatchCRC(raw []byte, expectedCRC uint32) bool {
 	return actual == expectedCRC
 }
 
-// assignOffset overwrites the BaseOffset (bytes 0-7) and
+// AssignOffset overwrites the BaseOffset (bytes 0-7) and
 // PartitionLeaderEpoch (bytes 12-15) in the raw batch bytes.
 // BaseOffset is set to the given value; PartitionLeaderEpoch is set to 0.
 // Both fields are outside the CRC-covered region (CRC covers bytes 21+),
 // so no CRC recalculation is needed.
-func assignOffset(raw []byte, baseOffset int64) {
+func AssignOffset(raw []byte, baseOffset int64) {
 	binary.BigEndian.PutUint64(raw[0:8], uint64(baseOffset))
 	binary.BigEndian.PutUint32(raw[12:16], 0) // PartitionLeaderEpoch = 0
 }

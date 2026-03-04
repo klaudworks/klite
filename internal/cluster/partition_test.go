@@ -745,3 +745,185 @@ func TestMaxTimestampTracking(t *testing.T) {
 		}
 	})
 }
+
+// --- Phase 3 tests: Ring Buffer, ReserveOffset, CommitBatch ---
+
+func newTestPartitionWithRing(slots int) *PartData {
+	pd := &PartData{
+		Topic:                "test-topic",
+		Index:                0,
+		TopicID:              [16]byte{1, 2, 3},
+		maxTimestampBatchIdx: -1,
+		ring:                 NewRingBuffer(slots),
+	}
+	return pd
+}
+
+func TestReserveOffset(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+
+	pd.Lock()
+	// Reserve 3 records: offsets 0, 1, 2
+	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2})
+	// Reserve 2 records: offsets 3, 4
+	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1})
+	pd.Unlock()
+
+	if base0 != 0 {
+		t.Errorf("first reserve base: got %d, want 0", base0)
+	}
+	if base1 != 3 {
+		t.Errorf("second reserve base: got %d, want 3", base1)
+	}
+}
+
+func TestCommitBatchInOrder(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+
+	raw0 := makeSimpleBatch(3, 1000)
+	raw1 := makeSimpleBatch(2, 2000)
+
+	pd.Lock()
+	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2})
+	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1})
+	pd.Unlock()
+
+	// Commit in order
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base0, LastOffsetDelta: 2,
+		RawBytes: raw0, MaxTimestamp: 1000, NumRecords: 3,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	if pd.HW() != 3 {
+		t.Errorf("HW after first commit: got %d, want 3", pd.HW())
+	}
+	pd.RUnlock()
+
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base1, LastOffsetDelta: 1,
+		RawBytes: raw1, MaxTimestamp: 2000, NumRecords: 2,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	if pd.HW() != 5 {
+		t.Errorf("HW after second commit: got %d, want 5", pd.HW())
+	}
+	pd.RUnlock()
+}
+
+func TestCommitBatchOutOfOrder(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+
+	pd.Lock()
+	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2}) // offsets 0-2
+	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1}) // offsets 3-4
+	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 5
+	pd.Unlock()
+
+	// Commit OUT of order: 2, 0, 1
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base2, LastOffsetDelta: 0,
+		RawBytes: makeSimpleBatch(1, 3000), MaxTimestamp: 3000, NumRecords: 1,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	// HW should still be 0 (waiting for base0)
+	if pd.HW() != 0 {
+		t.Errorf("HW after out-of-order commit: got %d, want 0", pd.HW())
+	}
+	pd.RUnlock()
+
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base0, LastOffsetDelta: 2,
+		RawBytes: makeSimpleBatch(3, 1000), MaxTimestamp: 1000, NumRecords: 3,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	// HW should be 3 (base0 committed, but base1 still missing)
+	if pd.HW() != 3 {
+		t.Errorf("HW after base0 commit: got %d, want 3", pd.HW())
+	}
+	pd.RUnlock()
+
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base1, LastOffsetDelta: 1,
+		RawBytes: makeSimpleBatch(2, 2000), MaxTimestamp: 2000, NumRecords: 2,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	// Now all 3 are committed, HW should be 6
+	if pd.HW() != 6 {
+		t.Errorf("HW after all commits: got %d, want 6", pd.HW())
+	}
+	pd.RUnlock()
+
+	_ = base0
+	_ = base1
+	_ = base2
+}
+
+func TestReadCascadeRingBuffer(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+
+	// Push some batches
+	pd.Lock()
+	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3})
+	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2})
+	pd.Unlock()
+
+	pd.RLock()
+	result := pd.FetchFrom(0, 1024*1024)
+	pd.RUnlock()
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(result))
+	}
+	if result[0].BaseOffset != 0 {
+		t.Errorf("batch 0 base: got %d, want 0", result[0].BaseOffset)
+	}
+	if result[1].BaseOffset != 3 {
+		t.Errorf("batch 1 base: got %d, want 3", result[1].BaseOffset)
+	}
+}
+
+func TestReadCascadeFetchFromMiddle(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithRing(64)
+
+	pd.Lock()
+	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3})
+	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2})
+	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1})
+	pd.Unlock()
+
+	pd.RLock()
+	result := pd.FetchFrom(3, 1024*1024) // Start at offset 3
+	pd.RUnlock()
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(result))
+	}
+	if result[0].BaseOffset != 3 {
+		t.Errorf("first batch base: got %d, want 3", result[0].BaseOffset)
+	}
+}

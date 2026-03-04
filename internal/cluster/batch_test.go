@@ -167,7 +167,7 @@ func TestAssignOffset(t *testing.T) {
 
 	raw := makeBatchBytes(0, 49, 99, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1)
 
-	assignOffset(raw, 42)
+	AssignOffset(raw, 42)
 
 	gotBase := int64(binary.BigEndian.Uint64(raw[0:8]))
 	if gotBase != 42 {

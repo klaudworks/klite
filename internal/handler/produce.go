@@ -6,13 +6,22 @@ import (
 
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
+	"github.com/klaudworks/klite/internal/wal"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // HandleProduce returns the Produce handler (API key 0).
 // Supports v3-11.
-func HandleProduce(state *cluster.State) server.Handler {
+//
+// If walWriter is non-nil, uses the durable path:
+//
+//	reserveOffset -> WAL append -> fsync -> commitBatch
+//
+// If walWriter is nil, uses the Phase 1 in-memory path:
+//
+//	PushBatch (assign + store + advance HW)
+func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ProduceRequest)
 
@@ -88,7 +97,6 @@ func HandleProduce(state *cluster.State) server.Handler {
 				}
 
 				// Step 2: Validate the batch covers the full Records slice
-				// BatchLength = total batch size - 12 (BaseOffset + BatchLength fields)
 				if int(meta.BatchLength) != len(raw)-12 {
 					sp.ErrorCode = kerr.CorruptMessage.Code
 					st.Partitions = append(st.Partitions, sp)
@@ -96,43 +104,59 @@ func HandleProduce(state *cluster.State) server.Handler {
 				}
 
 				// Step 3: Validate batch contents (BEFORE taking partition lock)
-				// 3a. Magic byte must be 2
 				if meta.Magic != 2 {
 					sp.ErrorCode = kerr.UnsupportedForMessageFormat.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
 				}
 
-				// 3b. Batch size check against max.message.bytes
 				if len(raw) > maxMessageBytes {
 					sp.ErrorCode = kerr.MessageTooLarge.Code
 					st.Partitions = append(st.Partitions, sp)
 					continue
 				}
 
-				// 3c. LogAppendTime: overwrite timestamps and recalculate CRC
 				if isLogAppendTime {
 					cluster.SetLogAppendTime(raw, now, &meta)
 				}
 
-				// Step 4: Append to partition under write lock
-				pd.Lock()
-				baseOffset := pd.PushBatch(raw, meta)
-				logStart := pd.LogStart()
-				pd.Unlock()
+				// Step 4: Append to partition
+				if walWriter != nil && pd.HasWAL() {
+					// Phase 3: WAL-aware path
+					baseOffset, logStart, walErr := produceWithWAL(pd, td, raw, meta, walWriter)
+					if walErr != nil {
+						sp.ErrorCode = kerr.KafkaStorageError.Code
+						st.Partitions = append(st.Partitions, sp)
+						continue
+					}
 
-				// Notify fetch waiters after releasing the partition lock
-				pd.NotifyWaiters()
+					sp.BaseOffset = baseOffset
+					sp.LogAppendTime = -1
+					if isLogAppendTime {
+						sp.LogAppendTime = now
+					}
+					if r.Version >= 5 {
+						sp.LogStartOffset = logStart
+					}
+				} else {
+					// Phase 1: in-memory path
+					pd.Lock()
+					baseOffset := pd.PushBatch(raw, meta)
+					logStart := pd.LogStart()
+					pd.Unlock()
 
-				// Step 5: Populate response
-				sp.BaseOffset = baseOffset
-				sp.LogAppendTime = -1
-				if isLogAppendTime {
-					sp.LogAppendTime = now
+					pd.NotifyWaiters()
+
+					sp.BaseOffset = baseOffset
+					sp.LogAppendTime = -1
+					if isLogAppendTime {
+						sp.LogAppendTime = now
+					}
+					if r.Version >= 5 {
+						sp.LogStartOffset = logStart
+					}
 				}
-				if r.Version >= 5 {
-					sp.LogStartOffset = logStart
-				}
+
 				st.Partitions = append(st.Partitions, sp)
 			}
 
@@ -145,6 +169,54 @@ func HandleProduce(state *cluster.State) server.Handler {
 
 		return resp, nil
 	}
+}
+
+// produceWithWAL implements the durable produce path:
+//  1. Reserve offset under partition lock
+//  2. Write to WAL (lock released during fsync wait)
+//  3. Commit batch under partition lock (advances HW in order)
+func produceWithWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (baseOffset int64, logStart int64, err error) {
+	// Make a copy so we own the bytes
+	stored := make([]byte, len(raw))
+	copy(stored, raw)
+
+	// Step 1: Reserve offset (brief write lock)
+	pd.Lock()
+	baseOffset = pd.ReserveOffset(meta)
+	logStart = pd.LogStart()
+	pd.Unlock()
+
+	// Assign the server-side offset into the raw bytes
+	cluster.AssignOffset(stored, baseOffset)
+
+	// Step 2: Write to WAL (pd.mu NOT held — Fetches can proceed)
+	walEntry := &wal.Entry{
+		TopicID:   td.ID,
+		Partition: pd.Index,
+		Offset:    baseOffset,
+		Data:      stored,
+	}
+
+	if err := walWriter.Append(walEntry); err != nil {
+		return 0, 0, err
+	}
+
+	// Step 3: Commit batch (brief write lock — advances HW in order)
+	batch := cluster.StoredBatch{
+		BaseOffset:      baseOffset,
+		LastOffsetDelta: meta.LastOffsetDelta,
+		RawBytes:        stored,
+		MaxTimestamp:    meta.MaxTimestamp,
+		NumRecords:      meta.NumRecords,
+	}
+
+	pd.Lock()
+	pd.CommitBatch(batch)
+	pd.Unlock()
+
+	pd.NotifyWaiters()
+
+	return baseOffset, logStart, nil
 }
 
 // getMaxMessageBytes returns the max.message.bytes config value for the topic.

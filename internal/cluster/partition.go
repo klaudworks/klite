@@ -3,6 +3,8 @@ package cluster
 import (
 	"sort"
 	"sync"
+
+	"github.com/klaudworks/klite/internal/wal"
 )
 
 // StoredBatch holds raw bytes and metadata extracted from the batch header.
@@ -39,19 +41,29 @@ func (w *FetchWaiter) CloseOnce() {
 	w.once.Do(func() { close(w.ch) })
 }
 
+// pendingBatch holds a batch waiting for sequential commit ordering.
+type pendingBatch struct {
+	StoredBatch
+}
+
 // PartData holds the state for a single partition.
 // Each partition has its own RWMutex. Produce takes a write lock,
 // Fetch takes a read lock. Different partitions are fully concurrent.
 //
 // Callers are responsible for holding the appropriate lock before
-// calling methods. Write methods (PushBatch) require mu.Lock().
-// Read methods (FetchFrom, SearchOffset, ListOffsets) require mu.RLock().
+// calling methods. Write methods (PushBatch, ReserveOffset, CommitBatch)
+// require mu.Lock(). Read methods (FetchFrom, SearchOffset, ListOffsets)
+// require mu.RLock().
+//
+// Phase 1 (ring==nil): uses batches slice, PushBatch does assign+store.
+// Phase 3 (ring!=nil): uses ring buffer, ReserveOffset+CommitBatch flow.
 type PartData struct {
 	mu sync.RWMutex // protects all fields below
 
 	Topic    string
 	Index    int32
-	batches  []StoredBatch // Phase 1: unbounded append-only slice
+	TopicID  [16]byte      // Topic UUID, used for WAL entries
+	batches  []StoredBatch // Phase 1: unbounded append-only slice (used when ring==nil)
 	logStart int64         // Earliest available offset (0 initially)
 	hw       int64         // High watermark = next offset to assign (= LEO for single broker)
 
@@ -61,6 +73,17 @@ type PartData struct {
 	// Fetch waiters (long polling) -- see 09-fetch.md
 	waiterMu sync.Mutex      // separate lock for waiter list (not RWMutex)
 	waiters  []*FetchWaiter  // each waiter holds a shared wake channel
+
+	// Phase 3+ fields (set when WAL is enabled)
+	ring               *RingBuffer    // in-memory ring buffer for recent batches
+	walWriter          *wal.Writer    // reference to WAL writer (nil in Phase 1)
+	walIndex           *wal.Index     // reference to WAL index for read-path lookups
+	nextReserve        int64          // next offset to hand out (advances on reserve)
+	nextCommit         int64          // next offset expected in commitBatch
+	pendingCommits     []pendingBatch // out-of-order commits waiting for earlier ones
+	totalBytes         int64          // running total of raw RecordBatch bytes
+	maxTimestampVal    int64          // max timestamp value (ring buffer mode)
+	maxTimestampOffset int64          // offset associated with max timestamp (ring buffer mode)
 }
 
 // HW returns the current high watermark (next offset to be assigned).
@@ -95,9 +118,39 @@ func (pd *PartData) RUnlock() {
 	pd.mu.RUnlock()
 }
 
+// InitWAL initializes the WAL-aware fields on this partition.
+// Called when the broker enables WAL persistence.
+func (pd *PartData) InitWAL(ring *RingBuffer, writer *wal.Writer, idx *wal.Index) {
+	pd.ring = ring
+	pd.walWriter = writer
+	pd.walIndex = idx
+	pd.nextReserve = pd.hw
+	pd.nextCommit = pd.hw
+}
+
+// SetHW sets the high watermark directly. Used during WAL replay.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) SetHW(hw int64) {
+	pd.hw = hw
+	if pd.nextReserve < hw {
+		pd.nextReserve = hw
+	}
+	if pd.nextCommit < hw {
+		pd.nextCommit = hw
+	}
+}
+
+// HasWAL returns whether this partition has WAL enabled.
+func (pd *PartData) HasWAL() bool {
+	return pd.ring != nil
+}
+
 // PushBatch appends a batch, assigns offset. Returns base offset.
 // Caller must hold pd.mu.Lock(). After releasing mu, caller should
 // call pd.NotifyWaiters() to wake long-polling Fetch requests.
+//
+// Phase 1 path (no WAL): assigns offset, stores in batches slice.
+// When ring is set, use ReserveOffset + CommitBatch instead.
 func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 	baseOffset := pd.hw
 
@@ -106,7 +159,7 @@ func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 	copy(stored, raw)
 
 	// Assign server-side base offset and PartitionLeaderEpoch
-	assignOffset(stored, baseOffset)
+	AssignOffset(stored, baseOffset)
 
 	// Advance high watermark
 	pd.hw = baseOffset + int64(meta.LastOffsetDelta) + 1
@@ -119,15 +172,90 @@ func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 		NumRecords:      meta.NumRecords,
 	}
 
-	pd.batches = append(pd.batches, batch)
+	if pd.ring != nil {
+		// Phase 3: use ring buffer
+		pd.ring.Push(batch)
+		pd.nextReserve = pd.hw
+		pd.nextCommit = pd.hw
+		pd.totalBytes += int64(len(stored))
+	} else {
+		// Phase 1: unbounded slice
+		pd.batches = append(pd.batches, batch)
+	}
 
 	// Update maxTimestamp tracking for ListOffsets -3 (KIP-734)
-	batchIdx := len(pd.batches) - 1
-	if pd.maxTimestampBatchIdx < 0 || meta.MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
-		pd.maxTimestampBatchIdx = batchIdx
+	if pd.ring != nil {
+		pd.updateMaxTimestampRing(batch)
+	} else {
+		batchIdx := len(pd.batches) - 1
+		if pd.maxTimestampBatchIdx < 0 || meta.MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
+			pd.maxTimestampBatchIdx = batchIdx
+		}
 	}
 
 	return baseOffset
+}
+
+// ReserveOffset reserves an offset range for a batch without storing data.
+// Called under pd.mu.Lock(). Returns the assigned base offset.
+// After this call, the caller should write to WAL (without holding the lock),
+// wait for fsync, then call CommitBatch.
+func (pd *PartData) ReserveOffset(meta BatchMeta) int64 {
+	base := pd.nextReserve
+	pd.nextReserve = base + int64(meta.LastOffsetDelta) + 1
+	return base
+}
+
+// CommitBatch stores a batch in the ring buffer after WAL fsync completes.
+// Called under pd.mu.Lock(). Advances HW in strict offset order.
+func (pd *PartData) CommitBatch(batch StoredBatch) {
+	if batch.BaseOffset == pd.nextCommit {
+		// In order: apply immediately
+		pd.ring.Push(batch)
+		pd.totalBytes += int64(len(batch.RawBytes))
+		pd.nextCommit = batch.BaseOffset + int64(batch.LastOffsetDelta) + 1
+		pd.hw = pd.nextCommit
+		pd.updateMaxTimestampRing(batch)
+
+		// Drain any queued commits that are now in order
+		for len(pd.pendingCommits) > 0 && pd.pendingCommits[0].BaseOffset == pd.nextCommit {
+			next := pd.pendingCommits[0].StoredBatch
+			pd.pendingCommits = pd.pendingCommits[1:]
+			pd.ring.Push(next)
+			pd.totalBytes += int64(len(next.RawBytes))
+			pd.nextCommit = next.BaseOffset + int64(next.LastOffsetDelta) + 1
+			pd.hw = pd.nextCommit
+			pd.updateMaxTimestampRing(next)
+		}
+	} else {
+		// Out of order: queue until earlier offsets commit
+		pd.insertPendingCommit(batch)
+	}
+}
+
+// insertPendingCommit adds a batch to the pending commits queue in sorted order.
+func (pd *PartData) insertPendingCommit(batch StoredBatch) {
+	pb := pendingBatch{StoredBatch: batch}
+	idx := sort.Search(len(pd.pendingCommits), func(i int) bool {
+		return pd.pendingCommits[i].BaseOffset > batch.BaseOffset
+	})
+	pd.pendingCommits = append(pd.pendingCommits, pendingBatch{})
+	copy(pd.pendingCommits[idx+1:], pd.pendingCommits[idx:])
+	pd.pendingCommits[idx] = pb
+}
+
+// updateMaxTimestampRing updates max timestamp tracking for ring buffer mode.
+// Uses the ring buffer's newest offset as the reference.
+func (pd *PartData) updateMaxTimestampRing(batch StoredBatch) {
+	if pd.maxTimestampBatchIdx < 0 {
+		// Use a sentinel value that means "check ring buffer"
+		pd.maxTimestampBatchIdx = 0
+		pd.maxTimestampVal = batch.MaxTimestamp
+		pd.maxTimestampOffset = batch.BaseOffset + int64(batch.LastOffsetDelta)
+	} else if batch.MaxTimestamp >= pd.maxTimestampVal {
+		pd.maxTimestampVal = batch.MaxTimestamp
+		pd.maxTimestampOffset = batch.BaseOffset + int64(batch.LastOffsetDelta)
+	}
 }
 
 // NotifyWaiters wakes all registered fetch waiters.
@@ -158,6 +286,7 @@ func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 //   - found=false, atEnd=true: offset >= HW (past the end)
 //   - found=false, atEnd=false: offset < logStart (before start)
 //
+// Phase 1 only (uses batches slice). In Phase 3, use FetchFrom directly.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) SearchOffset(offset int64) (index int, found bool, atEnd bool) {
 	if len(pd.batches) == 0 {
@@ -198,8 +327,26 @@ func (pd *PartData) SearchOffset(offset int64) (index int, found bool, atEnd boo
 // KIP-74: always includes at least one complete batch even if it exceeds maxBytes.
 // Returns nil if no batches match.
 // Caller must hold pd.mu.RLock().
+//
+// In Phase 3 (ring != nil), implements the three-tier read cascade:
+// 1. Ring buffer (memory)
+// 2. WAL index + pread
+// 3. (Phase 4: S3 range read)
 func (pd *PartData) FetchFrom(offset int64, maxBytes int32) []StoredBatch {
-	if len(pd.batches) == 0 || offset >= pd.hw {
+	if offset >= pd.hw {
+		return nil
+	}
+
+	if pd.ring != nil {
+		return pd.fetchFromTiered(offset, maxBytes)
+	}
+
+	return pd.fetchFromSlice(offset, maxBytes)
+}
+
+// fetchFromSlice is the Phase 1 fetch path using the batches slice.
+func (pd *PartData) fetchFromSlice(offset int64, maxBytes int32) []StoredBatch {
+	if len(pd.batches) == 0 {
 		return nil
 	}
 
@@ -237,6 +384,49 @@ func (pd *PartData) FetchFrom(offset int64, maxBytes int32) []StoredBatch {
 	return result
 }
 
+// fetchFromTiered implements the Phase 3 three-tier read cascade.
+func (pd *PartData) fetchFromTiered(offset int64, maxBytes int32) []StoredBatch {
+	// Tier 1: Ring buffer (memory) — only if the requested offset is within the ring
+	oldest := pd.ring.OldestOffset()
+	if oldest >= 0 && offset >= oldest {
+		if batches := pd.ring.CollectFrom(offset, maxBytes); len(batches) > 0 {
+			return batches
+		}
+	}
+
+	// Tier 2: WAL via index + pread
+	if pd.walIndex != nil && pd.walWriter != nil {
+		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
+		entries := pd.walIndex.Lookup(tp, offset, maxBytes)
+		if len(entries) > 0 {
+			var result []StoredBatch
+			for _, e := range entries {
+				data, err := pd.walWriter.ReadBatch(e)
+				if err != nil {
+					break // fall through to next tier or return what we have
+				}
+				meta, err := ParseBatchHeader(data)
+				if err != nil {
+					break
+				}
+				result = append(result, StoredBatch{
+					BaseOffset:      e.BaseOffset,
+					LastOffsetDelta: meta.LastOffsetDelta,
+					RawBytes:        data,
+					MaxTimestamp:    meta.MaxTimestamp,
+					NumRecords:      meta.NumRecords,
+				})
+			}
+			if len(result) > 0 {
+				return result
+			}
+		}
+	}
+
+	// Tier 3 (Phase 4): S3 range read — not yet implemented
+	return nil
+}
+
 // ListOffsets resolves a timestamp query for this partition.
 //
 //	timestamp -1 (Latest):       returns HW (next offset to be produced)
@@ -253,42 +443,66 @@ func (pd *PartData) ListOffsets(timestamp int64) (offset int64, ts int64) {
 	case -2: // Earliest
 		return pd.logStart, -1
 	case -3: // MaxTimestamp (KIP-734)
+		if pd.ring != nil {
+			// Ring buffer mode
+			if pd.maxTimestampBatchIdx < 0 {
+				return -1, -1
+			}
+			return pd.maxTimestampOffset, pd.maxTimestampVal
+		}
+		// Phase 1 slice mode
 		if len(pd.batches) == 0 || pd.maxTimestampBatchIdx < 0 {
 			return -1, -1
 		}
 		b := &pd.batches[pd.maxTimestampBatchIdx]
-		// Return the last offset in the batch with the max timestamp.
-		// Kafka returns the exact record offset, but since we don't decompress
-		// batches, we return the last offset in the batch (matches kfake).
 		return b.BaseOffset + int64(b.LastOffsetDelta), b.MaxTimestamp
 	default: // timestamp >= 0: find first batch with MaxTimestamp >= timestamp
+		if pd.ring != nil {
+			return pd.listOffsetsRingTimestamp(timestamp)
+		}
 		if len(pd.batches) == 0 {
 			return -1, -1
 		}
-
-		// Linear scan — batches are in offset order, timestamps may not be
-		// strictly ordered (CreateTime mode allows client-set timestamps).
-		// For correctness, we find the first batch whose MaxTimestamp >= timestamp.
 		for i := range pd.batches {
 			if pd.batches[i].MaxTimestamp >= timestamp {
 				return pd.batches[i].BaseOffset, pd.batches[i].MaxTimestamp
 			}
 		}
-
-		// No batch has timestamp >= requested: return -1 (not found)
 		return -1, -1
 	}
+}
+
+// listOffsetsRingTimestamp scans the ring buffer for a timestamp match.
+func (pd *PartData) listOffsetsRingTimestamp(timestamp int64) (int64, int64) {
+	if pd.ring == nil || pd.ring.Len() == 0 {
+		return -1, -1
+	}
+	for seq := pd.ring.head; seq < pd.ring.tail; seq++ {
+		slot := int(seq % int64(pd.ring.capacity))
+		b := pd.ring.batches[slot]
+		if b.MaxTimestamp >= timestamp {
+			return b.BaseOffset, b.MaxTimestamp
+		}
+	}
+	// TODO: Phase 3+ could also check WAL index for older data
+	return -1, -1
 }
 
 // BatchCount returns the number of stored batches.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) BatchCount() int {
+	if pd.ring != nil {
+		return pd.ring.Len()
+	}
 	return len(pd.batches)
 }
 
 // TotalBytes returns the total bytes of stored batch data.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) TotalBytes() int64 {
+	if pd.ring != nil {
+		return pd.totalBytes
+	}
 	var total int64
 	for i := range pd.batches {
 		total += int64(len(pd.batches[i].RawBytes))
@@ -308,7 +522,17 @@ func (pd *PartData) AdvanceLogStart(offset int64) {
 	}
 	pd.logStart = offset
 
-	// Trim batches whose last offset is before the new logStart
+	if pd.ring != nil {
+		// Ring buffer mode: the ring automatically evicts old data as new
+		// data is pushed. We just need to prune the WAL index.
+		if pd.walIndex != nil {
+			tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
+			pd.walIndex.PruneBefore(tp, offset)
+		}
+		return
+	}
+
+	// Phase 1 slice mode: trim batches
 	trimIdx := 0
 	for trimIdx < len(pd.batches) {
 		b := &pd.batches[trimIdx]
@@ -337,3 +561,5 @@ func (pd *PartData) AdvanceLogStart(offset int64) {
 		}
 	}
 }
+
+
