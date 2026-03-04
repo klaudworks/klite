@@ -7,12 +7,14 @@ import (
 
 // Entry types for metadata.log.
 const (
-	EntryCreateTopic     byte = 0x01
-	EntryDeleteTopic     byte = 0x02
-	EntryAlterConfig     byte = 0x03
-	EntryOffsetCommit    byte = 0x04
-	EntryProducerID      byte = 0x05
-	EntryLogStartOffset  byte = 0x06
+	EntryCreateTopic          byte = 0x01
+	EntryDeleteTopic          byte = 0x02
+	EntryAlterConfig          byte = 0x03
+	EntryOffsetCommit         byte = 0x04
+	EntryProducerID           byte = 0x05
+	EntryLogStartOffset       byte = 0x06
+	EntryScramCredential      byte = 0x07
+	EntryScramCredentialDelete byte = 0x08
 )
 
 // CreateTopicEntry records a topic creation.
@@ -303,5 +305,120 @@ func UnmarshalLogStartOffset(payload []byte) (LogStartOffsetEntry, error) {
 		return e, fmt.Errorf("short read for logStartOffset")
 	}
 	e.LogStartOffset = int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	return e, nil
+}
+
+// --- SCRAM Credential Entries ---
+
+// ScramCredentialEntry records a SCRAM credential upsert.
+type ScramCredentialEntry struct {
+	Username   string
+	Mechanism  int8   // 1=SHA-256, 2=SHA-512
+	Iterations int32
+	Salt       []byte
+	SaltedPass []byte
+	MechName   string // "SCRAM-SHA-256" or "SCRAM-SHA-512" (not persisted, derived from Mechanism)
+}
+
+// ScramCredentialDeleteEntry records a SCRAM credential deletion.
+type ScramCredentialDeleteEntry struct {
+	Username  string
+	Mechanism int8
+	MechName  string // not persisted, derived from Mechanism
+}
+
+func putBytes(buf []byte, off int, b []byte) int {
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(b)))
+	off += 2
+	copy(buf[off:off+len(b)], b)
+	return off + len(b)
+}
+
+func getBytes(buf []byte, off int) ([]byte, int, error) {
+	if off+2 > len(buf) {
+		return nil, off, fmt.Errorf("short read for bytes length at offset %d", off)
+	}
+	n := int(binary.BigEndian.Uint16(buf[off : off+2]))
+	off += 2
+	if off+n > len(buf) {
+		return nil, off, fmt.Errorf("short read for bytes data at offset %d, need %d bytes", off, n)
+	}
+	b := make([]byte, n)
+	copy(b, buf[off:off+n])
+	return b, off + n, nil
+}
+
+// MarshalScramCredential serializes a ScramCredentialEntry.
+func MarshalScramCredential(e *ScramCredentialEntry) []byte {
+	size := 1 + 2 + len(e.Username) + 1 + 4 + 2 + len(e.Salt) + 2 + len(e.SaltedPass)
+	buf := make([]byte, size)
+	buf[0] = EntryScramCredential
+	off := 1
+	off = putString(buf, off, e.Username)
+	buf[off] = byte(e.Mechanism)
+	off++
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(e.Iterations))
+	off += 4
+	off = putBytes(buf, off, e.Salt)
+	putBytes(buf, off, e.SaltedPass)
+	return buf
+}
+
+// UnmarshalScramCredential deserializes a ScramCredentialEntry.
+func UnmarshalScramCredential(payload []byte) (ScramCredentialEntry, error) {
+	var e ScramCredentialEntry
+	off := 0
+	var err error
+
+	e.Username, off, err = getString(payload, off)
+	if err != nil {
+		return e, err
+	}
+	if off >= len(payload) {
+		return e, fmt.Errorf("short read for mechanism")
+	}
+	e.Mechanism = int8(payload[off])
+	off++
+	if off+4 > len(payload) {
+		return e, fmt.Errorf("short read for iterations")
+	}
+	e.Iterations = int32(binary.BigEndian.Uint32(payload[off : off+4]))
+	off += 4
+	e.Salt, off, err = getBytes(payload, off)
+	if err != nil {
+		return e, err
+	}
+	e.SaltedPass, _, err = getBytes(payload, off)
+	if err != nil {
+		return e, err
+	}
+	return e, nil
+}
+
+// MarshalScramCredentialDelete serializes a ScramCredentialDeleteEntry.
+func MarshalScramCredentialDelete(e *ScramCredentialDeleteEntry) []byte {
+	size := 1 + 2 + len(e.Username) + 1
+	buf := make([]byte, size)
+	buf[0] = EntryScramCredentialDelete
+	off := 1
+	off = putString(buf, off, e.Username)
+	buf[off] = byte(e.Mechanism)
+	return buf
+}
+
+// UnmarshalScramCredentialDelete deserializes a ScramCredentialDeleteEntry.
+func UnmarshalScramCredentialDelete(payload []byte) (ScramCredentialDeleteEntry, error) {
+	var e ScramCredentialDeleteEntry
+	off := 0
+	var err error
+
+	e.Username, off, err = getString(payload, off)
+	if err != nil {
+		return e, err
+	}
+	if off >= len(payload) {
+		return e, fmt.Errorf("short read for mechanism")
+	}
+	e.Mechanism = int8(payload[off])
 	return e, nil
 }

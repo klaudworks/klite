@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/wal"
 )
 
@@ -65,6 +66,10 @@ type pendingBatch struct {
 // Each partition has its own RWMutex. Produce takes a write lock,
 // Fetch takes a read lock. Different partitions are fully concurrent.
 //
+// Lock ordering: compactionMu → mu
+// Always acquire compactionMu before mu. Never hold mu when acquiring
+// compactionMu. Callers of AdvanceLogStartOffset must hold compactionMu.
+//
 // Callers are responsible for holding the appropriate lock before
 // calling methods. Write methods (PushBatch, ReserveOffset, CommitBatch)
 // require mu.Lock(). Read methods (FetchFrom, SearchOffset, ListOffsets)
@@ -73,7 +78,8 @@ type pendingBatch struct {
 // Phase 1 (ring==nil): uses batches slice, PushBatch does assign+store.
 // Phase 3 (ring!=nil): uses ring buffer, ReserveOffset+CommitBatch flow.
 type PartData struct {
-	mu sync.RWMutex // protects all fields below
+	CompactionMu sync.Mutex   // held by compaction, retention, or DeleteRecords
+	mu           sync.RWMutex // protects all fields below
 
 	Topic    string
 	Index    int32
@@ -653,6 +659,80 @@ func (pd *PartData) AbortedTxnsInRange(fetchOffset int64, lastOffset int64) []Ab
 	return result
 }
 
+// RetentionScan evaluates time-based and size-based retention policies on this
+// partition under a read lock. Returns the new logStartOffset to advance to, or
+// the current logStart if no trimming is needed.
+//
+// retentionMs < 0 means infinite (skip time check).
+// retentionBytes < 0 means infinite (skip size check).
+// nowMs is the current wall clock time in milliseconds.
+// Caller must NOT hold pd.mu.
+func (pd *PartData) RetentionScan(retentionMs int64, retentionBytes int64, nowMs int64) (newLogStart int64, origLogStart int64) {
+	pd.mu.RLock()
+	defer pd.mu.RUnlock()
+
+	origLogStart = pd.logStart
+	newLogStart = origLogStart
+	var bytesToDrop int64
+
+	cutoff := nowMs - retentionMs // only meaningful if retentionMs >= 0
+
+	if pd.ring != nil {
+		// Ring buffer mode: also scan WAL index entries for older data
+		// For now, scan ring buffer batches (most recent data).
+		// WAL index entries are not included in the retention scan because
+		// we don't store MaxTimestamp in the index. Ring buffer + in-memory
+		// batches are what we can scan.
+		for seq := pd.ring.head; seq < pd.ring.tail; seq++ {
+			slot := int(seq % int64(pd.ring.capacity))
+			b := pd.ring.batches[slot]
+			if b.RawBytes == nil {
+				continue
+			}
+			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+			shouldTrim := false
+
+			if retentionMs >= 0 && b.MaxTimestamp < cutoff {
+				shouldTrim = true
+			}
+			if retentionBytes >= 0 && (pd.totalBytes-bytesToDrop) > retentionBytes {
+				shouldTrim = true
+			}
+
+			if shouldTrim {
+				newLogStart = lastOffset + 1
+				bytesToDrop += int64(len(b.RawBytes))
+			} else {
+				break
+			}
+		}
+	} else {
+		// Phase 1 slice mode
+		for i := range pd.batches {
+			b := &pd.batches[i]
+			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+			shouldTrim := false
+
+			totalBytesForCalc := pd.TotalBytes()
+			if retentionMs >= 0 && b.MaxTimestamp < cutoff {
+				shouldTrim = true
+			}
+			if retentionBytes >= 0 && (totalBytesForCalc-bytesToDrop) > retentionBytes {
+				shouldTrim = true
+			}
+
+			if shouldTrim {
+				newLogStart = lastOffset + 1
+				bytesToDrop += int64(len(b.RawBytes))
+			} else {
+				break
+			}
+		}
+	}
+
+	return newLogStart, origLogStart
+}
+
 // BatchCount returns the number of stored batches.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) BatchCount() int {
@@ -675,8 +755,8 @@ func (pd *PartData) TotalBytes() int64 {
 	return total
 }
 
-// AdvanceLogStart advances the log start offset to the given value,
-// trimming any batches that are entirely before the new log start.
+// AdvanceLogStart advances the log start offset without metadata.log persistence.
+// Used by DeleteRecords when metadata.log is not available (Phase 1 mode).
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) AdvanceLogStart(offset int64) {
 	if offset <= pd.logStart {
@@ -685,46 +765,102 @@ func (pd *PartData) AdvanceLogStart(offset int64) {
 	if offset > pd.hw {
 		offset = pd.hw
 	}
-	pd.logStart = offset
+	pd.trimBatchesLocked(offset)
+}
 
+// AdvanceLogStartOffset advances the partition's logStartOffset to newOffset,
+// trims old batches, persists the change to metadata.log, prunes the WAL
+// index, and updates the partition size counter.
+//
+// Called by: retention enforcement, DeleteRecords handler.
+// Caller must NOT hold pd.mu (this method acquires it internally).
+// Caller must hold pd.CompactionMu.
+//
+// If metaLog is nil, the persistence step is skipped (Phase 1 / tests).
+func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log) error {
+	pd.mu.Lock()
+	if pd.logStart >= newOffset {
+		pd.mu.Unlock()
+		return nil
+	}
+	if newOffset > pd.hw {
+		newOffset = pd.hw
+	}
+
+	// Persist to metadata.log FIRST, while still holding pd.mu.
+	if metaLog != nil {
+		entry := metadata.MarshalLogStartOffset(&metadata.LogStartOffsetEntry{
+			TopicName:      pd.Topic,
+			Partition:      pd.Index,
+			LogStartOffset: newOffset,
+		})
+		if err := metaLog.AppendSync(entry); err != nil {
+			pd.mu.Unlock()
+			return err
+		}
+	}
+
+	// Trim all batches below newOffset and set logStart.
+	pd.trimBatchesLocked(newOffset)
+	pd.mu.Unlock()
+
+	// Prune WAL index entries for this partition below newOffset.
+	if pd.walIndex != nil {
+		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
+		pd.walIndex.PruneBefore(tp, newOffset)
+	}
+
+	return nil
+}
+
+// trimBatchesLocked removes all batches whose last offset is below
+// newLogStart, then sets pd.logStart = newLogStart. Updates pd.totalBytes.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) trimBatchesLocked(newLogStart int64) {
 	if pd.ring != nil {
-		// Ring buffer mode: the ring automatically evicts old data as new
-		// data is pushed. We just need to prune the WAL index.
-		if pd.walIndex != nil {
-			tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
-			pd.walIndex.PruneBefore(tp, offset)
+		// Ring buffer mode: advance ring.head past trimmed batches.
+		for pd.ring.head < pd.ring.tail {
+			slot := int(pd.ring.head % int64(pd.ring.capacity))
+			b := pd.ring.batches[slot]
+			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+			if lastOffset >= newLogStart {
+				break
+			}
+			pd.totalBytes -= int64(len(b.RawBytes))
+			pd.ring.batches[slot] = StoredBatch{} // zero out for GC
+			pd.ring.head++
 		}
-		return
-	}
-
-	// Phase 1 slice mode: trim batches
-	trimIdx := 0
-	for trimIdx < len(pd.batches) {
-		b := &pd.batches[trimIdx]
-		lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
-		if lastOffset < offset {
-			trimIdx++
-		} else {
-			break
+	} else {
+		// Phase 1 slice mode: trim batches
+		trimIdx := 0
+		for trimIdx < len(pd.batches) {
+			b := &pd.batches[trimIdx]
+			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+			if lastOffset < newLogStart {
+				trimIdx++
+			} else {
+				break
+			}
 		}
-	}
 
-	if trimIdx > 0 {
-		// Release trimmed batch memory
-		copy(pd.batches, pd.batches[trimIdx:])
-		for i := len(pd.batches) - trimIdx; i < len(pd.batches); i++ {
-			pd.batches[i] = StoredBatch{} // zero out for GC
-		}
-		pd.batches = pd.batches[:len(pd.batches)-trimIdx]
+		if trimIdx > 0 {
+			copy(pd.batches, pd.batches[trimIdx:])
+			for i := len(pd.batches) - trimIdx; i < len(pd.batches); i++ {
+				pd.batches[i] = StoredBatch{} // zero out for GC
+			}
+			pd.batches = pd.batches[:len(pd.batches)-trimIdx]
 
-		// Recalculate maxTimestampBatchIdx
-		pd.maxTimestampBatchIdx = -1
-		for i := range pd.batches {
-			if pd.maxTimestampBatchIdx < 0 || pd.batches[i].MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
-				pd.maxTimestampBatchIdx = i
+			// Recalculate maxTimestampBatchIdx
+			pd.maxTimestampBatchIdx = -1
+			for i := range pd.batches {
+				if pd.maxTimestampBatchIdx < 0 || pd.batches[i].MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
+					pd.maxTimestampBatchIdx = i
+				}
 			}
 		}
 	}
+
+	pd.logStart = newLogStart
 }
 
 

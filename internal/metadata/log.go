@@ -41,12 +41,14 @@ type Log struct {
 	appendCount atomic.Int64
 
 	// For replay callbacks
-	topicCallback        func(CreateTopicEntry)
-	deleteTopicCallback  func(DeleteTopicEntry)
-	alterConfigCallback  func(AlterConfigEntry)
-	offsetCommitCallback func(OffsetCommitEntry)
-	producerIDCallback   func(ProducerIDEntry)
-	logStartCallback     func(LogStartOffsetEntry)
+	topicCallback                func(CreateTopicEntry)
+	deleteTopicCallback          func(DeleteTopicEntry)
+	alterConfigCallback          func(AlterConfigEntry)
+	offsetCommitCallback         func(OffsetCommitEntry)
+	producerIDCallback           func(ProducerIDEntry)
+	logStartCallback             func(LogStartOffsetEntry)
+	scramCredentialCallback      func(ScramCredentialEntry)
+	scramCredentialDeleteCallback func(ScramCredentialDeleteEntry)
 
 	// Snapshot provider for compaction (set by broker during init)
 	snapshotFn func() [][]byte
@@ -257,6 +259,24 @@ func (l *Log) dispatchEntry(entryType byte, data []byte) error {
 			l.logStartCallback(e)
 		}
 
+	case EntryScramCredential:
+		e, err := UnmarshalScramCredential(data)
+		if err != nil {
+			return err
+		}
+		if l.scramCredentialCallback != nil {
+			l.scramCredentialCallback(e)
+		}
+
+	case EntryScramCredentialDelete:
+		e, err := UnmarshalScramCredentialDelete(data)
+		if err != nil {
+			return err
+		}
+		if l.scramCredentialDeleteCallback != nil {
+			l.scramCredentialDeleteCallback(e)
+		}
+
 	default:
 		l.logger.Warn("unknown metadata entry type, skipping", "type", entryType)
 	}
@@ -279,6 +299,15 @@ func (l *Log) SetCallbacks(
 	l.offsetCommitCallback = offsetCommitCb
 	l.producerIDCallback = producerIDCb
 	l.logStartCallback = logStartCb
+}
+
+// SetScramCallbacks sets replay callbacks for SCRAM credential entries.
+func (l *Log) SetScramCallbacks(
+	credentialCb func(ScramCredentialEntry),
+	deleteCb func(ScramCredentialDeleteEntry),
+) {
+	l.scramCredentialCallback = credentialCb
+	l.scramCredentialDeleteCallback = deleteCb
 }
 
 // compactLocked performs compaction while holding l.mu.

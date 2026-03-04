@@ -9,8 +9,21 @@ import (
 	"net"
 	"sync"
 
+	"github.com/klaudworks/klite/internal/sasl"
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// SASLStage tracks the SASL authentication state for a connection.
+type SASLStage uint8
+
+const (
+	SASLStageBegin       SASLStage = iota // Only ApiVersions + SASLHandshake allowed
+	SASLStageAuthPlain                    // SASLAuthenticate: 1 round (PLAIN)
+	SASLStageAuthScram256                 // SASLAuthenticate: round 1 of 2 (SCRAM-SHA-256)
+	SASLStageAuthScram512                 // SASLAuthenticate: round 1 of 2 (SCRAM-SHA-512)
+	SASLStageAuthScram1                   // SASLAuthenticate: round 2 of 2 (SCRAM)
+	SASLStageComplete                     // Authenticated -- all requests allowed
 )
 
 const (
@@ -79,10 +92,19 @@ type clientConn struct {
 
 	// wg tracks handler goroutines for clean shutdown.
 	wg sync.WaitGroup
+
+	// SASL authentication state
+	saslStage SASLStage
+	scramS0   *sasl.ScramServer0 // SCRAM server-first state (between rounds 1 and 2)
+	user      string             // authenticated username (set after auth completes)
 }
 
 // newClientConn creates a new clientConn wrapping the given net.Conn.
 func newClientConn(s *Server, nc net.Conn) *clientConn {
+	stage := SASLStageComplete // no auth required by default
+	if s.saslEnabled {
+		stage = SASLStageBegin
+	}
 	return &clientConn{
 		server: s,
 		conn:   nc,
@@ -94,6 +116,7 @@ func newClientConn(s *Server, nc net.Conn) *clientConn {
 		shutdownCh:  s.shutdownCh,
 		logger:      s.logger,
 		inflightSem: make(chan struct{}, maxInFlight),
+		saslStage:   stage,
 	}
 }
 
@@ -176,6 +199,16 @@ func (cc *clientConn) readLoop() {
 			}
 		}
 
+		// SASL gate: if SASL is enabled, check whether this request
+		// is allowed given the connection's current auth stage.
+		if cc.saslStage != SASLStageComplete {
+			if !cc.saslAllowed(kreq) {
+				cc.logger.Debug("SASL gate: request not allowed before auth, closing",
+					"remote", who, "api_key", apiKey, "sasl_stage", cc.saslStage)
+				return
+			}
+		}
+
 		// Assign sequence number in arrival order BEFORE spawning handler
 		seq := nextSeq
 		nextSeq++
@@ -201,7 +234,7 @@ func (cc *clientConn) readLoop() {
 				}
 			}()
 
-			resp, err := cc.server.dispatch(kreq)
+			resp, err := cc.dispatchReq(kreq)
 
 			// nil response + nil error = no response expected (acks=0 produce)
 			if resp == nil && err == nil {
@@ -210,6 +243,31 @@ func (cc *clientConn) readLoop() {
 			}
 			cc.sendResp(clientResp{kresp: resp, corr: corrID, seq: seq, err: err})
 		}(corrID, kreq, seq)
+	}
+}
+
+// saslAllowed checks if the given request is allowed in the current SASL stage.
+func (cc *clientConn) saslAllowed(kreq kmsg.Request) bool {
+	switch cc.saslStage {
+	case SASLStageBegin:
+		switch kreq.(type) {
+		case *kmsg.ApiVersionsRequest, *kmsg.SASLHandshakeRequest:
+			return true
+		default:
+			return false
+		}
+	case SASLStageAuthPlain, SASLStageAuthScram256,
+		SASLStageAuthScram512, SASLStageAuthScram1:
+		switch kreq.(type) {
+		case *kmsg.ApiVersionsRequest, *kmsg.SASLAuthenticateRequest:
+			return true
+		default:
+			return false
+		}
+	case SASLStageComplete:
+		return true
+	default:
+		return false
 	}
 }
 

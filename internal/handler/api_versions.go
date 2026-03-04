@@ -52,6 +52,12 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 61, MinVersion: 0, MaxVersion: 0},  // DescribeProducers
 	{ApiKey: 65, MinVersion: 0, MaxVersion: 0},  // DescribeTransactions
 	{ApiKey: 66, MinVersion: 0, MaxVersion: 1},  // ListTransactions
+
+	// Phase 5: SASL Authentication
+	{ApiKey: 17, MinVersion: 1, MaxVersion: 1},  // SASLHandshake (v0 not supported)
+	{ApiKey: 36, MinVersion: 0, MaxVersion: 2},  // SASLAuthenticate
+	{ApiKey: 50, MinVersion: 0, MaxVersion: 0},  // DescribeUserScramCredentials
+	{ApiKey: 51, MinVersion: 0, MaxVersion: 0},  // AlterUserScramCredentials
 }
 
 // apiVersionsMap is a lookup table built from apiVersions for fast version

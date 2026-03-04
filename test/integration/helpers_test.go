@@ -8,10 +8,13 @@ import (
 	"time"
 
 	"github.com/klaudworks/klite/internal/broker"
+	"github.com/klaudworks/klite/internal/sasl"
 	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	saslplain "github.com/twmb/franz-go/pkg/sasl/plain"
+	saslscram "github.com/twmb/franz-go/pkg/sasl/scram"
 )
 
 // TestBroker wraps a running broker for tests.
@@ -66,6 +69,44 @@ func WithS3(s3api s3store.S3API, bucket, prefix string) BrokerOpt {
 // WithS3FlushInterval sets the S3 flush interval.
 func WithS3FlushInterval(d time.Duration) BrokerOpt {
 	return func(c *broker.Config) { c.S3FlushInterval = d }
+}
+
+// WithRetentionCheckInterval sets the retention check interval.
+func WithRetentionCheckInterval(d time.Duration) BrokerOpt {
+	return func(c *broker.Config) { c.RetentionCheckInterval = d }
+}
+
+// WithSASL enables SASL authentication with a pre-configured store.
+func WithSASL(store *sasl.Store) BrokerOpt {
+	return func(c *broker.Config) {
+		c.SASLEnabled = true
+		c.SASLStore = store
+	}
+}
+
+// WithSASLCLI enables SASL with CLI-flag user configuration.
+func WithSASLCLI(mechanism, user, password string) BrokerOpt {
+	return func(c *broker.Config) {
+		c.SASLEnabled = true
+		c.SASLMechanism = mechanism
+		c.SASLUser = user
+		c.SASLPassword = password
+	}
+}
+
+// PlainSASLOpt returns a kgo.Opt for SASL PLAIN authentication.
+func PlainSASLOpt(user, pass string) kgo.Opt {
+	return kgo.SASL(saslplain.Auth{User: user, Pass: pass}.AsMechanism())
+}
+
+// Scram256SASLOpt returns a kgo.Opt for SASL SCRAM-SHA-256 authentication.
+func Scram256SASLOpt(user, pass string) kgo.Opt {
+	return kgo.SASL(saslscram.Auth{User: user, Pass: pass}.AsSha256Mechanism())
+}
+
+// Scram512SASLOpt returns a kgo.Opt for SASL SCRAM-SHA-512 authentication.
+func Scram512SASLOpt(user, pass string) kgo.Opt {
+	return kgo.SASL(saslscram.Auth{User: user, Pass: pass}.AsSha512Mechanism())
 }
 
 // StartBroker starts a klite broker in-process on a random port.

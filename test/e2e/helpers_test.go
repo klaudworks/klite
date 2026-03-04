@@ -178,7 +178,6 @@ func startBroker(t *testing.T, binary, dataDir, s3Prefix string, extraArgs ...st
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
 			line := scanner.Text()
-			t.Log("[broker]", line)
 			if addr := parseListenAddr(line); addr != "" {
 				addrCh <- addr
 			}
