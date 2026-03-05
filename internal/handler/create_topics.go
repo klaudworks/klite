@@ -18,6 +18,9 @@ var validTopicConfigs = map[string]bool{
 	"max.message.bytes":      true,
 	"segment.bytes":          true,
 	"message.timestamp.type": true,
+	"min.compaction.lag.ms":  true,
+	"max.compaction.lag.ms":  true,
+	"delete.retention.ms":   true,
 }
 
 // HandleCreateTopics returns the CreateTopics handler (API key 19).

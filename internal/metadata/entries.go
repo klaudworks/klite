@@ -13,8 +13,9 @@ const (
 	EntryOffsetCommit         byte = 0x04
 	EntryProducerID           byte = 0x05
 	EntryLogStartOffset       byte = 0x06
-	EntryScramCredential      byte = 0x07
+	EntryScramCredential       byte = 0x07
 	EntryScramCredentialDelete byte = 0x08
+	EntryCompactionWatermark   byte = 0x09
 )
 
 // CreateTopicEntry records a topic creation.
@@ -305,6 +306,52 @@ func UnmarshalLogStartOffset(payload []byte) (LogStartOffsetEntry, error) {
 		return e, fmt.Errorf("short read for logStartOffset")
 	}
 	e.LogStartOffset = int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	return e, nil
+}
+
+// --- Compaction Watermark Entry ---
+
+// CompactionWatermarkEntry records the cleanedUpTo offset for a partition.
+type CompactionWatermarkEntry struct {
+	TopicName   string
+	Partition   int32
+	CleanedUpTo int64
+}
+
+// MarshalCompactionWatermark serializes a CompactionWatermarkEntry.
+func MarshalCompactionWatermark(e *CompactionWatermarkEntry) []byte {
+	size := 1 + 2 + len(e.TopicName) + 4 + 8
+	buf := make([]byte, size)
+	buf[0] = EntryCompactionWatermark
+	off := 1
+	off = putString(buf, off, e.TopicName)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(e.Partition))
+	off += 4
+	binary.BigEndian.PutUint64(buf[off:off+8], uint64(e.CleanedUpTo))
+	return buf
+}
+
+// UnmarshalCompactionWatermark deserializes a CompactionWatermarkEntry.
+func UnmarshalCompactionWatermark(payload []byte) (CompactionWatermarkEntry, error) {
+	var e CompactionWatermarkEntry
+	off := 0
+	var err error
+
+	e.TopicName, off, err = getString(payload, off)
+	if err != nil {
+		return e, err
+	}
+
+	if off+4 > len(payload) {
+		return e, fmt.Errorf("short read for partition")
+	}
+	e.Partition = int32(binary.BigEndian.Uint32(payload[off : off+4]))
+	off += 4
+
+	if off+8 > len(payload) {
+		return e, fmt.Errorf("short read for cleanedUpTo")
+	}
+	e.CleanedUpTo = int64(binary.BigEndian.Uint64(payload[off : off+8]))
 	return e, nil
 }
 

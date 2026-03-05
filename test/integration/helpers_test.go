@@ -76,6 +76,16 @@ func WithRetentionCheckInterval(d time.Duration) BrokerOpt {
 	return func(c *broker.Config) { c.RetentionCheckInterval = d }
 }
 
+// WithCompactionCheckInterval sets the compaction check interval.
+func WithCompactionCheckInterval(d time.Duration) BrokerOpt {
+	return func(c *broker.Config) { c.CompactionCheckInterval = d }
+}
+
+// WithCompactionMinDirtyObjects sets the minimum dirty objects for compaction.
+func WithCompactionMinDirtyObjects(n int) BrokerOpt {
+	return func(c *broker.Config) { c.CompactionMinDirtyObjects = n }
+}
+
 // WithSASL enables SASL authentication with a pre-configured store.
 func WithSASL(store *sasl.Store) BrokerOpt {
 	return func(c *broker.Config) {

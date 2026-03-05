@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // S3 object format:
@@ -218,4 +219,23 @@ func ObjectKey(prefix, topic string, partition int32, baseOffset int64) string {
 // ZeroPadOffset returns a 20-digit zero-padded string for an offset.
 func ZeroPadOffset(offset int64) string {
 	return fmt.Sprintf("%020d", offset)
+}
+
+// ParseBaseOffsetFromKey extracts the base offset from an S3 object key.
+// The key is expected to end with "/<offset>.obj". Returns -1 on parse failure.
+func ParseBaseOffsetFromKey(key string) int64 {
+	idx := strings.LastIndex(key, "/")
+	if idx < 0 {
+		return -1
+	}
+	name := key[idx+1:]
+	if !strings.HasSuffix(name, ".obj") {
+		return -1
+	}
+	name = strings.TrimSuffix(name, ".obj")
+	var offset int64
+	if _, err := fmt.Sscanf(name, "%d", &offset); err != nil {
+		return -1
+	}
+	return offset
 }

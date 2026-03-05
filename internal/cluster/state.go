@@ -495,6 +495,23 @@ func (s *State) SnapshotEntries() [][]byte {
 		}
 	}
 
+	// 5. COMPACTION_WATERMARK entries for partitions with cleanedUpTo > 0
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			pd.mu.RLock()
+			cu := pd.cleanedUpTo
+			pd.mu.RUnlock()
+			if cu > 0 {
+				e := metadata.MarshalCompactionWatermark(&metadata.CompactionWatermarkEntry{
+					TopicName:   td.Name,
+					Partition:   pd.Index,
+					CleanedUpTo: cu,
+				})
+				entries = append(entries, e)
+			}
+		}
+	}
+
 	return entries
 }
 
@@ -556,6 +573,21 @@ func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition in
 			CommitTime: time.Now(),
 		}
 	})
+}
+
+// SetCompactionWatermarkFromReplay sets the cleanedUpTo for a partition during replay.
+func (s *State) SetCompactionWatermarkFromReplay(topicName string, partition int32, cleanedUpTo int64) {
+	s.mu.RLock()
+	td, ok := s.topics[topicName]
+	s.mu.RUnlock()
+	if !ok || int(partition) >= len(td.Partitions) {
+		return
+	}
+
+	pd := td.Partitions[partition]
+	pd.mu.Lock()
+	pd.SetCleanedUpTo(cleanedUpTo)
+	pd.mu.Unlock()
 }
 
 // SetLogStartOffsetFromReplay sets the logStartOffset for a partition during replay.

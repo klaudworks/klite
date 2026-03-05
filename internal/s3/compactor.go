@@ -1,0 +1,666 @@
+package s3
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
+)
+
+// CompactorConfig holds configuration for the log compactor.
+type CompactorConfig struct {
+	Client  *Client
+	Reader  *Reader
+	Logger  *slog.Logger
+	Clock   clock.Clock
+
+	// WindowBytes is the max total source object size per compaction window (default 256 MiB).
+	WindowBytes int64
+
+	// S3Concurrency is the max concurrent S3 GETs for compaction (default 4).
+	S3Concurrency int
+
+	// MinDirtyObjects is the minimum number of dirty S3 objects before compaction triggers (default 4).
+	MinDirtyObjects int
+
+	// PersistWatermark is called after successful compaction to persist
+	// the cleanedUpTo watermark to metadata.log.
+	PersistWatermark func(topic string, partition int32, cleanedUpTo int64) error
+
+	// DeleteRetentionMs is the topic-level delete.retention.ms (default 24h).
+	// Tombstones older than this are removed during compaction.
+	DeleteRetentionMs int64
+}
+
+// Compactor performs log compaction on S3 objects for a single partition.
+type Compactor struct {
+	cfg    CompactorConfig
+	client *Client
+	reader *Reader
+	logger *slog.Logger
+	clock  clock.Clock
+}
+
+// NewCompactor creates a new compactor.
+func NewCompactor(cfg CompactorConfig) *Compactor {
+	if cfg.WindowBytes == 0 {
+		cfg.WindowBytes = 256 * 1024 * 1024 // 256 MiB
+	}
+	if cfg.S3Concurrency == 0 {
+		cfg.S3Concurrency = 4
+	}
+	if cfg.MinDirtyObjects == 0 {
+		cfg.MinDirtyObjects = 4
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = clock.RealClock{}
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.DeleteRetentionMs == 0 {
+		cfg.DeleteRetentionMs = 86400000 // 24 hours
+	}
+
+	return &Compactor{
+		cfg:    cfg,
+		client: cfg.Client,
+		reader: cfg.Reader,
+		logger: cfg.Logger,
+		clock:  cfg.Clock,
+	}
+}
+
+// SetDeleteRetentionMs updates the delete retention for tombstone removal.
+func (c *Compactor) SetDeleteRetentionMs(ms int64) {
+	c.cfg.DeleteRetentionMs = ms
+}
+
+// CompactPartition compacts all dirty objects for a single partition.
+// cleanedUpTo is the current compaction watermark.
+// minCompactionLagMs is the topic-level min.compaction.lag.ms.
+// Returns the new cleanedUpTo watermark.
+func (c *Compactor) CompactPartition(
+	ctx context.Context,
+	topic string,
+	partition int32,
+	cleanedUpTo int64,
+	minCompactionLagMs int64,
+	acquireLock func(),
+	releaseLock func(),
+) (int64, error) {
+	prefix := ObjectKeyPrefix(c.client.prefix, topic, partition)
+
+	// List all S3 objects for this partition
+	objects, err := c.client.ListObjects(ctx, prefix)
+	if err != nil {
+		return cleanedUpTo, fmt.Errorf("list objects: %w", err)
+	}
+
+	if len(objects) == 0 {
+		return cleanedUpTo, nil
+	}
+
+	// Parse and sort objects by base offset
+	var parsed []windowObj
+	for _, obj := range objects {
+		baseOff := parseBaseOffset(obj.Key, prefix)
+		if baseOff < 0 {
+			continue
+		}
+		parsed = append(parsed, windowObj{
+			key:        obj.Key,
+			size:       obj.Size,
+			baseOffset: baseOff,
+		})
+	}
+	sort.Slice(parsed, func(i, j int) bool {
+		return parsed[i].baseOffset < parsed[j].baseOffset
+	})
+
+	// Orphan cleanup: delete objects whose offset range is fully covered by a later object
+	if err := c.orphanCleanup(ctx, parsed); err != nil {
+		c.logger.Warn("orphan cleanup failed", "topic", topic, "partition", partition, "err", err)
+	}
+
+	// Re-list after orphan cleanup
+	objects, err = c.client.ListObjects(ctx, prefix)
+	if err != nil {
+		return cleanedUpTo, fmt.Errorf("re-list objects: %w", err)
+	}
+
+	parsed = parsed[:0]
+	for _, obj := range objects {
+		baseOff := parseBaseOffset(obj.Key, prefix)
+		if baseOff < 0 {
+			continue
+		}
+		parsed = append(parsed, windowObj{
+			key:        obj.Key,
+			size:       obj.Size,
+			baseOffset: baseOff,
+		})
+	}
+	sort.Slice(parsed, func(i, j int) bool {
+		return parsed[i].baseOffset < parsed[j].baseOffset
+	})
+
+	if len(parsed) == 0 {
+		return cleanedUpTo, nil
+	}
+
+	// Find the anchor object (object containing cleanedUpTo)
+	anchorIdx := -1
+	for i, p := range parsed {
+		if p.baseOffset <= cleanedUpTo {
+			anchorIdx = i
+		}
+	}
+
+	// Form windows
+	windows := c.formWindows(parsed, anchorIdx, minCompactionLagMs)
+	if len(windows) == 0 {
+		return cleanedUpTo, nil
+	}
+
+	// Process each window
+	for _, window := range windows {
+		if ctx.Err() != nil {
+			return cleanedUpTo, ctx.Err()
+		}
+
+		// Skip single-object windows (no key can be superseded within a window of one)
+		if len(window) == 1 {
+			// Unless it's an already-compacted anchor being re-examined
+			// with no dirty objects after it
+			continue
+		}
+
+		acquireLock()
+		newWatermark, err := c.compactWindow(ctx, topic, partition, window, cleanedUpTo)
+		releaseLock()
+
+		if err != nil {
+			return cleanedUpTo, fmt.Errorf("compact window: %w", err)
+		}
+		if newWatermark > cleanedUpTo {
+			cleanedUpTo = newWatermark
+		}
+	}
+
+	return cleanedUpTo, nil
+}
+
+// compactWindow compacts a single window of objects.
+// Returns the new cleanedUpTo watermark.
+func (c *Compactor) compactWindow(
+	ctx context.Context,
+	topic string,
+	partition int32,
+	window []windowObj,
+	currentCleanedUpTo int64,
+) (int64, error) {
+	// Phase 1: Read & map — one S3 GET per object
+	type cachedObj struct {
+		key      string
+		rawBytes []byte
+		footer   *Footer
+	}
+	cached := make([]cachedObj, len(window))
+
+	// Fetch objects with bounded concurrency
+	sem := make(chan struct{}, c.cfg.S3Concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var fetchErr error
+
+	for i, wo := range window {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, w windowObj) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			data, err := c.client.GetObject(ctx, w.key)
+			if err != nil {
+				mu.Lock()
+				if fetchErr == nil {
+					fetchErr = fmt.Errorf("GET %s: %w", w.key, err)
+				}
+				mu.Unlock()
+				return
+			}
+
+			footer, err := ParseFooter(data, int64(len(data)))
+			if err != nil {
+				mu.Lock()
+				if fetchErr == nil {
+					fetchErr = fmt.Errorf("parse footer %s: %w", w.key, err)
+				}
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			cached[idx] = cachedObj{key: w.key, rawBytes: data, footer: footer}
+			mu.Unlock()
+		}(i, wo)
+	}
+	wg.Wait()
+
+	if fetchErr != nil {
+		return currentCleanedUpTo, fetchErr
+	}
+
+	// Build offset map: key → highest offset across the window
+	offsetMap := make(map[string]int64)
+
+	for _, co := range cached {
+		if co.footer == nil || len(co.rawBytes) == 0 {
+			continue
+		}
+		if err := c.buildOffsetMap(co.rawBytes, co.footer, offsetMap); err != nil {
+			return currentCleanedUpTo, fmt.Errorf("build offset map: %w", err)
+		}
+	}
+
+	// Phase 2: Filter & rewrite — no S3 reads, CPU only
+	var outputBatches []BatchData
+	nowMs := c.clock.Now().UnixMilli()
+
+	for _, co := range cached {
+		if co.footer == nil || len(co.rawBytes) == 0 {
+			continue
+		}
+		batches, err := c.filterBatches(co.rawBytes, co.footer, offsetMap, nowMs)
+		if err != nil {
+			return currentCleanedUpTo, fmt.Errorf("filter batches: %w", err)
+		}
+		outputBatches = append(outputBatches, batches...)
+	}
+
+	if len(outputBatches) == 0 {
+		// All records were removed. Delete source objects, advance watermark.
+		var lastOffset int64
+		for _, co := range cached {
+			if co.footer != nil {
+				lo := co.footer.LastOffset()
+				if lo > lastOffset {
+					lastOffset = lo
+				}
+			}
+		}
+
+		if c.cfg.PersistWatermark != nil {
+			if err := c.cfg.PersistWatermark(topic, partition, lastOffset); err != nil {
+				return currentCleanedUpTo, fmt.Errorf("persist watermark: %w", err)
+			}
+		}
+
+		// Best-effort delete of source objects
+		var keys []string
+		for _, co := range cached {
+			keys = append(keys, co.key)
+		}
+		c.client.DeleteObjectsBatch(ctx, keys)
+
+		// Invalidate caches
+		c.reader.InvalidateFooters(topic, partition)
+
+		return lastOffset, nil
+	}
+
+	// Build compacted output object
+	outputData := BuildObject(outputBatches)
+	baseOffset := outputBatches[0].BaseOffset
+	outputKey := ObjectKey(c.client.prefix, topic, partition, baseOffset)
+
+	// PUT the compacted output
+	if err := c.client.PutObject(ctx, outputKey, outputData); err != nil {
+		return currentCleanedUpTo, fmt.Errorf("PUT compacted object: %w", err)
+	}
+
+	// Invalidate caches
+	c.reader.InvalidateFooters(topic, partition)
+
+	// Compute new watermark
+	lastBatch := outputBatches[len(outputBatches)-1]
+	newWatermark := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta)
+
+	// Persist watermark BEFORE deleting source objects
+	if c.cfg.PersistWatermark != nil {
+		if err := c.cfg.PersistWatermark(topic, partition, newWatermark); err != nil {
+			return currentCleanedUpTo, fmt.Errorf("persist watermark: %w", err)
+		}
+	}
+
+	// Best-effort delete of source objects (skip the output if it matches a source key)
+	var deleteKeys []string
+	for _, co := range cached {
+		if co.key != outputKey {
+			deleteKeys = append(deleteKeys, co.key)
+		}
+	}
+	if len(deleteKeys) > 0 {
+		c.client.DeleteObjectsBatch(ctx, deleteKeys)
+	}
+
+	return newWatermark, nil
+}
+
+// buildOffsetMap scans an object and updates the offset map with latest offset per key.
+func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap map[string]int64) error {
+	for _, entry := range footer.Entries {
+		if int(entry.BytePosition)+int(entry.BatchLength) > len(rawBytes) {
+			continue
+		}
+		batchRaw := rawBytes[entry.BytePosition : entry.BytePosition+entry.BatchLength]
+
+		header, err := ParseBatchHeaderFromRaw(batchRaw)
+		if err != nil {
+			continue
+		}
+
+		// Skip control batches
+		if header.IsControlBatch() {
+			continue
+		}
+
+		codec := header.CompressionCodec()
+		decompressed, err := DecompressRecords(batchRaw, codec)
+		if err != nil {
+			continue
+		}
+
+		err = IterateRecords(decompressed, func(rec Record) bool {
+			if rec.Key == nil {
+				return true // null keys are always retained, not in offset map
+			}
+			absOffset := header.BaseOffset + int64(rec.OffsetDelta)
+			key := string(rec.Key)
+			if existing, ok := offsetMap[key]; !ok || absOffset > existing {
+				offsetMap[key] = absOffset
+			}
+			return true
+		})
+		if err != nil {
+			c.logger.Debug("error iterating records for offset map", "err", err)
+		}
+	}
+	return nil
+}
+
+// filterBatches filters records from an object based on the offset map.
+// Returns the surviving batches as BatchData suitable for BuildObject.
+func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map[string]int64, nowMs int64) ([]BatchData, error) {
+	var result []BatchData
+
+	for _, entry := range footer.Entries {
+		if int(entry.BytePosition)+int(entry.BatchLength) > len(rawBytes) {
+			continue
+		}
+		batchRaw := rawBytes[entry.BytePosition : entry.BytePosition+entry.BatchLength]
+
+		header, err := ParseBatchHeaderFromRaw(batchRaw)
+		if err != nil {
+			continue
+		}
+
+		// Keep control batches as-is for now (simplified transactional handling)
+		if header.IsControlBatch() {
+			bd := BatchData{
+				RawBytes:        make([]byte, len(batchRaw)),
+				BaseOffset:      header.BaseOffset,
+				LastOffsetDelta: header.LastOffsetDelta,
+			}
+			copy(bd.RawBytes, batchRaw)
+			result = append(result, bd)
+			continue
+		}
+
+		codec := header.CompressionCodec()
+		decompressed, err := DecompressRecords(batchRaw, codec)
+		if err != nil {
+			// Keep batch as-is if we can't decompress
+			bd := BatchData{
+				RawBytes:        make([]byte, len(batchRaw)),
+				BaseOffset:      header.BaseOffset,
+				LastOffsetDelta: header.LastOffsetDelta,
+			}
+			copy(bd.RawBytes, batchRaw)
+			result = append(result, bd)
+			continue
+		}
+
+		// Filter records
+		var retained []Record
+		err = IterateRecords(decompressed, func(rec Record) bool {
+			absOffset := header.BaseOffset + int64(rec.OffsetDelta)
+
+			// Null keys: always retained
+			if rec.Key == nil {
+				retained = append(retained, rec)
+				return true
+			}
+
+			key := string(rec.Key)
+			latestOffset, inMap := offsetMap[key]
+
+			// Keep if this is the latest offset for this key
+			if !inMap || absOffset >= latestOffset {
+				// Check if tombstone past delete.retention.ms
+				if rec.Value == nil && c.cfg.DeleteRetentionMs > 0 {
+					var recordTs int64
+					if header.TimestampType() == 1 {
+						// LogAppendTime: use MaxTimestamp from header
+						recordTs = header.MaxTimestamp
+					} else {
+						// CreateTime: use individual record's timestamp
+						recordTs = header.BaseTimestamp + rec.TimestampDelta
+					}
+					if recordTs > 0 && nowMs-recordTs > c.cfg.DeleteRetentionMs {
+						// Tombstone past retention — remove
+						return true
+					}
+				}
+				retained = append(retained, rec)
+				return true
+			}
+
+			// Not the latest offset — superseded, remove
+			return true
+		})
+		if err != nil {
+			c.logger.Debug("error iterating records for filter", "err", err)
+			continue
+		}
+
+		// Skip batch if no records retained (don't emit empty batches)
+		if len(retained) == 0 {
+			continue
+		}
+
+		// If all records survived, keep the original batch (no re-encoding needed)
+		if int32(len(retained)) == header.NumRecords {
+			bd := BatchData{
+				RawBytes:        make([]byte, len(batchRaw)),
+				BaseOffset:      header.BaseOffset,
+				LastOffsetDelta: header.LastOffsetDelta,
+			}
+			copy(bd.RawBytes, batchRaw)
+			result = append(result, bd)
+			continue
+		}
+
+		// Build a new batch from retained records
+		newBatchBytes, err := BuildRecordBatch(header, retained, codec)
+		if err != nil {
+			c.logger.Warn("failed to build compacted batch, keeping original", "err", err)
+			bd := BatchData{
+				RawBytes:        make([]byte, len(batchRaw)),
+				BaseOffset:      header.BaseOffset,
+				LastOffsetDelta: header.LastOffsetDelta,
+			}
+			copy(bd.RawBytes, batchRaw)
+			result = append(result, bd)
+			continue
+		}
+
+		lastOD := retained[len(retained)-1].OffsetDelta
+		result = append(result, BatchData{
+			RawBytes:        newBatchBytes,
+			BaseOffset:      header.BaseOffset,
+			LastOffsetDelta: int32(lastOD),
+		})
+	}
+
+	return result, nil
+}
+
+// windowObj holds info about an S3 object for window formation.
+type windowObj struct {
+	key        string
+	size       int64
+	baseOffset int64
+}
+
+// formWindows groups objects into compaction windows bounded by WindowBytes.
+func (c *Compactor) formWindows(parsed []windowObj, anchorIdx int, minCompactionLagMs int64) [][]windowObj {
+	// Start from anchor (or 0 if no anchor)
+	startIdx := 0
+	if anchorIdx >= 0 {
+		startIdx = anchorIdx
+	}
+
+	var windows [][]windowObj
+	var currentWindow []windowObj
+	var currentSize int64
+
+	for i := startIdx; i < len(parsed); i++ {
+		p := parsed[i]
+
+		wo := windowObj{
+			key:        p.key,
+			size:       p.size,
+			baseOffset: p.baseOffset,
+		}
+
+		if currentSize+p.size > c.cfg.WindowBytes && len(currentWindow) > 0 {
+			windows = append(windows, currentWindow)
+			currentWindow = nil
+			currentSize = 0
+		}
+
+		currentWindow = append(currentWindow, wo)
+		currentSize += p.size
+	}
+
+	if len(currentWindow) > 0 {
+		windows = append(windows, currentWindow)
+	}
+
+	return windows
+}
+
+// orphanCleanup deletes objects whose offset range is fully covered by a later object.
+func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error {
+	if len(parsed) < 2 {
+		return nil
+	}
+
+	// Load footers to check offset ranges
+	type objRange struct {
+		key       string
+		baseOff   int64
+		lastOff   int64
+		footerErr bool
+	}
+
+	ranges := make([]objRange, len(parsed))
+	for i, p := range parsed {
+		ranges[i] = objRange{
+			key:     p.key,
+			baseOff: p.baseOffset,
+			lastOff: p.baseOffset, // minimum
+		}
+
+		// Try to read the footer to get the actual last offset
+		data, err := c.client.GetObject(ctx, p.key)
+		if err != nil {
+			ranges[i].footerErr = true
+			continue
+		}
+		footer, err := ParseFooter(data, int64(len(data)))
+		if err != nil {
+			ranges[i].footerErr = true
+			continue
+		}
+		if lo := footer.LastOffset(); lo >= 0 {
+			ranges[i].lastOff = lo
+		}
+	}
+
+	orphanSet := make(map[string]bool)
+	for i := 0; i < len(ranges); i++ {
+		if ranges[i].footerErr {
+			continue
+		}
+		for j := 0; j < len(ranges); j++ {
+			if i == j || ranges[j].footerErr {
+				continue
+			}
+			// If object i's range is fully covered by object j, object i is orphan
+			if ranges[i].baseOff >= ranges[j].baseOff && ranges[i].lastOff <= ranges[j].lastOff && ranges[i].key != ranges[j].key {
+				orphanSet[ranges[i].key] = true
+				break
+			}
+		}
+	}
+	var orphanKeys []string
+	for k := range orphanSet {
+		orphanKeys = append(orphanKeys, k)
+	}
+
+	if len(orphanKeys) > 0 {
+		c.logger.Info("compaction orphan cleanup",
+			"orphans", len(orphanKeys))
+		c.client.DeleteObjectsBatch(ctx, orphanKeys)
+	}
+
+	return nil
+}
+
+// parseBaseOffset extracts the base offset from an S3 object key.
+// Key format: prefix/topic/partition/00000000000000000123.obj
+func parseBaseOffset(key, prefix string) int64 {
+	rel := strings.TrimPrefix(key, prefix)
+	if !strings.HasSuffix(rel, ".obj") {
+		return -1
+	}
+	rel = strings.TrimSuffix(rel, ".obj")
+	var offset int64
+	if _, err := fmt.Sscanf(rel, "%d", &offset); err != nil {
+		return -1
+	}
+	return offset
+}
+
+// CompactionEligibility holds the result of checking if a partition needs compaction.
+type CompactionEligibility struct {
+	Eligible     bool
+	DirtyObjects int32
+	Topic        string
+	Partition    int32
+}
+
+// DirtyPartitionInfo holds in-memory compaction state for a partition.
+type DirtyPartitionInfo struct {
+	DirtyObjects  int32
+	LastCompacted time.Time
+	CleanedUpTo   int64
+}

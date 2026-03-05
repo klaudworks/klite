@@ -11,13 +11,16 @@ import (
 
 // topicConfigDefaults are the default values for supported topic configs.
 var topicConfigDefaults = map[string]string{
-	"cleanup.policy":        "delete",
-	"compression.type":      "producer",
-	"retention.ms":          "604800000",
-	"retention.bytes":       "-1",
-	"max.message.bytes":     "1048588",
-	"segment.bytes":         "67108864",
+	"cleanup.policy":         "delete",
+	"compression.type":       "producer",
+	"retention.ms":           "604800000",
+	"retention.bytes":        "-1",
+	"max.message.bytes":      "1048588",
+	"segment.bytes":          "67108864",
 	"message.timestamp.type": "CreateTime",
+	"min.compaction.lag.ms":  "0",
+	"max.compaction.lag.ms":  "9223372036854775807",
+	"delete.retention.ms":   "86400000",
 }
 
 // DescribeConfigsConfig holds config for the DescribeConfigs handler.
