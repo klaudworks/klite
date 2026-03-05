@@ -41,15 +41,15 @@ type Log struct {
 	appendCount atomic.Int64
 
 	// For replay callbacks
-	topicCallback                  func(CreateTopicEntry)
-	deleteTopicCallback            func(DeleteTopicEntry)
-	alterConfigCallback            func(AlterConfigEntry)
-	offsetCommitCallback           func(OffsetCommitEntry)
-	producerIDCallback             func(ProducerIDEntry)
-	logStartCallback               func(LogStartOffsetEntry)
-	scramCredentialCallback        func(ScramCredentialEntry)
-	scramCredentialDeleteCallback  func(ScramCredentialDeleteEntry)
-	compactionWatermarkCallback    func(CompactionWatermarkEntry)
+	topicCallback                 func(CreateTopicEntry)
+	deleteTopicCallback           func(DeleteTopicEntry)
+	alterConfigCallback           func(AlterConfigEntry)
+	offsetCommitCallback          func(OffsetCommitEntry)
+	producerIDCallback            func(ProducerIDEntry)
+	logStartCallback              func(LogStartOffsetEntry)
+	scramCredentialCallback       func(ScramCredentialEntry)
+	scramCredentialDeleteCallback func(ScramCredentialDeleteEntry)
+	compactionWatermarkCallback   func(CompactionWatermarkEntry)
 
 	// Snapshot provider for compaction (set by broker during init)
 	snapshotFn func() [][]byte

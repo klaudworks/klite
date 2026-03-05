@@ -11,7 +11,7 @@ import (
 )
 
 // StoredBatch holds raw bytes and metadata extracted from the batch header.
-// Used for both in-memory storage and as the return type from WAL/S3 reads.
+// Used in ring buffers, WAL reads, and S3 reads.
 type StoredBatch struct {
 	BaseOffset      int64
 	LastOffsetDelta int32
@@ -37,8 +37,8 @@ type S3BatchData struct {
 // A single FetchWaiter is shared across multiple partitions. Multiple partitions
 // may call CloseOnce concurrently — sync.Once prevents double-close panic.
 type FetchWaiter struct {
-	once sync.Once       // ensures ch is closed exactly once
-	ch   chan struct{}    // closed when data arrives (wake-up signal only, no data)
+	once sync.Once     // ensures ch is closed exactly once
+	ch   chan struct{} // closed when data arrives (wake-up signal only, no data)
 }
 
 // NewFetchWaiter creates a new fetch waiter with a fresh wake channel.
@@ -66,49 +66,46 @@ type pendingBatch struct {
 // Each partition has its own RWMutex. Produce takes a write lock,
 // Fetch takes a read lock. Different partitions are fully concurrent.
 //
-// Lock ordering: compactionMu → mu
+// Lock ordering: compactionMu -> mu
 // Always acquire compactionMu before mu. Never hold mu when acquiring
 // compactionMu. Callers of AdvanceLogStartOffset must hold compactionMu.
 //
 // Callers are responsible for holding the appropriate lock before
 // calling methods. Write methods (PushBatch, ReserveOffset, CommitBatch)
-// require mu.Lock(). Read methods (FetchFrom, SearchOffset, ListOffsets)
-// require mu.RLock().
+// require mu.Lock(). Read methods (FetchFrom, ListOffsets) require mu.RLock().
 //
-// Phase 1 (ring==nil): uses batches slice, PushBatch does assign+store.
-// Phase 3 (ring!=nil): uses ring buffer, ReserveOffset+CommitBatch flow.
+// Storage: uses ring buffer for recent batches in memory, WAL on disk,
+// and optionally S3 for older data. The produce path uses
+// ReserveOffset + WAL append + CommitBatch for durability.
 type PartData struct {
 	CompactionMu sync.Mutex   // held by compaction, retention, or DeleteRecords
 	mu           sync.RWMutex // protects all fields below
 
 	Topic    string
 	Index    int32
-	TopicID  [16]byte      // Topic UUID, used for WAL entries
-	batches  []StoredBatch // Phase 1: unbounded append-only slice (used when ring==nil)
-	logStart int64         // Earliest available offset (0 initially)
-	hw       int64         // High watermark = next offset to assign (= LEO for single broker)
+	TopicID  [16]byte // Topic UUID, used for WAL entries
+	logStart int64    // Earliest available offset (0 initially)
+	hw       int64    // High watermark = next offset to assign (= LEO for single broker)
 
-	// For ListOffsets timestamp -3 (KIP-734): index of batch with max timestamp
-	maxTimestampBatchIdx int // -1 if no batches
+	hasMaxTimestamp bool // false until first batch committed (for ListOffsets -3 / KIP-734)
 
-	// Fetch waiters (long polling) -- see 09-fetch.md
-	waiterMu sync.Mutex      // separate lock for waiter list (not RWMutex)
-	waiters  []*FetchWaiter  // each waiter holds a shared wake channel
+	// Fetch waiters (long polling)
+	waiterMu sync.Mutex     // separate lock for waiter list (not RWMutex)
+	waiters  []*FetchWaiter // each waiter holds a shared wake channel
 
-	// Phase 3+ fields (set when WAL is enabled)
 	ring               *RingBuffer    // in-memory ring buffer for recent batches
-	walWriter          *wal.Writer    // reference to WAL writer (nil in Phase 1)
+	walWriter          *wal.Writer    // reference to WAL writer
 	walIndex           *wal.Index     // reference to WAL index for read-path lookups
 	nextReserve        int64          // next offset to hand out (advances on reserve)
 	nextCommit         int64          // next offset expected in commitBatch
 	pendingCommits     []pendingBatch // out-of-order commits waiting for earlier ones
 	totalBytes         int64          // running total of raw RecordBatch bytes
-	maxTimestampVal    int64          // max timestamp value (ring buffer mode)
-	maxTimestampOffset int64          // offset associated with max timestamp (ring buffer mode)
+	maxTimestampVal    int64          // max timestamp value
+	maxTimestampOffset int64          // offset associated with max timestamp
 
 	// Phase 4 (S3)
-	s3FlushWatermark int64          // highest offset+1 flushed to S3
-	s3Fetch          S3Fetcher      // S3 reader for tier 3 reads (nil if S3 not configured)
+	s3FlushWatermark int64     // highest offset+1 flushed to S3
+	s3Fetch          S3Fetcher // S3 reader for tier 3 reads (nil if S3 not configured)
 
 	// Phase 4 (Transactions)
 	abortedTxns []AbortedTxnEntry // aborted transaction index, sorted by LastOffset
@@ -221,11 +218,6 @@ func (pd *PartData) SetHW(hw int64) {
 	}
 }
 
-// HasWAL returns whether this partition has WAL enabled.
-func (pd *PartData) HasWAL() bool {
-	return pd.ring != nil
-}
-
 // S3FlushWatermark returns the highest offset+1 flushed to S3.
 // Caller must hold pd.mu.RLock() or pd.mu.Lock().
 func (pd *PartData) S3FlushWatermark() int64 {
@@ -254,8 +246,8 @@ func (pd *PartData) HasS3() bool {
 // Caller must hold pd.mu.Lock(). After releasing mu, caller should
 // call pd.NotifyWaiters() to wake long-polling Fetch requests.
 //
-// Phase 1 path (no WAL): assigns offset, stores in batches slice.
-// When ring is set, use ReserveOffset + CommitBatch instead.
+// Used by WAL replay and transaction control batches (EndTxn).
+// The normal produce path uses ReserveOffset + WAL append + CommitBatch.
 func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 	baseOffset := pd.hw
 
@@ -277,26 +269,12 @@ func (pd *PartData) PushBatch(raw []byte, meta BatchMeta) int64 {
 		NumRecords:      meta.NumRecords,
 	}
 
-	if pd.ring != nil {
-		// Phase 3: use ring buffer
-		pd.ring.Push(batch)
-		pd.nextReserve = pd.hw
-		pd.nextCommit = pd.hw
-		pd.totalBytes += int64(len(stored))
-	} else {
-		// Phase 1: unbounded slice
-		pd.batches = append(pd.batches, batch)
-	}
+	pd.ring.Push(batch)
+	pd.nextReserve = pd.hw
+	pd.nextCommit = pd.hw
+	pd.totalBytes += int64(len(stored))
 
-	// Update maxTimestamp tracking for ListOffsets -3 (KIP-734)
-	if pd.ring != nil {
-		pd.updateMaxTimestampRing(batch)
-	} else {
-		batchIdx := len(pd.batches) - 1
-		if pd.maxTimestampBatchIdx < 0 || meta.MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
-			pd.maxTimestampBatchIdx = batchIdx
-		}
-	}
+	pd.updateMaxTimestampRing(batch)
 
 	return baseOffset
 }
@@ -352,12 +330,8 @@ func (pd *PartData) insertPendingCommit(batch StoredBatch) {
 // updateMaxTimestampRing updates max timestamp tracking for ring buffer mode.
 // Uses the ring buffer's newest offset as the reference.
 func (pd *PartData) updateMaxTimestampRing(batch StoredBatch) {
-	if pd.maxTimestampBatchIdx < 0 {
-		// Use a sentinel value that means "check ring buffer"
-		pd.maxTimestampBatchIdx = 0
-		pd.maxTimestampVal = batch.MaxTimestamp
-		pd.maxTimestampOffset = batch.BaseOffset + int64(batch.LastOffsetDelta)
-	} else if batch.MaxTimestamp >= pd.maxTimestampVal {
+	if !pd.hasMaxTimestamp || batch.MaxTimestamp >= pd.maxTimestampVal {
+		pd.hasMaxTimestamp = true
 		pd.maxTimestampVal = batch.MaxTimestamp
 		pd.maxTimestampOffset = batch.BaseOffset + int64(batch.LastOffsetDelta)
 	}
@@ -385,212 +359,129 @@ func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 	pd.waiterMu.Unlock()
 }
 
-// SearchOffset finds the batch containing the given offset via binary search.
-// Returns (index, found, atEnd).
-//   - found=true: batches[index] contains the offset
-//   - found=false, atEnd=true: offset >= HW (past the end)
-//   - found=false, atEnd=false: offset < logStart (before start)
-//
-// Phase 1 only (uses batches slice). In Phase 3, use FetchFrom directly.
-// Caller must hold pd.mu.RLock().
-func (pd *PartData) SearchOffset(offset int64) (index int, found bool, atEnd bool) {
-	if len(pd.batches) == 0 {
-		return 0, false, true
-	}
-
-	if offset >= pd.hw {
-		return len(pd.batches), false, true
-	}
-
-	if offset < pd.logStart {
-		return 0, false, false
-	}
-
-	// Binary search: find the last batch whose BaseOffset <= offset
-	idx := sort.Search(len(pd.batches), func(i int) bool {
-		return pd.batches[i].BaseOffset > offset
-	})
-	// idx is the first batch with BaseOffset > offset, so idx-1 is the batch containing offset
-	idx--
-
-	if idx < 0 {
-		return 0, false, false
-	}
-
-	// Verify the offset is within this batch's range
-	b := &pd.batches[idx]
-	lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
-	if offset >= b.BaseOffset && offset <= lastOffset {
-		return idx, true, false
-	}
-
-	// Should not happen with well-formed data, but handle gracefully
-	return idx, false, false
-}
-
 // FetchFrom collects batches starting at offset, up to maxBytes.
 // KIP-74: always includes at least one complete batch even if it exceeds maxBytes.
 // Returns nil if no batches match.
-// Caller must hold pd.mu.RLock().
 //
-// In Phase 3 (ring != nil), implements the three-tier read cascade:
-// 1. Ring buffer (memory)
-// 2. WAL index + pread
-// 3. (Phase 4: S3 range read)
+// This method manages its own locking: it acquires RLock for in-memory reads
+// and releases it before any disk/network I/O (WAL pread, S3 HTTP).
+// Caller must NOT hold pd.mu.
+//
+// Implements the three-tier read cascade:
+// 1. Ring buffer (memory) — under RLock
+// 2. WAL index + pread — no lock held
+// 3. S3 range read (if configured) — no lock held
 func (pd *PartData) FetchFrom(offset int64, maxBytes int32) []StoredBatch {
+	// Tier 1: Ring buffer (fast path, under RLock)
+	pd.mu.RLock()
 	if offset >= pd.hw {
+		pd.mu.RUnlock()
 		return nil
 	}
-
-	if pd.ring != nil {
-		return pd.fetchFromTiered(offset, maxBytes)
-	}
-
-	return pd.fetchFromSlice(offset, maxBytes)
-}
-
-// fetchFromSlice is the Phase 1 fetch path using the batches slice.
-func (pd *PartData) fetchFromSlice(offset int64, maxBytes int32) []StoredBatch {
-	if len(pd.batches) == 0 {
-		return nil
-	}
-
-	idx, found, _ := pd.SearchOffset(offset)
-	if !found {
-		// If offset equals logStart, start from the first batch
-		if offset <= pd.logStart && len(pd.batches) > 0 {
-			idx = 0
-		} else {
-			return nil
-		}
-	}
-
-	var result []StoredBatch
-	var totalBytes int32
-
-	for i := idx; i < len(pd.batches); i++ {
-		b := &pd.batches[i]
-		batchSize := int32(len(b.RawBytes))
-
-		// KIP-74: always include at least one batch
-		if len(result) > 0 && totalBytes+batchSize > maxBytes {
-			break
-		}
-
-		result = append(result, *b)
-		totalBytes += batchSize
-
-		// After including at least one batch, check byte limit
-		if totalBytes >= maxBytes {
-			break
-		}
-	}
-
-	return result
-}
-
-// fetchFromTiered implements the Phase 3 three-tier read cascade.
-func (pd *PartData) fetchFromTiered(offset int64, maxBytes int32) []StoredBatch {
-	// Tier 1: Ring buffer (memory) — only if the requested offset is within the ring
 	oldest := pd.ring.OldestOffset()
 	if oldest >= 0 && offset >= oldest {
 		if batches := pd.ring.CollectFrom(offset, maxBytes); len(batches) > 0 {
+			pd.mu.RUnlock()
 			return batches
 		}
 	}
+	// Capture immutable references needed for cold reads before releasing lock.
+	topicID := pd.TopicID
+	partIdx := pd.Index
+	topic := pd.Topic
+	walIdx := pd.walIndex
+	walW := pd.walWriter
+	s3Fetch := pd.s3Fetch
+	pd.mu.RUnlock()
 
-	// Determine the lowest offset available in WAL. If the requested offset
-	// is below the WAL range and S3 is available, skip WAL and try S3 first.
-	// This handles the disaster recovery case where WAL was deleted but S3
-	// still has the old data.
+	// Tier 2 & 3: WAL and S3 reads (no lock held)
+	return fetchFromCold(offset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch)
+}
+
+// readFromWAL reads batches from WAL index entries.
+func readFromWAL(walW *wal.Writer, entries []wal.IndexEntry) []StoredBatch {
+	var result []StoredBatch
+	for _, e := range entries {
+		data, err := walW.ReadBatch(e)
+		if err != nil {
+			break
+		}
+		meta, err := ParseBatchHeader(data)
+		if err != nil {
+			break
+		}
+		result = append(result, StoredBatch{
+			BaseOffset:      e.BaseOffset,
+			LastOffsetDelta: meta.LastOffsetDelta,
+			RawBytes:        data,
+			MaxTimestamp:    meta.MaxTimestamp,
+			NumRecords:      meta.NumRecords,
+		})
+	}
+	return result
+}
+
+// readFromS3 reads batches from S3.
+func readFromS3(s3Fetch S3Fetcher, topic string, partition int32, offset int64, maxBytes int32) []StoredBatch {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s3Batches, err := s3Fetch.FetchBatches(ctx, topic, partition, offset, maxBytes)
+	if err != nil || len(s3Batches) == 0 {
+		return nil
+	}
+	var result []StoredBatch
+	for _, sb := range s3Batches {
+		meta, parseErr := ParseBatchHeader(sb.RawBytes)
+		if parseErr != nil {
+			continue
+		}
+		result = append(result, StoredBatch{
+			BaseOffset:      sb.BaseOffset,
+			LastOffsetDelta: sb.LastOffsetDelta,
+			RawBytes:        sb.RawBytes,
+			MaxTimestamp:    meta.MaxTimestamp,
+			NumRecords:      meta.NumRecords,
+		})
+	}
+	return result
+}
+
+// fetchFromCold implements the WAL + S3 tiers of the read cascade.
+// Called without any partition lock held.
+func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32, topic string, walIdx *wal.Index, walW *wal.Writer, s3Fetch S3Fetcher) []StoredBatch {
+	// Look up WAL entries once and reuse for both the primary and fallback paths.
+	var walEntries []wal.IndexEntry
+	if walIdx != nil && walW != nil {
+		tp := wal.TopicPartition{TopicID: topicID, Partition: partIdx}
+		walEntries = walIdx.Lookup(tp, offset, maxBytes)
+	}
+
+	// Try WAL first, then S3, with fallback logic for disaster recovery.
 	walHasOffset := false
-	if pd.walIndex != nil && pd.walWriter != nil {
-		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
-		entries := pd.walIndex.Lookup(tp, offset, maxBytes)
-		if len(entries) > 0 {
-			// Only use WAL if its entries actually start at or near the
-			// requested offset. If the first entry's BaseOffset is far
-			// beyond the requested offset, the data for the requested
-			// offset is not in the WAL — try S3 first.
-			if entries[0].BaseOffset <= offset || pd.s3Fetch == nil {
-				walHasOffset = true
-				var result []StoredBatch
-				for _, e := range entries {
-					data, err := pd.walWriter.ReadBatch(e)
-					if err != nil {
-						break
-					}
-					meta, err := ParseBatchHeader(data)
-					if err != nil {
-						break
-					}
-					result = append(result, StoredBatch{
-						BaseOffset:      e.BaseOffset,
-						LastOffsetDelta: meta.LastOffsetDelta,
-						RawBytes:        data,
-						MaxTimestamp:    meta.MaxTimestamp,
-						NumRecords:      meta.NumRecords,
-					})
-				}
-				if len(result) > 0 {
-					return result
-				}
+	if len(walEntries) > 0 {
+		// Only use WAL if its entries actually start at or near the
+		// requested offset. If the first entry's BaseOffset is far
+		// beyond the requested offset, the data for the requested
+		// offset is not in the WAL — try S3 first.
+		if walEntries[0].BaseOffset <= offset || s3Fetch == nil {
+			walHasOffset = true
+			if result := readFromWAL(walW, walEntries); len(result) > 0 {
+				return result
 			}
 		}
 	}
 
-	// Tier 3 (Phase 4): S3 range read
-	if pd.s3Fetch != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		s3Batches, err := pd.s3Fetch.FetchBatches(ctx, pd.Topic, pd.Index, offset, maxBytes)
-		if err == nil && len(s3Batches) > 0 {
-			var result []StoredBatch
-			for _, sb := range s3Batches {
-				meta, parseErr := ParseBatchHeader(sb.RawBytes)
-				if parseErr != nil {
-					continue
-				}
-				result = append(result, StoredBatch{
-					BaseOffset:      sb.BaseOffset,
-					LastOffsetDelta: sb.LastOffsetDelta,
-					RawBytes:        sb.RawBytes,
-					MaxTimestamp:    meta.MaxTimestamp,
-					NumRecords:      meta.NumRecords,
-				})
-			}
-			if len(result) > 0 {
-				return result
-			}
+	// S3 range read
+	if s3Fetch != nil {
+		if result := readFromS3(s3Fetch, topic, partIdx, offset, maxBytes); len(result) > 0 {
+			return result
 		}
 	}
 
 	// Fallback: if S3 didn't have data but WAL does (for a higher range), use WAL
-	if !walHasOffset && pd.walIndex != nil && pd.walWriter != nil {
-		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
-		entries := pd.walIndex.Lookup(tp, offset, maxBytes)
-		if len(entries) > 0 {
-			var result []StoredBatch
-			for _, e := range entries {
-				data, err := pd.walWriter.ReadBatch(e)
-				if err != nil {
-					break
-				}
-				meta, err := ParseBatchHeader(data)
-				if err != nil {
-					break
-				}
-				result = append(result, StoredBatch{
-					BaseOffset:      e.BaseOffset,
-					LastOffsetDelta: meta.LastOffsetDelta,
-					RawBytes:        data,
-					MaxTimestamp:    meta.MaxTimestamp,
-					NumRecords:      meta.NumRecords,
-				})
-			}
-			if len(result) > 0 {
-				return result
-			}
+	if !walHasOffset && len(walEntries) > 0 {
+		if result := readFromWAL(walW, walEntries); len(result) > 0 {
+			return result
 		}
 	}
 	return nil
@@ -605,45 +496,28 @@ func (pd *PartData) fetchFromTiered(offset int64, maxBytes int32) []StoredBatch 
 //
 // Returns (offset, timestamp). For -1 and -2, timestamp is -1.
 // Caller must hold pd.mu.RLock().
-func (pd *PartData) ListOffsets(timestamp int64) (offset int64, ts int64) {
+func (pd *PartData) ListOffsets(timestamp int64, isolationLevel int8) (offset int64, ts int64) {
 	switch timestamp {
 	case -1: // Latest
+		if isolationLevel == 1 { // read_committed: return LSO
+			return pd.LSO(), -1
+		}
 		return pd.hw, -1
 	case -2: // Earliest
 		return pd.logStart, -1
 	case -3: // MaxTimestamp (KIP-734)
-		if pd.ring != nil {
-			// Ring buffer mode
-			if pd.maxTimestampBatchIdx < 0 {
-				return -1, -1
-			}
-			return pd.maxTimestampOffset, pd.maxTimestampVal
-		}
-		// Phase 1 slice mode
-		if len(pd.batches) == 0 || pd.maxTimestampBatchIdx < 0 {
+		if !pd.hasMaxTimestamp {
 			return -1, -1
 		}
-		b := &pd.batches[pd.maxTimestampBatchIdx]
-		return b.BaseOffset + int64(b.LastOffsetDelta), b.MaxTimestamp
+		return pd.maxTimestampOffset, pd.maxTimestampVal
 	default: // timestamp >= 0: find first batch with MaxTimestamp >= timestamp
-		if pd.ring != nil {
-			return pd.listOffsetsRingTimestamp(timestamp)
-		}
-		if len(pd.batches) == 0 {
-			return -1, -1
-		}
-		for i := range pd.batches {
-			if pd.batches[i].MaxTimestamp >= timestamp {
-				return pd.batches[i].BaseOffset, pd.batches[i].MaxTimestamp
-			}
-		}
-		return -1, -1
+		return pd.listOffsetsRingTimestamp(timestamp)
 	}
 }
 
 // listOffsetsRingTimestamp scans the ring buffer for a timestamp match.
 func (pd *PartData) listOffsetsRingTimestamp(timestamp int64) (int64, int64) {
-	if pd.ring == nil || pd.ring.Len() == 0 {
+	if pd.ring.Len() == 0 {
 		return -1, -1
 	}
 	for seq := pd.ring.head; seq < pd.ring.tail; seq++ {
@@ -653,7 +527,7 @@ func (pd *PartData) listOffsetsRingTimestamp(timestamp int64) (int64, int64) {
 			return b.BaseOffset, b.MaxTimestamp
 		}
 	}
-	// TODO: Phase 3+ could also check WAL index for older data
+	// Data flushed to WAL/S3 is not searched (accepted limitation — see 10-list-offsets.md).
 	return -1, -1
 }
 
@@ -711,113 +585,16 @@ func (pd *PartData) AbortedTxnsInRange(fetchOffset int64, lastOffset int64) []Ab
 	return result
 }
 
-// RetentionScan evaluates time-based and size-based retention policies on this
-// partition under a read lock. Returns the new logStartOffset to advance to, or
-// the current logStart if no trimming is needed.
-//
-// retentionMs < 0 means infinite (skip time check).
-// retentionBytes < 0 means infinite (skip size check).
-// nowMs is the current wall clock time in milliseconds.
-// Caller must NOT hold pd.mu.
-func (pd *PartData) RetentionScan(retentionMs int64, retentionBytes int64, nowMs int64) (newLogStart int64, origLogStart int64) {
-	pd.mu.RLock()
-	defer pd.mu.RUnlock()
-
-	origLogStart = pd.logStart
-	newLogStart = origLogStart
-	var bytesToDrop int64
-
-	cutoff := nowMs - retentionMs // only meaningful if retentionMs >= 0
-
-	if pd.ring != nil {
-		// Ring buffer mode: also scan WAL index entries for older data
-		// For now, scan ring buffer batches (most recent data).
-		// WAL index entries are not included in the retention scan because
-		// we don't store MaxTimestamp in the index. Ring buffer + in-memory
-		// batches are what we can scan.
-		for seq := pd.ring.head; seq < pd.ring.tail; seq++ {
-			slot := int(seq % int64(pd.ring.capacity))
-			b := pd.ring.batches[slot]
-			if b.RawBytes == nil {
-				continue
-			}
-			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
-			shouldTrim := false
-
-			if retentionMs >= 0 && b.MaxTimestamp < cutoff {
-				shouldTrim = true
-			}
-			if retentionBytes >= 0 && (pd.totalBytes-bytesToDrop) > retentionBytes {
-				shouldTrim = true
-			}
-
-			if shouldTrim {
-				newLogStart = lastOffset + 1
-				bytesToDrop += int64(len(b.RawBytes))
-			} else {
-				break
-			}
-		}
-	} else {
-		// Phase 1 slice mode
-		for i := range pd.batches {
-			b := &pd.batches[i]
-			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
-			shouldTrim := false
-
-			totalBytesForCalc := pd.TotalBytes()
-			if retentionMs >= 0 && b.MaxTimestamp < cutoff {
-				shouldTrim = true
-			}
-			if retentionBytes >= 0 && (totalBytesForCalc-bytesToDrop) > retentionBytes {
-				shouldTrim = true
-			}
-
-			if shouldTrim {
-				newLogStart = lastOffset + 1
-				bytesToDrop += int64(len(b.RawBytes))
-			} else {
-				break
-			}
-		}
-	}
-
-	return newLogStart, origLogStart
-}
-
-// BatchCount returns the number of stored batches.
+// BatchCount returns the number of stored batches in the ring buffer.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) BatchCount() int {
-	if pd.ring != nil {
-		return pd.ring.Len()
-	}
-	return len(pd.batches)
+	return pd.ring.Len()
 }
 
 // TotalBytes returns the total bytes of stored batch data.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) TotalBytes() int64 {
-	if pd.ring != nil {
-		return pd.totalBytes
-	}
-	var total int64
-	for i := range pd.batches {
-		total += int64(len(pd.batches[i].RawBytes))
-	}
-	return total
-}
-
-// AdvanceLogStart advances the log start offset without metadata.log persistence.
-// Used by DeleteRecords when metadata.log is not available (Phase 1 mode).
-// Caller must hold pd.mu.Lock().
-func (pd *PartData) AdvanceLogStart(offset int64) {
-	if offset <= pd.logStart {
-		return
-	}
-	if offset > pd.hw {
-		offset = pd.hw
-	}
-	pd.trimBatchesLocked(offset)
+	return pd.totalBytes
 }
 
 // AdvanceLogStartOffset advances the partition's logStartOffset to newOffset,
@@ -828,7 +605,7 @@ func (pd *PartData) AdvanceLogStart(offset int64) {
 // Caller must NOT hold pd.mu (this method acquires it internally).
 // Caller must hold pd.CompactionMu.
 //
-// If metaLog is nil, the persistence step is skipped (Phase 1 / tests).
+// If metaLog is nil, the persistence step is skipped (tests only).
 func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log) error {
 	pd.mu.Lock()
 	if pd.logStart >= newOffset {
@@ -862,6 +639,11 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 		pd.walIndex.PruneBefore(tp, newOffset)
 	}
 
+	// Signal the WAL writer to clean up segments that are no longer referenced.
+	if pd.walWriter != nil {
+		pd.walWriter.TryCleanupSegments()
+	}
+
 	return nil
 }
 
@@ -869,50 +651,17 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 // newLogStart, then sets pd.logStart = newLogStart. Updates pd.totalBytes.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) trimBatchesLocked(newLogStart int64) {
-	if pd.ring != nil {
-		// Ring buffer mode: advance ring.head past trimmed batches.
-		for pd.ring.head < pd.ring.tail {
-			slot := int(pd.ring.head % int64(pd.ring.capacity))
-			b := pd.ring.batches[slot]
-			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
-			if lastOffset >= newLogStart {
-				break
-			}
-			pd.totalBytes -= int64(len(b.RawBytes))
-			pd.ring.batches[slot] = StoredBatch{} // zero out for GC
-			pd.ring.head++
+	for pd.ring.head < pd.ring.tail {
+		slot := int(pd.ring.head % int64(pd.ring.capacity))
+		b := pd.ring.batches[slot]
+		lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+		if lastOffset >= newLogStart {
+			break
 		}
-	} else {
-		// Phase 1 slice mode: trim batches
-		trimIdx := 0
-		for trimIdx < len(pd.batches) {
-			b := &pd.batches[trimIdx]
-			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
-			if lastOffset < newLogStart {
-				trimIdx++
-			} else {
-				break
-			}
-		}
-
-		if trimIdx > 0 {
-			copy(pd.batches, pd.batches[trimIdx:])
-			for i := len(pd.batches) - trimIdx; i < len(pd.batches); i++ {
-				pd.batches[i] = StoredBatch{} // zero out for GC
-			}
-			pd.batches = pd.batches[:len(pd.batches)-trimIdx]
-
-			// Recalculate maxTimestampBatchIdx
-			pd.maxTimestampBatchIdx = -1
-			for i := range pd.batches {
-				if pd.maxTimestampBatchIdx < 0 || pd.batches[i].MaxTimestamp >= pd.batches[pd.maxTimestampBatchIdx].MaxTimestamp {
-					pd.maxTimestampBatchIdx = i
-				}
-			}
-		}
+		pd.totalBytes -= int64(len(b.RawBytes))
+		pd.ring.batches[slot] = StoredBatch{} // zero out for GC
+		pd.ring.head++
 	}
 
 	pd.logStart = newLogStart
 }
-
-

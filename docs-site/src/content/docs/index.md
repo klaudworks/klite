@@ -17,21 +17,12 @@ hero:
 ## Up and running in 5 seconds
 
 ```bash
-# Download
-curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-$(uname -s | tr A-Z a-z)-$(uname -m) -o klite && chmod +x klite
-
-# Start
-./klite
+# Start klite
+docker run -p 9092:9092 ghcr.io/klaudworks/klite
 
 # Produce & consume (in another terminal)
 echo "hello klite" | kcat -P -b localhost:9092 -t my-topic
 kcat -C -b localhost:9092 -t my-topic -e
-```
-
-Or with Docker:
-
-```bash
-docker run -p 9092:9092 ghcr.io/klaudworks/klite
 ```
 
 ## Why klite?

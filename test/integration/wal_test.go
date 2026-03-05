@@ -26,7 +26,7 @@ func TestWALProduceRestart(t *testing.T) {
 	// Phase 1: Start broker with WAL, produce data
 	func() {
 		tb := StartBroker(t,
-			WithWALEnabled(true),
+
 			WithDataDir(dataDir),
 		)
 
@@ -71,7 +71,7 @@ func TestWALProduceRestart(t *testing.T) {
 	// With metadata.log, the topic metadata is persisted, so WAL replay
 	// can find the topic and rebuild partition state from WAL entries.
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 	)
 
@@ -118,9 +118,9 @@ func TestWALReadTier(t *testing.T) {
 
 	topic := "wal-read-tier-test"
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		// Use a tiny ring buffer: 16 slots * 1 partition * ~16 KiB est = very small
-		WithRingBufferMaxMem(16 * 16 * 1024),
+		WithRingBufferMaxMem(16*16*1024),
 	)
 
 	admin := NewAdminClient(t, tb.Addr)
@@ -130,8 +130,8 @@ func TestWALReadTier(t *testing.T) {
 	producer := NewClient(t, tb.Addr,
 		kgo.DefaultProduceTopic(topic),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-		kgo.MaxBufferedRecords(1),       // Force immediate flush per record
-		kgo.ProducerLinger(0),           // No linger — send immediately
+		kgo.MaxBufferedRecords(1), // Force immediate flush per record
+		kgo.ProducerLinger(0),     // No linger — send immediately
 	)
 
 	// Produce 50 records (each as a separate batch via ProduceSync with MaxBufferedRecords=1).
@@ -178,7 +178,7 @@ func TestWALTopicConfigSurvivesRestart(t *testing.T) {
 	// Phase 1: Start broker, create topic with custom config
 	func() {
 		tb := StartBroker(t,
-			WithWALEnabled(true),
+
 			WithDataDir(dataDir),
 			WithAutoCreateTopics(false),
 		)
@@ -213,7 +213,7 @@ func TestWALTopicConfigSurvivesRestart(t *testing.T) {
 
 	// Phase 2: Restart, verify config persists
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithAutoCreateTopics(false),
 	)
@@ -249,7 +249,7 @@ func TestWALCommittedOffsetsSurviveRestart(t *testing.T) {
 	// Phase 1: Start broker, produce data, commit offsets
 	func() {
 		tb := StartBroker(t,
-			WithWALEnabled(true),
+
 			WithDataDir(dataDir),
 		)
 
@@ -295,7 +295,7 @@ func TestWALCommittedOffsetsSurviveRestart(t *testing.T) {
 
 	// Phase 2: Restart, verify offsets persist
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 	)
 
@@ -330,7 +330,7 @@ func TestWALMultiPartitionRestart(t *testing.T) {
 	// Phase 1: Start broker, create multi-partition topic, produce data
 	func() {
 		tb := StartBroker(t,
-			WithWALEnabled(true),
+
 			WithDataDir(dataDir),
 		)
 
@@ -370,7 +370,7 @@ func TestWALMultiPartitionRestart(t *testing.T) {
 
 	// Phase 2: Restart and verify all partitions
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 	)
 
@@ -424,7 +424,7 @@ func TestWALCrashRecovery(t *testing.T) {
 	// Phase 1: Start broker, produce data, stop cleanly
 	func() {
 		tb := StartBroker(t,
-			WithWALEnabled(true),
+
 			WithDataDir(dataDir),
 		)
 
@@ -490,7 +490,7 @@ func TestWALCrashRecovery(t *testing.T) {
 
 	// Phase 2: Restart — broker should truncate the corrupted tail and recover
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 	)
 
@@ -543,7 +543,7 @@ func TestWALSegmentRotation(t *testing.T) {
 	// Phase 1: Produce enough data to cause multiple segment rotations
 	func() {
 		tb := StartBroker(t,
-			WithWALEnabled(true),
+
 			WithDataDir(dataDir),
 			WithWALSegmentMaxBytes(segMaxBytes),
 		)
@@ -596,7 +596,7 @@ func TestWALSegmentRotation(t *testing.T) {
 
 	// Phase 2: Restart and verify all records across segments
 	tb2 := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 		WithWALSegmentMaxBytes(segMaxBytes),
 	)
@@ -641,7 +641,7 @@ func TestWALEmptyStart(t *testing.T) {
 	dataDir := t.TempDir()
 
 	tb := StartBroker(t,
-		WithWALEnabled(true),
+
 		WithDataDir(dataDir),
 	)
 
@@ -691,7 +691,7 @@ func TestWALProduceConsume(t *testing.T) {
 	t.Parallel()
 
 	topic := "wal-produce-consume-test"
-	tb := StartBroker(t, WithWALEnabled(true))
+	tb := StartBroker(t)
 
 	admin := NewAdminClient(t, tb.Addr)
 	_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)

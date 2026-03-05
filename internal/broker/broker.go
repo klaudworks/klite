@@ -40,9 +40,9 @@ type Broker struct {
 	logger     *slog.Logger
 	server     *server.Server
 	handlers   *server.HandlerRegistry
-	walWriter  *wal.Writer    // nil if WAL disabled
-	walIndex   *wal.Index     // nil if WAL disabled
-	metaLog    *metadata.Log  // nil if metadata persistence disabled
+	walWriter  *wal.Writer      // nil if WAL disabled
+	walIndex   *wal.Index       // nil if WAL disabled
+	metaLog    *metadata.Log    // nil if metadata persistence disabled
 	s3Client   *s3store.Client  // nil if S3 disabled
 	s3Reader   *s3store.Reader  // nil if S3 disabled
 	s3Flusher  *s3store.Flusher // nil if S3 disabled
@@ -55,6 +55,7 @@ type Broker struct {
 // New creates a new Broker with the given config.
 func New(cfg Config) *Broker {
 	logger := setupLogger(cfg.LogLevel)
+	slog.SetDefault(logger)
 	handlers := server.NewHandlerRegistry()
 	shutdownCh := make(chan struct{})
 	srv := server.NewServer(handlers, shutdownCh, logger)
@@ -211,16 +212,14 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	// 3. Initialize metadata.log if WAL is enabled (replay metadata first)
-	if b.cfg.WALEnabled {
-		if err := b.initMetadataLog(); err != nil {
-			return fmt.Errorf("init metadata.log: %w", err)
-		}
-		// After metadata.log replay (which may have loaded persisted SCRAM
-		// credentials), re-apply CLI-flag user so config always wins.
-		if b.saslStore != nil && b.cfg.SASLUser != "" && b.cfg.SASLPassword != "" {
-			b.applyCLISASLUser()
-		}
+	// 3. Initialize metadata.log (replay metadata first)
+	if err := b.initMetadataLog(); err != nil {
+		return fmt.Errorf("init metadata.log: %w", err)
+	}
+	// After metadata.log replay (which may have loaded persisted SCRAM
+	// credentials), re-apply CLI-flag user so config always wins.
+	if b.saslStore != nil && b.cfg.SASLUser != "" && b.cfg.SASLPassword != "" {
+		b.applyCLISASLUser()
 	}
 
 	// Validate SASL: if enabled but no credentials configured, refuse to start
@@ -228,15 +227,13 @@ func (b *Broker) Run(ctx context.Context) error {
 		return fmt.Errorf("SASL is enabled but no credentials are configured; add users via --sasl-user/--sasl-password or config file")
 	}
 
-	// 4. Initialize WAL if enabled (replay WAL after metadata)
-	if b.cfg.WALEnabled {
-		if err := b.initWAL(); err != nil {
-			return fmt.Errorf("init WAL: %w", err)
-		}
+	// 4. Initialize WAL (replay WAL after metadata)
+	if err := b.initWAL(); err != nil {
+		return fmt.Errorf("init WAL: %w", err)
 	}
 
 	// 4b. Initialize S3 if configured
-	if b.cfg.S3Bucket != "" && b.cfg.WALEnabled {
+	if b.cfg.S3Bucket != "" {
 		if err := b.initS3(); err != nil {
 			return fmt.Errorf("init S3: %w", err)
 		}
@@ -269,11 +266,19 @@ func (b *Broker) Run(ctx context.Context) error {
 		"cluster_id", b.clusterID,
 		"node_id", b.cfg.NodeID,
 		"data_dir", b.cfg.DataDir,
-		"wal_enabled", b.cfg.WALEnabled,
 	)
 
 	// Signal that initialization is complete
 	close(b.ready)
+
+	// 8a. Start HTTP health server if configured (opt-in via --health-addr)
+	var healthShutdown func()
+	if b.cfg.HealthAddr != "" || b.cfg.HealthListener != nil {
+		healthShutdown, err = b.startHealthServer()
+		if err != nil {
+			return fmt.Errorf("health server: %w", err)
+		}
+	}
 
 	// 8b. Start retention loop
 	go b.retentionLoop(ctx)
@@ -302,6 +307,9 @@ func (b *Broker) Run(ctx context.Context) error {
 
 	// 10. Shutdown sequence
 	b.shutdown()
+	if healthShutdown != nil {
+		healthShutdown()
+	}
 
 	// 11. Wait for Serve() to return so no new connections are accepted
 	if !serveReturned {
@@ -460,24 +468,25 @@ func (b *Broker) initWAL() error {
 		return fmt.Errorf("create WAL writer: %w", err)
 	}
 
-	// Replay existing WAL entries to rebuild state
-	if err := b.replayWAL(w); err != nil {
-		return fmt.Errorf("replay WAL: %w", err)
-	}
-
-	// Start the writer goroutine
-	if err := w.Start(); err != nil {
-		return fmt.Errorf("start WAL writer: %w", err)
-	}
-
 	b.walWriter = w
 
-	// Configure cluster state for WAL mode
+	// Initialize ring buffers on all partitions BEFORE replay so that
+	// CommitBatch can push data into them during WAL replay.
 	ringMem := b.cfg.RingBufferMaxMem
 	if ringMem == 0 {
 		ringMem = 512 * 1024 * 1024 // 512 MiB
 	}
 	b.state.SetWALConfig(w, idx, ringMem)
+
+	// Replay existing WAL entries to rebuild state
+	if err := b.replayWAL(w); err != nil {
+		return fmt.Errorf("replay WAL: %w", err)
+	}
+
+	// Start the writer goroutine (after replay, so no concurrent writes during rebuild)
+	if err := w.Start(); err != nil {
+		return fmt.Errorf("start WAL writer: %w", err)
+	}
 
 	b.logger.Info("WAL initialized",
 		"dir", walDir,
@@ -578,10 +587,7 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 			// value takes precedence and WAL data below it was already skipped.
 		}
 
-		// If ring buffer is initialized, push to it
-		if pd.HasWAL() {
-			pd.CommitBatch(batch)
-		}
+		pd.CommitBatch(batch)
 		pd.Unlock()
 
 		// Add to WAL index
@@ -726,7 +732,11 @@ func (b *Broker) maybeRecoverFromS3() error {
 			return fmt.Errorf("S3API must implement s3.S3API")
 		}
 	} else {
-		return fmt.Errorf("no S3 API client available for recovery")
+		var err error
+		s3api, err = createAWSS3Client(b.cfg)
+		if err != nil {
+			return fmt.Errorf("create AWS S3 client for recovery: %w", err)
+		}
 	}
 
 	prefix := b.cfg.S3Prefix
@@ -1176,59 +1186,6 @@ func scramMechName(mech int8) string {
 	}
 }
 
-// retentionLoop runs the retention enforcement goroutine.
-func (b *Broker) retentionLoop(ctx context.Context) {
-	interval := b.cfg.RetentionCheckInterval
-	if interval == 0 {
-		interval = 5 * time.Minute
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			b.enforceRetention()
-		}
-	}
-}
-
-// enforceRetention scans all partitions and trims data exceeding retention.
-func (b *Broker) enforceRetention() {
-	nowMs := time.Now().UnixMilli()
-	topics := b.state.GetAllTopics()
-
-	for _, td := range topics {
-		retentionMs := int64(604800000) // 7 days default
-		retentionBytes := int64(-1)     // infinite default
-
-		if v, ok := td.Configs["retention.ms"]; ok {
-			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-				retentionMs = parsed
-			}
-		}
-		if v, ok := td.Configs["retention.bytes"]; ok {
-			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-				retentionBytes = parsed
-			}
-		}
-
-		for _, pd := range td.Partitions {
-			newLogStart, origLogStart := pd.RetentionScan(retentionMs, retentionBytes, nowMs)
-			if newLogStart > origLogStart {
-				pd.CompactionMu.Lock()
-				if err := pd.AdvanceLogStartOffset(newLogStart, b.metaLog); err != nil {
-					b.logger.Warn("retention: failed to advance logStartOffset",
-						"topic", td.Name, "partition", pd.Index,
-						"new_log_start", newLogStart, "err", err)
-				}
-				pd.CompactionMu.Unlock()
-			}
-		}
-	}
-}
-
 // compactionLoop runs the background compaction goroutine.
 func (b *Broker) compactionLoop(ctx context.Context) {
 	interval := b.cfg.CompactionCheckInterval
@@ -1241,9 +1198,9 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 	}
 
 	compactor := s3store.NewCompactor(s3store.CompactorConfig{
-		Client:  b.s3Client,
-		Reader:  b.s3Reader,
-		Logger:  b.logger,
+		Client: b.s3Client,
+		Reader: b.s3Reader,
+		Logger: b.logger,
 		PersistWatermark: func(topic string, partition int32, cleanedUpTo int64) error {
 			if b.metaLog == nil {
 				return nil
@@ -1257,6 +1214,7 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 		},
 		WindowBytes:   b.cfg.CompactionWindowBytes,
 		S3Concurrency: b.cfg.CompactionS3Concurrency,
+		ReadRateLimit: b.cfg.CompactionReadRate,
 	})
 
 	ticker := time.NewTicker(interval)

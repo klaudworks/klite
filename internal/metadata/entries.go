@@ -7,12 +7,12 @@ import (
 
 // Entry types for metadata.log.
 const (
-	EntryCreateTopic          byte = 0x01
-	EntryDeleteTopic          byte = 0x02
-	EntryAlterConfig          byte = 0x03
-	EntryOffsetCommit         byte = 0x04
-	EntryProducerID           byte = 0x05
-	EntryLogStartOffset       byte = 0x06
+	EntryCreateTopic           byte = 0x01
+	EntryDeleteTopic           byte = 0x02
+	EntryAlterConfig           byte = 0x03
+	EntryOffsetCommit          byte = 0x04
+	EntryProducerID            byte = 0x05
+	EntryLogStartOffset        byte = 0x06
 	EntryScramCredential       byte = 0x07
 	EntryScramCredentialDelete byte = 0x08
 	EntryCompactionWatermark   byte = 0x09
@@ -88,11 +88,11 @@ func getString(buf []byte, off int) (string, int, error) {
 // MarshalCreateTopic serializes a CreateTopicEntry.
 func MarshalCreateTopic(e *CreateTopicEntry) []byte {
 	// Calculate size
-	size := 1                          // type
-	size += 2 + len(e.TopicName)       // topic name
-	size += 4                          // partition count
-	size += 16                         // topic ID
-	size += 2                          // config count
+	size := 1                    // type
+	size += 2 + len(e.TopicName) // topic name
+	size += 4                    // partition count
+	size += 16                   // topic ID
+	size += 2                    // config count
 	for k, v := range e.Configs {
 		size += 2 + len(k) + 2 + len(v)
 	}
@@ -360,7 +360,7 @@ func UnmarshalCompactionWatermark(payload []byte) (CompactionWatermarkEntry, err
 // ScramCredentialEntry records a SCRAM credential upsert.
 type ScramCredentialEntry struct {
 	Username   string
-	Mechanism  int8   // 1=SHA-256, 2=SHA-512
+	Mechanism  int8 // 1=SHA-256, 2=SHA-512
 	Iterations int32
 	Salt       []byte
 	SaltedPass []byte

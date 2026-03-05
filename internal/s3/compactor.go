@@ -10,14 +10,15 @@ import (
 	"time"
 
 	"github.com/klaudworks/klite/internal/clock"
+	"golang.org/x/time/rate"
 )
 
 // CompactorConfig holds configuration for the log compactor.
 type CompactorConfig struct {
-	Client  *Client
-	Reader  *Reader
-	Logger  *slog.Logger
-	Clock   clock.Clock
+	Client *Client
+	Reader *Reader
+	Logger *slog.Logger
+	Clock  clock.Clock
 
 	// WindowBytes is the max total source object size per compaction window (default 256 MiB).
 	WindowBytes int64
@@ -35,15 +36,20 @@ type CompactorConfig struct {
 	// DeleteRetentionMs is the topic-level delete.retention.ms (default 24h).
 	// Tombstones older than this are removed during compaction.
 	DeleteRetentionMs int64
+
+	// ReadRateLimit is the maximum S3 read throughput in bytes/sec for compaction.
+	// 0 means unlimited. Default 50 MiB/s.
+	ReadRateLimit int
 }
 
 // Compactor performs log compaction on S3 objects for a single partition.
 type Compactor struct {
-	cfg    CompactorConfig
-	client *Client
-	reader *Reader
-	logger *slog.Logger
-	clock  clock.Clock
+	cfg         CompactorConfig
+	client      *Client
+	reader      *Reader
+	logger      *slog.Logger
+	clock       clock.Clock
+	rateLimiter *rate.Limiter // nil if unlimited
 }
 
 // NewCompactor creates a new compactor.
@@ -66,13 +72,18 @@ func NewCompactor(cfg CompactorConfig) *Compactor {
 	if cfg.DeleteRetentionMs == 0 {
 		cfg.DeleteRetentionMs = 86400000 // 24 hours
 	}
+	var rl *rate.Limiter
+	if cfg.ReadRateLimit > 0 {
+		rl = rate.NewLimiter(rate.Limit(cfg.ReadRateLimit), cfg.ReadRateLimit)
+	}
 
 	return &Compactor{
-		cfg:    cfg,
-		client: cfg.Client,
-		reader: cfg.Reader,
-		logger: cfg.Logger,
-		clock:  cfg.Clock,
+		cfg:         cfg,
+		client:      cfg.Client,
+		reader:      cfg.Reader,
+		logger:      cfg.Logger,
+		clock:       cfg.Clock,
+		rateLimiter: rl,
 	}
 }
 
@@ -114,9 +125,10 @@ func (c *Compactor) CompactPartition(
 			continue
 		}
 		parsed = append(parsed, windowObj{
-			key:        obj.Key,
-			size:       obj.Size,
-			baseOffset: baseOff,
+			key:          obj.Key,
+			size:         obj.Size,
+			baseOffset:   baseOff,
+			lastModified: obj.LastModified,
 		})
 	}
 	sort.Slice(parsed, func(i, j int) bool {
@@ -141,9 +153,10 @@ func (c *Compactor) CompactPartition(
 			continue
 		}
 		parsed = append(parsed, windowObj{
-			key:        obj.Key,
-			size:       obj.Size,
-			baseOffset: baseOff,
+			key:          obj.Key,
+			size:         obj.Size,
+			baseOffset:   baseOff,
+			lastModified: obj.LastModified,
 		})
 	}
 	sort.Slice(parsed, func(i, j int) bool {
@@ -225,6 +238,18 @@ func (c *Compactor) compactWindow(
 		go func(idx int, w windowObj) {
 			defer wg.Done()
 			defer func() { <-sem }()
+
+			// Rate-limit S3 reads to avoid starving consumer fetches.
+			if c.rateLimiter != nil {
+				if err := waitRateLimiter(ctx, c.rateLimiter, int(w.size)); err != nil {
+					mu.Lock()
+					if fetchErr == nil {
+						fetchErr = fmt.Errorf("rate limit wait: %w", err)
+					}
+					mu.Unlock()
+					return
+				}
+			}
 
 			data, err := c.client.GetObject(ctx, w.key)
 			if err != nil {
@@ -363,6 +388,7 @@ func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap ma
 
 		header, err := ParseBatchHeaderFromRaw(batchRaw)
 		if err != nil {
+			c.logger.Warn("compactor: skipping batch with unparseable header in buildOffsetMap", "err", err)
 			continue
 		}
 
@@ -374,6 +400,8 @@ func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap ma
 		codec := header.CompressionCodec()
 		decompressed, err := DecompressRecords(batchRaw, codec)
 		if err != nil {
+			c.logger.Warn("compactor: skipping batch with decompression error in buildOffsetMap",
+				"base_offset", header.BaseOffset, "err", err)
 			continue
 		}
 
@@ -408,6 +436,7 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 
 		header, err := ParseBatchHeaderFromRaw(batchRaw)
 		if err != nil {
+			c.logger.Warn("compactor: skipping batch with unparseable header in filterBatches", "err", err)
 			continue
 		}
 
@@ -426,7 +455,8 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 		codec := header.CompressionCodec()
 		decompressed, err := DecompressRecords(batchRaw, codec)
 		if err != nil {
-			// Keep batch as-is if we can't decompress
+			c.logger.Warn("compactor: keeping batch as-is due to decompression error in filterBatches",
+				"base_offset", header.BaseOffset, "err", err)
 			bd := BatchData{
 				RawBytes:        make([]byte, len(batchRaw)),
 				BaseOffset:      header.BaseOffset,
@@ -524,18 +554,24 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 
 // windowObj holds info about an S3 object for window formation.
 type windowObj struct {
-	key        string
-	size       int64
-	baseOffset int64
+	key          string
+	size         int64
+	baseOffset   int64
+	lastModified time.Time
 }
 
 // formWindows groups objects into compaction windows bounded by WindowBytes.
+// Objects newer than minCompactionLagMs (based on LastModified) are excluded,
+// except for the anchor object which is always included.
 func (c *Compactor) formWindows(parsed []windowObj, anchorIdx int, minCompactionLagMs int64) [][]windowObj {
 	// Start from anchor (or 0 if no anchor)
 	startIdx := 0
 	if anchorIdx >= 0 {
 		startIdx = anchorIdx
 	}
+
+	now := c.clock.Now()
+	lagCutoff := now.Add(-time.Duration(minCompactionLagMs) * time.Millisecond)
 
 	var windows [][]windowObj
 	var currentWindow []windowObj
@@ -544,10 +580,10 @@ func (c *Compactor) formWindows(parsed []windowObj, anchorIdx int, minCompaction
 	for i := startIdx; i < len(parsed); i++ {
 		p := parsed[i]
 
-		wo := windowObj{
-			key:        p.key,
-			size:       p.size,
-			baseOffset: p.baseOffset,
+		// Skip objects that are too recent, unless it's the anchor object.
+		if minCompactionLagMs > 0 && i != anchorIdx &&
+			!p.lastModified.IsZero() && p.lastModified.After(lagCutoff) {
+			continue
 		}
 
 		if currentSize+p.size > c.cfg.WindowBytes && len(currentWindow) > 0 {
@@ -556,7 +592,7 @@ func (c *Compactor) formWindows(parsed []windowObj, anchorIdx int, minCompaction
 			currentSize = 0
 		}
 
-		currentWindow = append(currentWindow, wo)
+		currentWindow = append(currentWindow, p)
 		currentSize += p.size
 	}
 
@@ -663,4 +699,21 @@ type DirtyPartitionInfo struct {
 	DirtyObjects  int32
 	LastCompacted time.Time
 	CleanedUpTo   int64
+}
+
+// waitRateLimiter waits for n tokens from the rate limiter, breaking large
+// reservations into burst-sized chunks to avoid exceeding the limiter's burst.
+func waitRateLimiter(ctx context.Context, rl *rate.Limiter, n int) error {
+	burst := rl.Burst()
+	for n > 0 {
+		chunk := n
+		if chunk > burst {
+			chunk = burst
+		}
+		if err := rl.WaitN(ctx, chunk); err != nil {
+			return err
+		}
+		n -= chunk
+	}
+	return nil
 }

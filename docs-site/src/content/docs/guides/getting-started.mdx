@@ -1,0 +1,202 @@
+---
+title: Quickstart
+description: Install klite and send your first message in under a minute.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+klite is a Kafka-compatible broker in a single Go binary. This guide gets you from zero to producing and consuming messages in under a minute.
+
+## Install and start
+
+<Tabs syncKey="install">
+  <TabItem label="Docker">
+    ```bash
+    docker run -p 9092:9092 ghcr.io/klaudworks/klite
+    ```
+
+    See the [configuration guide](/guides/configuration/) for all available options.
+  </TabItem>
+  <TabItem label="Binary">
+    ```bash
+    # macOS (Apple Silicon)
+    curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-darwin-arm64 -o klite
+
+    # macOS (Intel)
+    curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-darwin-amd64 -o klite
+
+    # Linux (amd64)
+    curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-linux-amd64 -o klite
+
+    # Linux (arm64)
+    curl -L https://github.com/klaudworks/klite/releases/latest/download/klite-linux-arm64 -o klite
+
+    chmod +x klite
+    ./klite
+    ```
+  </TabItem>
+  <TabItem label="From source">
+    ```bash
+    go install github.com/klaudworks/klite/cmd/klite@latest
+    klite
+    ```
+  </TabItem>
+</Tabs>
+
+klite is now listening on `localhost:9092`. You should see:
+
+```
+INFO klite started listen=:9092 cluster_id=abc123 node_id=0
+```
+
+## Produce and consume
+
+Use **any** Kafka client. klite speaks the standard Kafka wire protocol.
+
+<Tabs syncKey="lang">
+  <TabItem label="kcat">
+    ```bash
+    # Produce a message
+    echo "hello klite" | kcat -P -b localhost:9092 -t my-topic
+
+    # Consume all messages
+    kcat -C -b localhost:9092 -t my-topic -e
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    package main
+
+    import (
+    	"context"
+    	"fmt"
+    	"github.com/twmb/franz-go/pkg/kgo"
+    )
+
+    func main() {
+    	// Producer
+    	client, _ := kgo.NewClient(kgo.SeedBrokers("localhost:9092"))
+    	defer client.Close()
+
+    	ctx := context.Background()
+    	client.Produce(ctx, &kgo.Record{
+    		Topic: "my-topic",
+    		Value: []byte("hello from Go"),
+    	}, func(r *kgo.Record, err error) {
+    		if err != nil {
+    			panic(err)
+    		}
+    		fmt.Printf("produced to partition %d offset %d\n", r.Partition, r.Offset)
+    	})
+    	client.Flush(ctx)
+
+    	// Consumer
+    	consumer, _ := kgo.NewClient(
+    		kgo.SeedBrokers("localhost:9092"),
+    		kgo.ConsumeTopics("my-topic"),
+    	)
+    	defer consumer.Close()
+
+    	fetches := consumer.PollFetches(ctx)
+    	fetches.EachRecord(func(r *kgo.Record) {
+    		fmt.Printf("consumed: %s\n", string(r.Value))
+    	})
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from confluent_kafka import Producer, Consumer
+
+    # Produce
+    p = Producer({'bootstrap.servers': 'localhost:9092'})
+    p.produce('my-topic', value='hello from Python')
+    p.flush()
+
+    # Consume
+    c = Consumer({
+        'bootstrap.servers': 'localhost:9092',
+        'group.id': 'my-group',
+        'auto.offset.reset': 'earliest',
+    })
+    c.subscribe(['my-topic'])
+
+    msg = c.poll(5.0)
+    if msg:
+        print(f"consumed: {msg.value().decode()}")
+    c.close()
+    ```
+  </TabItem>
+  <TabItem label="Node.js">
+    ```javascript
+    const { Kafka } = require('kafkajs');
+
+    const kafka = new Kafka({ brokers: ['localhost:9092'] });
+
+    // Produce
+    const producer = kafka.producer();
+    await producer.connect();
+    await producer.send({
+      topic: 'my-topic',
+      messages: [{ value: 'hello from Node.js' }],
+    });
+    await producer.disconnect();
+
+    // Consume
+    const consumer = kafka.consumer({ groupId: 'my-group' });
+    await consumer.connect();
+    await consumer.subscribe({ topic: 'my-topic', fromBeginning: true });
+    await consumer.run({
+      eachMessage: async ({ message }) => {
+        console.log(`consumed: ${message.value.toString()}`);
+      },
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+## Add S3 storage
+
+By default klite stores data in a local WAL. Adding an S3-compatible backend gives you durable, cost-efficient storage. This example uses [SeaweedFS](https://github.com/seaweedfs/seaweedfs) as a local S3 server, but any S3-compatible store (AWS S3, MinIO, R2, etc.) works.
+
+### 1. Start SeaweedFS
+
+```bash
+# Create an S3 credentials config
+cat > /tmp/s3-config.json <<'EOF'
+{"identities":[{"name":"klite","credentials":[{"accessKey":"klite","secretKey":"kliteklite"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+EOF
+
+# Start SeaweedFS with S3 API on port 8333
+docker run -d --name seaweedfs -p 8333:8333 \
+  -v /tmp/s3-config.json:/etc/s3-config.json \
+  chrislusf/seaweedfs server -s3 -s3.config=/etc/s3-config.json
+```
+
+### 2. Start klite with S3
+
+Stop any running klite container, then restart with S3 enabled:
+
+```bash
+docker run --network host \
+  -e AWS_ACCESS_KEY_ID=klite \
+  -e AWS_SECRET_ACCESS_KEY=kliteklite \
+  ghcr.io/klaudworks/klite \
+    --s3-bucket klite-data \
+    --s3-region us-east-1 \
+    --s3-endpoint http://localhost:8333
+```
+
+You should see:
+
+```
+INFO S3 storage initialized bucket=klite-data
+```
+
+Produce and consume work exactly the same as before. klite writes to the local WAL first, then periodically flushes data to SeaweedFS.
+
+## Next steps
+
+- [Configuration](/guides/configuration/) -- networking, storage, S3, authentication
+- [Deploy to Kubernetes](/guides/kubernetes/) -- Helm chart with StatefulSet and PVCs
+- [Architecture](/concepts/architecture/) -- understand how klite works under the hood

@@ -13,7 +13,7 @@ func HandleListTransactions(state *cluster.State) server.Handler {
 		r := req.(*kmsg.ListTransactionsRequest)
 		resp := r.ResponseKind().(*kmsg.ListTransactionsResponse)
 
-		allTxns := state.PIDManager().AllTransactions()
+		snapshots := state.PIDManager().AllTransactions()
 
 		// Build state filter set
 		stateFilter := make(map[string]bool)
@@ -27,9 +27,9 @@ func HandleListTransactions(state *cluster.State) server.Handler {
 			pidFilter[pid] = true
 		}
 
-		for _, ps := range allTxns {
+		for _, snap := range snapshots {
 			var txnState string
-			if ps.TxnState == cluster.TxnOngoing {
+			if snap.TxnState == cluster.TxnOngoing {
 				txnState = "Ongoing"
 			} else {
 				txnState = "Empty"
@@ -41,13 +41,13 @@ func HandleListTransactions(state *cluster.State) server.Handler {
 			}
 
 			// Apply producer ID filter
-			if len(pidFilter) > 0 && !pidFilter[ps.ProducerID] {
+			if len(pidFilter) > 0 && !pidFilter[snap.ProducerID] {
 				continue
 			}
 
 			ts := kmsg.NewListTransactionsResponseTransactionState()
-			ts.TransactionalID = ps.TxnID
-			ts.ProducerID = ps.ProducerID
+			ts.TransactionalID = snap.TxnID
+			ts.ProducerID = snap.ProducerID
 			ts.TransactionState = txnState
 
 			resp.TransactionStates = append(resp.TransactionStates, ts)

@@ -97,7 +97,7 @@ func (s *Store) DeleteScram512(user string) bool {
 
 // ScramUserInfo holds mechanism and iteration count for a SCRAM user.
 type ScramUserInfo struct {
-	Mechanism  int8  // 1=SHA-256, 2=SHA-512
+	Mechanism  int8 // 1=SHA-256, 2=SHA-512
 	Iterations int32
 }
 

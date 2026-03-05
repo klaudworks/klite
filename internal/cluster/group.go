@@ -83,11 +83,11 @@ type Group struct {
 	id    string
 	state GroupState
 
-	protocolType string            // e.g., "consumer"
-	protocol     string            // elected protocol, e.g., "range"
-	protocols    map[string]int    // protocol name -> count of members supporting it
+	protocolType string         // e.g., "consumer"
+	protocol     string         // elected protocol, e.g., "range"
+	protocols    map[string]int // protocol name -> count of members supporting it
 	generation   int32
-	leader       string            // member ID of the leader
+	leader       string // member ID of the leader
 
 	members       map[string]*groupMember // memberID -> member
 	pending       map[string]*groupMember // memberID -> pending member (MEMBER_ID_REQUIRED)
@@ -100,7 +100,7 @@ type Group struct {
 	nJoining int
 
 	// Timers
-	rebalanceTimer *time.Timer // rebalance timeout
+	rebalanceTimer   *time.Timer // rebalance timeout
 	pendingSyncTimer *time.Timer // pending sync timeout
 
 	// Channel-based dispatch
@@ -121,10 +121,10 @@ type TopicPartition struct {
 
 // CommittedOffset stores a committed offset for a topic-partition.
 type CommittedOffset struct {
-	Offset        int64
-	LeaderEpoch   int32
-	Metadata      string
-	CommitTime    time.Time
+	Offset      int64
+	LeaderEpoch int32
+	Metadata    string
+	CommitTime  time.Time
 }
 
 // NewGroup creates a new consumer group and starts its manage goroutine.
@@ -1113,7 +1113,10 @@ func (g *Group) handleOffsetCommit(req *kmsg.OffsetCommitRequest) kmsg.Response 
 						Offset:    rp.Offset,
 						Metadata:  derefStr(rp.Metadata),
 					})
-					g.metaLog.Append(entry) //nolint:errcheck
+					if err := g.metaLog.Append(entry); err != nil {
+						g.logger.Warn("metadata.log: failed to persist OffsetCommit",
+							"group", g.id, "topic", rt.Topic, "partition", rp.Partition, "err", err)
+					}
 				}
 			}
 			rtResp.Partitions = append(rtResp.Partitions, rpResp)
@@ -1125,10 +1128,74 @@ func (g *Group) handleOffsetCommit(req *kmsg.OffsetCommitRequest) kmsg.Response 
 
 // ---- OffsetFetch (handled in group goroutine) ----
 
+// OffsetQuery describes a set of topic-partitions to fetch offsets for.
+// If Topics is nil or empty, all committed offsets are returned.
+type OffsetQuery struct {
+	Topics []OffsetQueryTopic
+}
+
+// OffsetQueryTopic is a topic + partitions to query.
+type OffsetQueryTopic struct {
+	Topic      string
+	Partitions []int32
+}
+
+// OffsetResult is a single partition's committed offset result.
+type OffsetResult struct {
+	Topic       string
+	Partition   int32
+	Offset      int64
+	LeaderEpoch int32
+	Metadata    string
+}
+
+// FetchOffsets looks up committed offsets for the given query. If q.Topics is
+// empty, all committed offsets are returned. Must be called within the group
+// goroutine (via Control or handleRequest).
+func (g *Group) FetchOffsets(q OffsetQuery) []OffsetResult {
+	if len(q.Topics) == 0 {
+		results := make([]OffsetResult, 0, len(g.offsets))
+		for tp, co := range g.offsets {
+			results = append(results, OffsetResult{
+				Topic:       tp.Topic,
+				Partition:   tp.Partition,
+				Offset:      co.Offset,
+				LeaderEpoch: co.LeaderEpoch,
+				Metadata:    co.Metadata,
+			})
+		}
+		return results
+	}
+
+	var results []OffsetResult
+	for _, qt := range q.Topics {
+		for _, p := range qt.Partitions {
+			co, ok := g.offsets[TopicPartition{Topic: qt.Topic, Partition: p}]
+			if ok {
+				results = append(results, OffsetResult{
+					Topic:       qt.Topic,
+					Partition:   p,
+					Offset:      co.Offset,
+					LeaderEpoch: co.LeaderEpoch,
+					Metadata:    co.Metadata,
+				})
+			} else {
+				results = append(results, OffsetResult{
+					Topic:       qt.Topic,
+					Partition:   p,
+					Offset:      -1,
+					LeaderEpoch: -1,
+				})
+			}
+		}
+	}
+	return results
+}
+
 func (g *Group) handleOffsetFetch(req *kmsg.OffsetFetchRequest) kmsg.Response {
 	resp := req.ResponseKind().(*kmsg.OffsetFetchResponse)
 
-	// v8+ uses the Groups array format
+	// v8+ uses the Groups array format — only process entries matching our ID.
 	if req.Version >= 8 {
 		for _, rg := range req.Groups {
 			gResp := kmsg.NewOffsetFetchResponseGroup()
@@ -1140,98 +1207,93 @@ func (g *Group) handleOffsetFetch(req *kmsg.OffsetFetchRequest) kmsg.Response {
 				continue
 			}
 
-			if len(rg.Topics) == 0 {
-				// Fetch all committed offsets
-				topicMap := make(map[string]*kmsg.OffsetFetchResponseGroupTopic)
-				for tp, co := range g.offsets {
-					tResp, ok := topicMap[tp.Topic]
-					if !ok {
-						t := kmsg.NewOffsetFetchResponseGroupTopic()
-						t.Topic = tp.Topic
-						tResp = &t
-						topicMap[tp.Topic] = tResp
-					}
-					pResp := kmsg.NewOffsetFetchResponseGroupTopicPartition()
-					pResp.Partition = tp.Partition
-					pResp.Offset = co.Offset
-					pResp.LeaderEpoch = co.LeaderEpoch
-					pResp.Metadata = &co.Metadata
-					tResp.Partitions = append(tResp.Partitions, pResp)
-				}
-				for _, t := range topicMap {
-					gResp.Topics = append(gResp.Topics, *t)
-				}
-			} else {
-				for _, rt := range rg.Topics {
-					tResp := kmsg.NewOffsetFetchResponseGroupTopic()
-					tResp.Topic = rt.Topic
-					for _, p := range rt.Partitions {
-						pResp := kmsg.NewOffsetFetchResponseGroupTopicPartition()
-						pResp.Partition = p
-						co, ok := g.offsets[TopicPartition{Topic: rt.Topic, Partition: p}]
-						if ok {
-							pResp.Offset = co.Offset
-							pResp.LeaderEpoch = co.LeaderEpoch
-							pResp.Metadata = &co.Metadata
-						} else {
-							pResp.Offset = -1
-							pResp.LeaderEpoch = -1
-						}
-						tResp.Partitions = append(tResp.Partitions, pResp)
-					}
-					gResp.Topics = append(gResp.Topics, tResp)
-				}
-			}
+			q := offsetQueryFromGroupTopics(rg.Topics)
+			results := g.FetchOffsets(q)
+			gResp.Topics = groupTopicsFromResults(results)
 			resp.Groups = append(resp.Groups, gResp)
 		}
 		return resp
 	}
 
-	// v0-v7: single group format
-	if len(req.Topics) == 0 {
-		// Fetch all committed offsets
-		topicMap := make(map[string]*kmsg.OffsetFetchResponseTopic)
-		for tp, co := range g.offsets {
-			tResp, ok := topicMap[tp.Topic]
-			if !ok {
-				t := kmsg.NewOffsetFetchResponseTopic()
-				t.Topic = tp.Topic
-				tResp = &t
-				topicMap[tp.Topic] = tResp
-			}
-			pResp := kmsg.NewOffsetFetchResponseTopicPartition()
-			pResp.Partition = tp.Partition
-			pResp.Offset = co.Offset
-			pResp.LeaderEpoch = co.LeaderEpoch
-			pResp.Metadata = &co.Metadata
-			tResp.Partitions = append(tResp.Partitions, pResp)
-		}
-		for _, t := range topicMap {
-			resp.Topics = append(resp.Topics, *t)
-		}
-	} else {
-		for _, rt := range req.Topics {
-			tResp := kmsg.NewOffsetFetchResponseTopic()
-			tResp.Topic = rt.Topic
-			for _, p := range rt.Partitions {
-				pResp := kmsg.NewOffsetFetchResponseTopicPartition()
-				pResp.Partition = p
-				co, ok := g.offsets[TopicPartition{Topic: rt.Topic, Partition: p}]
-				if ok {
-					pResp.Offset = co.Offset
-					pResp.LeaderEpoch = co.LeaderEpoch
-					pResp.Metadata = &co.Metadata
-				} else {
-					pResp.Offset = -1
-					pResp.LeaderEpoch = -1
-				}
-				tResp.Partitions = append(tResp.Partitions, pResp)
-			}
-			resp.Topics = append(resp.Topics, tResp)
-		}
-	}
-
+	// v0-v7: single group format.
+	q := offsetQueryFromV7Topics(req.Topics)
+	results := g.FetchOffsets(q)
+	resp.Topics = v7TopicsFromResults(results)
 	return resp
+}
+
+// offsetQueryFromGroupTopics converts v8+ OffsetFetchRequestGroupTopic to OffsetQuery.
+func offsetQueryFromGroupTopics(topics []kmsg.OffsetFetchRequestGroupTopic) OffsetQuery {
+	if len(topics) == 0 {
+		return OffsetQuery{}
+	}
+	q := OffsetQuery{Topics: make([]OffsetQueryTopic, len(topics))}
+	for i, t := range topics {
+		q.Topics[i] = OffsetQueryTopic{Topic: t.Topic, Partitions: t.Partitions}
+	}
+	return q
+}
+
+// offsetQueryFromV7Topics converts v0-v7 OffsetFetchRequestTopic to OffsetQuery.
+func offsetQueryFromV7Topics(topics []kmsg.OffsetFetchRequestTopic) OffsetQuery {
+	if len(topics) == 0 {
+		return OffsetQuery{}
+	}
+	q := OffsetQuery{Topics: make([]OffsetQueryTopic, len(topics))}
+	for i, t := range topics {
+		q.Topics[i] = OffsetQueryTopic{Topic: t.Topic, Partitions: t.Partitions}
+	}
+	return q
+}
+
+// groupTopicsFromResults converts OffsetResult slice to v8+ response topics.
+func groupTopicsFromResults(results []OffsetResult) []kmsg.OffsetFetchResponseGroupTopic {
+	topicMap := make(map[string][]kmsg.OffsetFetchResponseGroupTopicPartition)
+	topicOrder := make([]string, 0)
+	for _, r := range results {
+		if _, seen := topicMap[r.Topic]; !seen {
+			topicOrder = append(topicOrder, r.Topic)
+		}
+		pResp := kmsg.NewOffsetFetchResponseGroupTopicPartition()
+		pResp.Partition = r.Partition
+		pResp.Offset = r.Offset
+		pResp.LeaderEpoch = r.LeaderEpoch
+		pResp.Metadata = &r.Metadata
+		topicMap[r.Topic] = append(topicMap[r.Topic], pResp)
+	}
+	out := make([]kmsg.OffsetFetchResponseGroupTopic, 0, len(topicOrder))
+	for _, topic := range topicOrder {
+		t := kmsg.NewOffsetFetchResponseGroupTopic()
+		t.Topic = topic
+		t.Partitions = topicMap[topic]
+		out = append(out, t)
+	}
+	return out
+}
+
+// v7TopicsFromResults converts OffsetResult slice to v0-v7 response topics.
+func v7TopicsFromResults(results []OffsetResult) []kmsg.OffsetFetchResponseTopic {
+	topicMap := make(map[string][]kmsg.OffsetFetchResponseTopicPartition)
+	topicOrder := make([]string, 0)
+	for _, r := range results {
+		if _, seen := topicMap[r.Topic]; !seen {
+			topicOrder = append(topicOrder, r.Topic)
+		}
+		pResp := kmsg.NewOffsetFetchResponseTopicPartition()
+		pResp.Partition = r.Partition
+		pResp.Offset = r.Offset
+		pResp.LeaderEpoch = r.LeaderEpoch
+		pResp.Metadata = &r.Metadata
+		topicMap[r.Topic] = append(topicMap[r.Topic], pResp)
+	}
+	out := make([]kmsg.OffsetFetchResponseTopic, 0, len(topicOrder))
+	for _, topic := range topicOrder {
+		t := kmsg.NewOffsetFetchResponseTopic()
+		t.Topic = topic
+		t.Partitions = topicMap[topic]
+		out = append(out, t)
+	}
+	return out
 }
 
 // ---- OffsetDelete (handled in group goroutine) ----
@@ -1355,7 +1417,10 @@ func (g *Group) ApplyTxnOffset(tp TopicPartition, po PendingTxnOffset) {
 			Offset:    po.Offset,
 			Metadata:  po.Metadata,
 		})
-		g.metaLog.Append(entry) //nolint:errcheck
+		if err := g.metaLog.Append(entry); err != nil {
+			g.logger.Warn("metadata.log: failed to persist TxnOffsetCommit",
+				"group", g.id, "topic", tp.Topic, "partition", tp.Partition, "err", err)
+		}
 	}
 }
 

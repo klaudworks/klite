@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -16,7 +19,7 @@ func HandleInitProducerID(state *cluster.State) server.Handler {
 
 		minV, maxV, ok := VersionRange(22)
 		if !ok || r.Version < minV || r.Version > maxV {
-			resp.ErrorCode = 35 // UNSUPPORTED_VERSION
+			resp.ErrorCode = kerr.UnsupportedVersion.Code
 			return resp, nil
 		}
 
@@ -41,7 +44,9 @@ func HandleInitProducerID(state *cluster.State) server.Handler {
 			entry := metadata.MarshalProducerID(&metadata.ProducerIDEntry{
 				NextProducerID: state.PIDManager().NextPID(),
 			})
-			ml.Append(entry) //nolint:errcheck
+			if err := ml.Append(entry); err != nil {
+			slog.Warn("metadata.log: failed to persist ProducerID", "err", err)
+		}
 		}
 
 		return resp, nil

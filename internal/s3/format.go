@@ -13,16 +13,18 @@ import (
 // S3 object format:
 //
 //	[M bytes]     data section: concatenated raw RecordBatch bytes
-//	[N × 20 B]   batch index: one entry per RecordBatch
+//	[N × 32 B]   batch index: one entry per RecordBatch
 //	[4 bytes]     entry count (uint32, big-endian)
 //	[4 bytes]     magic number (0x4B4C4958 = "KLIX", big-endian)
 //
-// Batch index entry (20 bytes, big-endian):
+// Batch index entry (32 bytes, big-endian):
 //
 //	[8 bytes]   baseOffset (int64)
 //	[4 bytes]   bytePosition (uint32)
 //	[4 bytes]   batchLength (uint32)
 //	[4 bytes]   lastOffsetDelta (int32)
+//	[8 bytes]   maxTimestamp (int64)
+//	[4 bytes]   recordCount (int32)
 
 const (
 	// FooterMagic is the 4-byte magic number at the end of each S3 object.
@@ -32,7 +34,7 @@ const (
 	FooterTrailerSize = 4 + 4 // uint32 entryCount + uint32 magic
 
 	// IndexEntrySize is the size of one batch index entry.
-	IndexEntrySize = 20 // 8 + 4 + 4 + 4
+	IndexEntrySize = 32 // 8 + 4 + 4 + 4 + 8 + 4
 
 	// DefaultFooterReadSize is the speculative read size for the footer.
 	// Covers up to 3272 batch entries.
@@ -48,6 +50,8 @@ type BatchIndexEntry struct {
 	BytePosition    uint32
 	BatchLength     uint32
 	LastOffsetDelta int32
+	MaxTimestamp    int64
+	RecordCount     int32
 }
 
 // LastOffset returns the last Kafka offset in this batch.
@@ -104,6 +108,38 @@ func (f *Footer) LastOffset() int64 {
 	return last.BaseOffset + int64(last.LastOffsetDelta)
 }
 
+// MaxTimestamp returns the maximum timestamp across all entries, or -1 if empty.
+func (f *Footer) MaxTimestamp() int64 {
+	if len(f.Entries) == 0 {
+		return -1
+	}
+	max := f.Entries[0].MaxTimestamp
+	for i := 1; i < len(f.Entries); i++ {
+		if f.Entries[i].MaxTimestamp > max {
+			max = f.Entries[i].MaxTimestamp
+		}
+	}
+	return max
+}
+
+// DataSize returns the sum of batch lengths (logical data bytes, excluding footer overhead).
+func (f *Footer) DataSize() int64 {
+	var total int64
+	for i := range f.Entries {
+		total += int64(f.Entries[i].BatchLength)
+	}
+	return total
+}
+
+// TotalRecordCount returns the sum of record counts across all entries.
+func (f *Footer) TotalRecordCount() int64 {
+	var total int64
+	for i := range f.Entries {
+		total += int64(f.Entries[i].RecordCount)
+	}
+	return total
+}
+
 // BuildObject assembles an S3 object from raw RecordBatch bytes.
 // Returns the complete object bytes (data + footer).
 //
@@ -131,11 +167,20 @@ func BuildObject(batches []BatchData) []byte {
 	entries := make([]BatchIndexEntry, len(batches))
 	for i, b := range batches {
 		copy(buf[pos:], b.RawBytes)
+		// Extract maxTimestamp and recordCount from RecordBatch header
+		var maxTs int64
+		var numRec int32
+		if len(b.RawBytes) >= RecordBatchHeaderSize {
+			maxTs = int64(binary.BigEndian.Uint64(b.RawBytes[35:43]))
+			numRec = int32(binary.BigEndian.Uint32(b.RawBytes[57:61]))
+		}
 		entries[i] = BatchIndexEntry{
 			BaseOffset:      b.BaseOffset,
 			BytePosition:    pos,
 			BatchLength:     uint32(len(b.RawBytes)),
 			LastOffsetDelta: b.LastOffsetDelta,
+			MaxTimestamp:    maxTs,
+			RecordCount:     numRec,
 		}
 		pos += uint32(len(b.RawBytes))
 	}
@@ -147,6 +192,8 @@ func BuildObject(batches []BatchData) []byte {
 		binary.BigEndian.PutUint32(buf[off+8:off+12], e.BytePosition)
 		binary.BigEndian.PutUint32(buf[off+12:off+16], e.BatchLength)
 		binary.BigEndian.PutUint32(buf[off+16:off+20], uint32(e.LastOffsetDelta))
+		binary.BigEndian.PutUint64(buf[off+20:off+28], uint64(e.MaxTimestamp))
+		binary.BigEndian.PutUint32(buf[off+28:off+32], uint32(e.RecordCount))
 		off += IndexEntrySize
 	}
 
@@ -200,6 +247,8 @@ func ParseFooter(tailData []byte, objectSize int64) (*Footer, error) {
 			BytePosition:    binary.BigEndian.Uint32(tailData[off+8 : off+12]),
 			BatchLength:     binary.BigEndian.Uint32(tailData[off+12 : off+16]),
 			LastOffsetDelta: int32(binary.BigEndian.Uint32(tailData[off+16 : off+20])),
+			MaxTimestamp:    int64(binary.BigEndian.Uint64(tailData[off+20 : off+28])),
+			RecordCount:     int32(binary.BigEndian.Uint32(tailData[off+28 : off+32])),
 		}
 	}
 

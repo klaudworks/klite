@@ -114,18 +114,19 @@ resources:
     cpu: "2"
     memory: 1Gi
 
-# Probes
-# TODO: Switch to HTTP health endpoint when available
+# Probes (requires --health-addr :8080 in broker args)
 livenessProbe:
-  tcpSocket:
-    port: kafka
-  initialDelaySeconds: 10
-  periodSeconds: 10
-  timeoutSeconds: 5
-readinessProbe:
-  tcpSocket:
-    port: kafka
+  httpGet:
+    path: /livez
+    port: 8080
   initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 3
   periodSeconds: 5
   timeoutSeconds: 3
 
@@ -324,6 +325,5 @@ See [Troubleshooting](/guides/troubleshooting/) for more common issues.
 
 ## Next steps
 
-- [Configuration reference](/reference/configuration/) -- all flags and environment variables
-- [Monitoring](/guides/monitoring/) -- observability in Kubernetes
+- [Configuration](/guides/configuration/) -- all flags and environment variables
 - [Architecture](/concepts/architecture/) -- understand klite internals

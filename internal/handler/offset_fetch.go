@@ -13,7 +13,7 @@ func HandleOffsetFetch(state *cluster.State) server.Handler {
 		r := req.(*kmsg.OffsetFetchRequest)
 		resp := r.ResponseKind().(*kmsg.OffsetFetchResponse)
 
-		// v8+: batch (multiple groups)
+		// v8+: batch (multiple groups) — process each group independently.
 		if r.Version >= 8 {
 			for _, rg := range r.Groups {
 				gResp := kmsg.NewOffsetFetchResponseGroup()
@@ -27,25 +27,29 @@ func HandleOffsetFetch(state *cluster.State) server.Handler {
 
 				g := state.GetGroup(rg.Group)
 				if g == nil {
-					// Unknown group: return offset -1 for all requested partitions (not an error)
 					fillOffsetFetchGroupNotFound(rg, &gResp)
 					resp.Groups = append(resp.Groups, gResp)
 					continue
 				}
 
-				gresp, err := g.Send(r)
+				// Build a single-group v8 request for this group's goroutine.
+				perGroup := &kmsg.OffsetFetchRequest{Version: r.Version}
+				perGroup.Groups = []kmsg.OffsetFetchRequestGroup{rg}
+
+				gresp, err := g.Send(perGroup)
 				if err != nil {
 					gResp.ErrorCode = kerr.CoordinatorNotAvailable.Code
 					resp.Groups = append(resp.Groups, gResp)
 					continue
 				}
-				// The group goroutine returns a fully populated response
-				return gresp, nil
+
+				ofResp := gresp.(*kmsg.OffsetFetchResponse)
+				resp.Groups = append(resp.Groups, ofResp.Groups...)
 			}
 			return resp, nil
 		}
 
-		// v0-v7: single group
+		// v0-v7: single group.
 		if r.Group == "" {
 			resp.ErrorCode = kerr.InvalidGroupID.Code
 			return resp, nil
@@ -53,7 +57,6 @@ func HandleOffsetFetch(state *cluster.State) server.Handler {
 
 		g := state.GetGroup(r.Group)
 		if g == nil {
-			// Unknown group: return offset -1 for all requested partitions
 			fillOffsetFetchNotFound(r, resp)
 			return resp, nil
 		}

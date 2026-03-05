@@ -149,4 +149,4 @@ klite is **not** a fit when:
 
 - [Storage](/concepts/storage/) -- deep dive into WAL format, S3 flushing, and retention
 - [Compatibility](/concepts/compatibility/) -- supported Kafka APIs and client libraries
-- [Configuration](/reference/configuration/) -- tune klite for your workload
+- [Configuration](/guides/configuration/) -- tune klite for your workload

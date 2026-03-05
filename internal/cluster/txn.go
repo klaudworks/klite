@@ -25,15 +25,15 @@ type ProducerState struct {
 	Sequences map[TopicPartition]*SequenceWindow
 
 	// Transaction state
-	TxnState      TxnState
-	TxnPartitions map[TopicPartition]bool           // partitions in current txn
-	TxnBatches    []*TxnBatchRef                    // data batches written in current txn
-	TxnGroups     []string                          // consumer groups in current txn (AddOffsetsToTxn)
-	TxnOffsets    map[string]map[TopicPartition]PendingTxnOffset // group -> tp -> offset
-	TxnFirstOffsets map[TopicPartition]int64         // first offset per partition in this txn
-	TxnStartTime  time.Time
-	TxnTimeoutMs  int32
-	LastWasCommit bool
+	TxnState        TxnState
+	TxnPartitions   map[TopicPartition]bool                        // partitions in current txn
+	TxnBatches      []*TxnBatchRef                                 // data batches written in current txn
+	TxnGroups       []string                                       // consumer groups in current txn (AddOffsetsToTxn)
+	TxnOffsets      map[string]map[TopicPartition]PendingTxnOffset // group -> tp -> offset
+	TxnFirstOffsets map[TopicPartition]int64                       // first offset per partition in this txn
+	TxnStartTime    time.Time
+	TxnTimeoutMs    int32
+	LastWasCommit   bool
 }
 
 // PendingTxnOffset holds an offset commit pending transaction resolution.
@@ -52,11 +52,11 @@ type TxnBatchRef struct {
 
 // SequenceWindow implements a 5-slot ring buffer for dedup, matching Kafka's window.
 type SequenceWindow struct {
-	seq     [5]int32  // expected next sequence at each slot
-	offsets [5]int64  // base offset for each slot
-	at      uint8     // current write position
-	epoch   int16     // last seen epoch
-	filled  bool      // whether we've seen any writes
+	seq     [5]int32 // expected next sequence at each slot
+	offsets [5]int64 // base offset for each slot
+	at      uint8    // current write position
+	epoch   int16    // last seen epoch
+	filled  bool     // whether we've seen any writes
 }
 
 // PushAndValidate checks a batch's sequence against the window.
@@ -124,9 +124,9 @@ type AbortedTxnEntry struct {
 // ProducerIDManager manages producer IDs and transactional state.
 type ProducerIDManager struct {
 	mu        sync.Mutex
-	nextPID   int64                      // monotonic counter
-	producers map[int64]*ProducerState   // PID -> state
-	byTxnID   map[string]*ProducerState  // txnID -> state
+	nextPID   int64                     // monotonic counter
+	producers map[int64]*ProducerState  // PID -> state
+	byTxnID   map[string]*ProducerState // txnID -> state
 }
 
 // NewProducerIDManager creates a new producer ID manager.
@@ -241,7 +241,7 @@ func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPar
 
 	if epoch != ps.Epoch {
 		if epoch < ps.Epoch {
-			return 35, false, 0 // PRODUCER_FENCED (kerr.ProducerFenced.Code)
+			return 35, false, 0 // PRODUCER_FENCED
 		}
 		return 47, false, 0 // INVALID_PRODUCER_EPOCH
 	}
@@ -263,7 +263,10 @@ func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPar
 }
 
 // UpdateDedupOffset updates the dedup window's offset for the last accepted batch.
-// This is called after the actual offset is assigned (which may differ from the tentative one).
+// Called after the actual offset is assigned (which may differ from the tentative
+// one passed to ValidateAndDedup). ValidateAndDedup stores the offset at position
+// (at-1) before advancing at, so the most recently accepted batch's offset is
+// always at slot (at+4)%5.
 func (m *ProducerIDManager) UpdateDedupOffset(pid int64, tp TopicPartition, firstSeq int32, actualOffset int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -276,15 +279,7 @@ func (m *ProducerIDManager) UpdateDedupOffset(pid int64, tp TopicPartition, firs
 	if !ok {
 		return
 	}
-	// Find the slot that has this sequence and update its offset
-	for i := 0; i < 5; i++ {
-		if w.offsets[i] != actualOffset && w.seq[i] == firstSeq {
-			w.offsets[i] = actualOffset
-			return
-		}
-	}
-	// Also check the most recently written slot (at-1)
-	prev := (w.at + 4) % 5 // at-1 mod 5
+	prev := (w.at + 4) % 5 // slot written by the last PushAndValidate call
 	w.offsets[prev] = actualOffset
 }
 
@@ -415,12 +410,12 @@ func (m *ProducerIDManager) RecordTxnBatch(pid int64, topic string, partition in
 
 // EndTxnState holds the state needed to complete a transaction.
 type EndTxnState struct {
-	ProducerID    int64
-	Epoch         int16
-	Commit        bool
-	TxnPartitions map[TopicPartition]bool
-	TxnGroups     []string
-	TxnOffsets    map[string]map[TopicPartition]PendingTxnOffset
+	ProducerID      int64
+	Epoch           int16
+	Commit          bool
+	TxnPartitions   map[TopicPartition]bool
+	TxnGroups       []string
+	TxnOffsets      map[string]map[TopicPartition]PendingTxnOffset
 	TxnFirstOffsets map[TopicPartition]int64
 }
 
@@ -481,31 +476,88 @@ func (ps *ProducerState) resetTxnState() {
 	ps.TxnStartTime = time.Time{}
 }
 
-// AllTransactions returns information about all transactional producers.
-func (m *ProducerIDManager) AllTransactions() []*ProducerState {
+// ProducerSnapshot is a point-in-time copy of ProducerState fields.
+// Safe to read without holding any lock.
+type ProducerSnapshot struct {
+	ProducerID     int64
+	Epoch          int16
+	TxnID          string
+	TxnState       TxnState
+	TxnTimeoutMs   int32
+	TxnStartTime   time.Time
+	LastSequence   int32                   // for a specific partition (set by GetProducersForPartition)
+	TxnStartOffset int64                   // for a specific partition (set by GetProducersForPartition)
+	TxnPartitions  map[TopicPartition]bool // copied map
+}
+
+func snapshotProducer(ps *ProducerState) ProducerSnapshot {
+	snap := ProducerSnapshot{
+		ProducerID:     ps.ProducerID,
+		Epoch:          ps.Epoch,
+		TxnID:          ps.TxnID,
+		TxnState:       ps.TxnState,
+		TxnTimeoutMs:   ps.TxnTimeoutMs,
+		TxnStartTime:   ps.TxnStartTime,
+		LastSequence:   -1,
+		TxnStartOffset: -1,
+	}
+	if len(ps.TxnPartitions) > 0 {
+		snap.TxnPartitions = make(map[TopicPartition]bool, len(ps.TxnPartitions))
+		for tp, v := range ps.TxnPartitions {
+			snap.TxnPartitions[tp] = v
+		}
+	}
+	return snap
+}
+
+// AllTransactions returns snapshot information about all transactional producers.
+func (m *ProducerIDManager) AllTransactions() []ProducerSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var result []*ProducerState
+	var result []ProducerSnapshot
 	for _, ps := range m.producers {
 		if ps.TxnID != "" {
-			result = append(result, ps)
+			result = append(result, snapshotProducer(ps))
 		}
 	}
 	return result
 }
 
-// GetProducersForPartition returns active producers that have written to the given partition.
-func (m *ProducerIDManager) GetProducersForPartition(topic string, partition int32) []*ProducerState {
+// GetProducerByTxnIDSnapshot returns a snapshot of the producer state for the
+// given transactional ID, or ok=false if not found.
+func (m *ProducerIDManager) GetProducerByTxnIDSnapshot(txnID string) (ProducerSnapshot, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ps, ok := m.byTxnID[txnID]
+	if !ok {
+		return ProducerSnapshot{}, false
+	}
+	return snapshotProducer(ps), true
+}
+
+// GetProducersForPartition returns snapshots of active producers that have
+// written to the given partition. LastSequence and TxnStartOffset are populated
+// relative to the queried partition.
+func (m *ProducerIDManager) GetProducersForPartition(topic string, partition int32) []ProducerSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	tp := TopicPartition{Topic: topic, Partition: partition}
-	var result []*ProducerState
+	var result []ProducerSnapshot
 	for _, ps := range m.producers {
-		if _, ok := ps.Sequences[tp]; ok {
-			result = append(result, ps)
+		w, ok := ps.Sequences[tp]
+		if !ok {
+			continue
 		}
+		snap := snapshotProducer(ps)
+		snap.LastSequence = w.LastSequence()
+		if ps.TxnState == TxnOngoing {
+			if firstOff, ok2 := ps.TxnFirstOffsets[tp]; ok2 {
+				snap.TxnStartOffset = firstOff
+			}
+		}
+		result = append(result, snap)
 	}
 	return result
 }

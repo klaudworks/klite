@@ -5,6 +5,7 @@ import (
 	"hash/crc32"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -372,19 +373,9 @@ func TestCompactionEmptyKeyDedup(t *testing.T) {
 	assert.Equal(t, "newest", emptyKeyRecords[0])
 }
 
-type fakeClock struct {
-	now time.Time
-}
-
-func (c *fakeClock) Now() time.Time                          { return c.now }
-func (c *fakeClock) After(d time.Duration) <-chan time.Time   { return time.After(d) }
-func (c *fakeClock) NewTicker(d time.Duration) *clock.Ticker {
-	return clock.RealClock{}.NewTicker(d)
-}
-
 func TestCompactionTombstoneRetention(t *testing.T) {
 	s3mem := NewInMemoryS3()
-	clk := &fakeClock{now: time.Unix(100000, 0)} // 100000 seconds
+	clk := clock.NewFakeClock(time.Unix(100000, 0)) // 100000 seconds
 	compactor, _ := newTestCompactor(t, s3mem, clk)
 	compactor.cfg.DeleteRetentionMs = 10000 // 10 seconds
 
@@ -450,7 +441,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	assert.True(t, tombstoneFound, "tombstone should be retained when within delete.retention.ms")
 
 	// Now advance time past the retention period
-	clk.now = time.Unix(100011, 0) // 100011 seconds → tombstone age = 21s > 10s
+	clk.Set(time.Unix(100011, 0)) // 100011 seconds → tombstone age = 21s > 10s
 
 	// Re-create objects (compaction replaced them)
 	s3mem2 := NewInMemoryS3()
@@ -510,23 +501,24 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 }
 
 func TestCompactionMinLag(t *testing.T) {
-	// TODO: min.compaction.lag.ms filtering is applied during window formation,
-	// not at the record level. With in-memory S3 we can't easily test this
-	// without modifying the compactor to check batch timestamps against the lag.
-	// For now, verify that CompactPartition with minCompactionLagMs > all timestamps
-	// doesn't compact anything.
+	// Objects whose LastModified is within minCompactionLagMs of "now" should
+	// be excluded from compaction windows.
 	s3mem := NewInMemoryS3()
-	compactor, _ := newTestCompactor(t, s3mem, nil)
+	clk := &clock.FakeClock{}
+	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	clk.Set(now)
 
-	obj := buildTestObject(t, []testBatch{{
+	compactor, _ := newTestCompactor(t, s3mem, clk)
+
+	obj1 := buildTestObject(t, []testBatch{{
 		baseOffset:    0,
 		baseTimestamp: 1000,
 		records: []Record{
-			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("val")},
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("val1")},
 		},
 		codec: CompressionNone,
 	}})
-	putObject(t, s3mem, "test-prefix", "topic1", 0, 0, obj)
+	putObject(t, s3mem, "test-prefix", "topic1", 0, 0, obj1)
 
 	obj2 := buildTestObject(t, []testBatch{{
 		baseOffset:    1,
@@ -538,18 +530,35 @@ func TestCompactionMinLag(t *testing.T) {
 	}})
 	putObject(t, s3mem, "test-prefix", "topic1", 0, 1, obj2)
 
+	// Override timestamps to simulate objects written at different times.
+	// obj1 written 2 hours ago, obj2 written 30 minutes ago.
+	s3mem.mu.Lock()
+	for k := range s3mem.timestamps {
+		if strings.Contains(k, "00000000000000000000.obj") {
+			s3mem.timestamps[k] = now.Add(-2 * time.Hour)
+		} else if strings.Contains(k, "00000000000000000001.obj") {
+			s3mem.timestamps[k] = now.Add(-30 * time.Minute)
+		}
+	}
+	s3mem.mu.Unlock()
+
 	ctx := context.Background()
 	compactor.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
 		return nil
 	}
 
-	// With enormous min lag, compaction should still process the window
-	// (min lag is checked at object level, not record level, and our
-	// formWindows doesn't currently filter by timestamp).
-	// At minimum, verify the call doesn't error.
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	// With 1h min lag, obj2 (30 min old) should be excluded.
+	// Only 1 object in the window => single-object windows are skipped => no compaction.
+	watermark, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 3600000,
 		func() {}, func() {})
 	require.NoError(t, err)
+	assert.Equal(t, int64(-1), watermark, "should not compact when recent objects are excluded")
+
+	// With 0 min lag (default), both objects are eligible => compaction happens.
+	watermark, err = compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+		func() {}, func() {})
+	require.NoError(t, err)
+	assert.Greater(t, watermark, int64(-1), "should compact with no min lag")
 }
 
 func TestCompactionPreservesOrder(t *testing.T) {

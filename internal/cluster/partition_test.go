@@ -5,12 +5,12 @@ import (
 	"testing"
 )
 
-// newTestPartition creates a PartData with sensible defaults for testing.
+// newTestPartition creates a PartData with a ring buffer for testing.
 func newTestPartition() *PartData {
 	return &PartData{
-		Topic:                "test-topic",
-		Index:                0,
-		maxTimestampBatchIdx: -1,
+		Topic: "test-topic",
+		Index: 0,
+		ring:  NewRingBuffer(64),
 	}
 }
 
@@ -114,138 +114,13 @@ func TestPushBatch(t *testing.T) {
 		// Mutate the original raw bytes
 		raw[0] = 0xFF
 
-		pd.RLock()
 		// The stored bytes should not be affected
-		if pd.batches[0].RawBytes[0] == 0xFF {
+		fetched := pd.FetchFrom(0, 1024*1024)
+		if len(fetched) == 0 {
+			t.Fatal("expected at least one batch")
+		}
+		if fetched[0].RawBytes[0] == 0xFF {
 			t.Error("raw bytes were not copied - mutation affected stored batch")
-		}
-		pd.RUnlock()
-	})
-}
-
-func TestSearchOffset(t *testing.T) {
-	t.Parallel()
-
-	t.Run("empty partition", func(t *testing.T) {
-		t.Parallel()
-		pd := newTestPartition()
-
-		pd.RLock()
-		_, found, atEnd := pd.SearchOffset(0)
-		pd.RUnlock()
-
-		if found {
-			t.Error("expected not found for empty partition")
-		}
-		if !atEnd {
-			t.Error("expected atEnd for empty partition")
-		}
-	})
-
-	t.Run("offset past end", func(t *testing.T) {
-		t.Parallel()
-		pd := newTestPartition()
-
-		pd.Lock()
-		pushTestBatch(t, pd, 3, 1000) // offsets 0,1,2, HW=3
-		pd.Unlock()
-
-		pd.RLock()
-		_, found, atEnd := pd.SearchOffset(3)
-		pd.RUnlock()
-
-		if found {
-			t.Error("expected not found for offset at HW")
-		}
-		if !atEnd {
-			t.Error("expected atEnd for offset at HW")
-		}
-	})
-
-	t.Run("offset in single batch", func(t *testing.T) {
-		t.Parallel()
-		pd := newTestPartition()
-
-		pd.Lock()
-		pushTestBatch(t, pd, 5, 1000) // offsets 0-4
-		pd.Unlock()
-
-		pd.RLock()
-		defer pd.RUnlock()
-
-		for _, offset := range []int64{0, 1, 2, 3, 4} {
-			idx, found, atEnd := pd.SearchOffset(offset)
-			if !found {
-				t.Errorf("offset %d: expected found", offset)
-			}
-			if atEnd {
-				t.Errorf("offset %d: expected not atEnd", offset)
-			}
-			if idx != 0 {
-				t.Errorf("offset %d: expected index 0, got %d", offset, idx)
-			}
-		}
-	})
-
-	t.Run("offset across multiple batches", func(t *testing.T) {
-		t.Parallel()
-		pd := newTestPartition()
-
-		pd.Lock()
-		pushTestBatch(t, pd, 3, 1000) // batch 0: offsets 0,1,2
-		pushTestBatch(t, pd, 2, 2000) // batch 1: offsets 3,4
-		pushTestBatch(t, pd, 4, 3000) // batch 2: offsets 5,6,7,8
-		pd.Unlock()
-
-		pd.RLock()
-		defer pd.RUnlock()
-
-		tests := []struct {
-			offset    int64
-			wantIdx   int
-			wantFound bool
-		}{
-			{0, 0, true},
-			{1, 0, true},
-			{2, 0, true},
-			{3, 1, true},
-			{4, 1, true},
-			{5, 2, true},
-			{8, 2, true},
-		}
-
-		for _, tt := range tests {
-			idx, found, _ := pd.SearchOffset(tt.offset)
-			if found != tt.wantFound {
-				t.Errorf("offset %d: found=%v, want %v", tt.offset, found, tt.wantFound)
-			}
-			if found && idx != tt.wantIdx {
-				t.Errorf("offset %d: idx=%d, want %d", tt.offset, idx, tt.wantIdx)
-			}
-		}
-	})
-
-	t.Run("first offset of each batch", func(t *testing.T) {
-		t.Parallel()
-		pd := newTestPartition()
-
-		pd.Lock()
-		pushTestBatch(t, pd, 1, 1000) // batch 0: offset 0
-		pushTestBatch(t, pd, 1, 2000) // batch 1: offset 1
-		pushTestBatch(t, pd, 1, 3000) // batch 2: offset 2
-		pd.Unlock()
-
-		pd.RLock()
-		defer pd.RUnlock()
-
-		for i := 0; i < 3; i++ {
-			idx, found, _ := pd.SearchOffset(int64(i))
-			if !found {
-				t.Errorf("offset %d: expected found", i)
-			}
-			if idx != i {
-				t.Errorf("offset %d: idx=%d, want %d", i, idx, i)
-			}
 		}
 	})
 }
@@ -257,9 +132,7 @@ func TestFetchFrom(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
-		pd.RLock()
 		result := pd.FetchFrom(0, 1024*1024)
-		pd.RUnlock()
 
 		if result != nil {
 			t.Errorf("expected nil for empty partition, got %d batches", len(result))
@@ -275,9 +148,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 2, 2000)
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(0, 1024*1024)
-		pd.RUnlock()
 
 		if len(result) != 2 {
 			t.Fatalf("expected 2 batches, got %d", len(result))
@@ -300,9 +171,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 1, 3000) // offset 5
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(3, 1024*1024)
-		pd.RUnlock()
 
 		if len(result) != 2 {
 			t.Fatalf("expected 2 batches, got %d", len(result))
@@ -321,9 +190,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 3, 2000) // offsets 5-7
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(2, 1024*1024) // mid-batch
-		pd.RUnlock()
 
 		if len(result) != 2 {
 			t.Fatalf("expected 2 batches, got %d", len(result))
@@ -342,9 +209,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 2, 2000) // 61-byte batch
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(0, 1) // maxBytes=1, way smaller than any batch
-		pd.RUnlock()
 
 		if len(result) != 1 {
 			t.Fatalf("KIP-74: expected at least 1 batch, got %d", len(result))
@@ -364,9 +229,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 1, 3000) // 61 bytes
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(0, 62) // room for 1 batch (61 bytes) + 1 byte
-		pd.RUnlock()
 
 		// Should get 1 batch (61 bytes), second batch (61+61=122) exceeds 62
 		if len(result) != 1 {
@@ -382,9 +245,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 3, 1000) // HW=3
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(3, 1024*1024)
-		pd.RUnlock()
 
 		if result != nil {
 			t.Errorf("expected nil for fetch at HW, got %d batches", len(result))
@@ -399,9 +260,7 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 3, 1000)
 		pd.Unlock()
 
-		pd.RLock()
 		result := pd.FetchFrom(100, 1024*1024)
-		pd.RUnlock()
 
 		if result != nil {
 			t.Errorf("expected nil for fetch past HW, got %d batches", len(result))
@@ -420,19 +279,19 @@ func TestListOffsets(t *testing.T) {
 		defer pd.RUnlock()
 
 		// Latest (-1)
-		off, ts := pd.ListOffsets(-1)
+		off, ts := pd.ListOffsets(-1, 0)
 		if off != 0 || ts != -1 {
 			t.Errorf("Latest on empty: got (%d, %d), want (0, -1)", off, ts)
 		}
 
 		// Earliest (-2)
-		off, ts = pd.ListOffsets(-2)
+		off, ts = pd.ListOffsets(-2, 0)
 		if off != 0 || ts != -1 {
 			t.Errorf("Earliest on empty: got (%d, %d), want (0, -1)", off, ts)
 		}
 
 		// MaxTimestamp (-3) — empty partition returns (-1, -1) per kfake/Kafka behavior
-		off, ts = pd.ListOffsets(-3)
+		off, ts = pd.ListOffsets(-3, 0)
 		if off != -1 || ts != -1 {
 			t.Errorf("MaxTimestamp on empty: got (%d, %d), want (-1, -1)", off, ts)
 		}
@@ -448,7 +307,7 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(-1)
+		off, ts := pd.ListOffsets(-1, 0)
 		pd.RUnlock()
 
 		if off != 5 {
@@ -468,7 +327,7 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(-2)
+		off, ts := pd.ListOffsets(-2, 0)
 		pd.RUnlock()
 
 		if off != 0 {
@@ -490,7 +349,7 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(-3)
+		off, ts := pd.ListOffsets(-3, 0)
 		pd.RUnlock()
 
 		// Max timestamp is in batch 1 (ts=5000), last offset in that batch = 3+1 = 4
@@ -516,7 +375,7 @@ func TestListOffsets(t *testing.T) {
 		defer pd.RUnlock()
 
 		// Find first batch with maxTS >= 1500 -> batch 1 (maxTS=2000)
-		off, ts := pd.ListOffsets(1500)
+		off, ts := pd.ListOffsets(1500, 0)
 		if off != 2 {
 			t.Errorf("Timestamp 1500: got offset %d, want 2", off)
 		}
@@ -535,7 +394,7 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(2000)
+		off, ts := pd.ListOffsets(2000, 0)
 		pd.RUnlock()
 
 		if off != 2 {
@@ -556,7 +415,7 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(3000) // beyond all batches
+		off, ts := pd.ListOffsets(3000, 0) // beyond all batches
 		pd.RUnlock()
 
 		// No match returns (-1, -1) per Kafka/kfake behavior
@@ -577,7 +436,7 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(0)
+		off, ts := pd.ListOffsets(0, 0)
 		pd.RUnlock()
 
 		if off != 0 {
@@ -585,6 +444,39 @@ func TestListOffsets(t *testing.T) {
 		}
 		if ts != 1000 {
 			t.Errorf("Timestamp 0: got ts %d, want 1000", ts)
+		}
+	})
+
+	t.Run("latest read_committed returns LSO", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		pd.Lock()
+		pushTestBatch(t, pd, 3, 1000) // HW=3
+		pushTestBatch(t, pd, 2, 2000) // HW=5
+		// Simulate an open transaction starting at offset 2
+		pd.AddOpenTxn(42, 2)
+		pd.Unlock()
+
+		pd.RLock()
+		defer pd.RUnlock()
+
+		// read_uncommitted: should return HW (5)
+		off, ts := pd.ListOffsets(-1, 0)
+		if off != 5 {
+			t.Errorf("read_uncommitted Latest: got offset %d, want 5", off)
+		}
+		if ts != -1 {
+			t.Errorf("read_uncommitted Latest: got ts %d, want -1", ts)
+		}
+
+		// read_committed: should return LSO = min(HW, oldest open txn) = 2
+		off, ts = pd.ListOffsets(-1, 1)
+		if off != 2 {
+			t.Errorf("read_committed Latest: got offset %d, want 2 (LSO)", off)
+		}
+		if ts != -1 {
+			t.Errorf("read_committed Latest: got ts %d, want -1", ts)
 		}
 	})
 }
@@ -693,7 +585,7 @@ func TestMaxTimestampTracking(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(-3)
+		off, ts := pd.ListOffsets(-3, 0)
 		pd.RUnlock()
 
 		if ts != 5000 {
@@ -716,7 +608,7 @@ func TestMaxTimestampTracking(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		_, ts := pd.ListOffsets(-3)
+		_, ts := pd.ListOffsets(-3, 0)
 		pd.RUnlock()
 
 		if ts != 5000 {
@@ -734,7 +626,7 @@ func TestMaxTimestampTracking(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(-3)
+		off, ts := pd.ListOffsets(-3, 0)
 		pd.RUnlock()
 
 		if ts != 1000 {
@@ -751,11 +643,10 @@ func TestMaxTimestampTracking(t *testing.T) {
 
 func newTestPartitionWithRing(slots int) *PartData {
 	pd := &PartData{
-		Topic:                "test-topic",
-		Index:                0,
-		TopicID:              [16]byte{1, 2, 3},
-		maxTimestampBatchIdx: -1,
-		ring:                 NewRingBuffer(slots),
+		Topic:   "test-topic",
+		Index:   0,
+		TopicID: [16]byte{1, 2, 3},
+		ring:    NewRingBuffer(slots),
 	}
 	return pd
 }
@@ -891,9 +782,7 @@ func TestReadCascadeRingBuffer(t *testing.T) {
 	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2})
 	pd.Unlock()
 
-	pd.RLock()
 	result := pd.FetchFrom(0, 1024*1024)
-	pd.RUnlock()
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(result))
@@ -917,9 +806,7 @@ func TestReadCascadeFetchFromMiddle(t *testing.T) {
 	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1})
 	pd.Unlock()
 
-	pd.RLock()
 	result := pd.FetchFrom(3, 1024*1024) // Start at offset 3
-	pd.RUnlock()
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(result))
@@ -930,181 +817,6 @@ func TestReadCascadeFetchFromMiddle(t *testing.T) {
 }
 
 // --- Phase 6 tests: Retention ---
-
-func TestRetentionByTime(t *testing.T) {
-	t.Parallel()
-
-	pd := newTestPartition()
-	nowMs := int64(10000)
-
-	pd.Lock()
-	pushTestBatch(t, pd, 1, 1000) // old: offset 0, ts=1000
-	pushTestBatch(t, pd, 1, 2000) // old: offset 1, ts=2000
-	pushTestBatch(t, pd, 1, 8000) // recent: offset 2, ts=8000
-	pushTestBatch(t, pd, 1, 9000) // recent: offset 3, ts=9000
-	pd.Unlock()
-
-	// retention.ms=5000 -> cutoff=5000 -> batches with ts<5000 should be trimmed
-	newLS, origLS := pd.RetentionScan(5000, -1, nowMs)
-	if origLS != 0 {
-		t.Errorf("origLogStart: got %d, want 0", origLS)
-	}
-	if newLS != 2 { // batches at offset 0 (ts=1000) and 1 (ts=2000) should be trimmed
-		t.Errorf("newLogStart: got %d, want 2", newLS)
-	}
-
-	// Apply the advancement
-	pd.Lock()
-	pd.AdvanceLogStart(newLS)
-	pd.Unlock()
-
-	pd.RLock()
-	if pd.LogStart() != 2 {
-		t.Errorf("logStart after advance: got %d, want 2", pd.LogStart())
-	}
-	if pd.BatchCount() != 2 {
-		t.Errorf("batch count after advance: got %d, want 2", pd.BatchCount())
-	}
-	pd.RUnlock()
-}
-
-func TestRetentionBySize(t *testing.T) {
-	t.Parallel()
-
-	pd := newTestPartition()
-
-	pd.Lock()
-	pushTestBatch(t, pd, 1, 1000) // offset 0
-	pushTestBatch(t, pd, 1, 2000) // offset 1
-	pushTestBatch(t, pd, 1, 3000) // offset 2
-	pd.Unlock()
-
-	pd.RLock()
-	totalBytes := pd.TotalBytes()
-	pd.RUnlock()
-
-	// Set retention.bytes to approximately 2/3 of total (should trim 1 batch)
-	retentionBytes := totalBytes * 2 / 3
-
-	newLS, _ := pd.RetentionScan(-1, retentionBytes, 100000)
-	if newLS != 1 {
-		t.Errorf("newLogStart for size retention: got %d, want 1", newLS)
-	}
-
-	pd.Lock()
-	pd.AdvanceLogStart(newLS)
-	pd.Unlock()
-
-	pd.RLock()
-	if pd.LogStart() != 1 {
-		t.Errorf("logStart: got %d, want 1", pd.LogStart())
-	}
-	if pd.BatchCount() != 2 {
-		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
-	}
-	pd.RUnlock()
-}
-
-func TestRetentionInfinite(t *testing.T) {
-	t.Parallel()
-
-	pd := newTestPartition()
-
-	pd.Lock()
-	pushTestBatch(t, pd, 1, 1000)
-	pushTestBatch(t, pd, 1, 2000)
-	pd.Unlock()
-
-	// Both set to -1 (infinite) -> nothing should be trimmed
-	newLS, origLS := pd.RetentionScan(-1, -1, 100000)
-	if newLS != origLS {
-		t.Errorf("infinite retention: newLogStart=%d should equal origLogStart=%d", newLS, origLS)
-	}
-}
-
-func TestRetentionBothPolicies(t *testing.T) {
-	t.Parallel()
-
-	pd := newTestPartition()
-	nowMs := int64(10000)
-
-	pd.Lock()
-	pushTestBatch(t, pd, 1, 1000) // offset 0, ts=1000
-	pushTestBatch(t, pd, 1, 2000) // offset 1, ts=2000
-	pushTestBatch(t, pd, 1, 3000) // offset 2, ts=3000
-	pushTestBatch(t, pd, 1, 8000) // offset 3, ts=8000
-	pushTestBatch(t, pd, 1, 9000) // offset 4, ts=9000
-	pd.Unlock()
-
-	// Time retention: cutoff = 10000 - 5000 = 5000 -> trim offsets 0,1,2 (ts < 5000) -> newLS=3
-	// Size retention: total is ~305 bytes, limit = 200 -> need to drop ~105 bytes = ~2 batches -> newLS=2
-	// Time is more aggressive, so newLS=3 should win
-
-	pd.RLock()
-	totalBytes := pd.TotalBytes()
-	pd.RUnlock()
-
-	// Set size limit to slightly more than 2 batches worth
-	sizeLimit := totalBytes * 3 / 5
-	newLS, _ := pd.RetentionScan(5000, sizeLimit, nowMs)
-	if newLS != 3 {
-		t.Errorf("both policies: got newLS=%d, want 3 (time was more aggressive)", newLS)
-	}
-}
-
-func TestRetentionBytesPerPartition(t *testing.T) {
-	t.Parallel()
-
-	// Create 3 partitions, each with different amounts of data
-	pds := make([]*PartData, 3)
-	for i := 0; i < 3; i++ {
-		pds[i] = &PartData{
-			Topic:                "test-topic",
-			Index:                int32(i),
-			maxTimestampBatchIdx: -1,
-		}
-	}
-
-	// Push different amounts to each partition
-	for _, pd := range pds {
-		pd.Lock()
-	}
-	pushTestBatch(t, pds[0], 1, 1000) // 1 batch
-	pushTestBatch(t, pds[0], 1, 2000) // 2 batches
-	pushTestBatch(t, pds[0], 1, 3000) // 3 batches
-
-	pushTestBatch(t, pds[1], 1, 1000) // 1 batch only
-
-	pushTestBatch(t, pds[2], 1, 1000) // 1 batch
-	pushTestBatch(t, pds[2], 1, 2000) // 2 batches
-
-	for _, pd := range pds {
-		pd.Unlock()
-	}
-
-	// Per-partition size limit: 1 batch worth
-	pds[0].RLock()
-	oneBatchSize := pds[0].TotalBytes() / 3
-	pds[0].RUnlock()
-
-	// Partition 0 has 3 batches -> should trim 2
-	newLS0, _ := pds[0].RetentionScan(-1, oneBatchSize, 100000)
-	if newLS0 != 2 { // trim offsets 0 and 1
-		t.Errorf("partition 0: newLS=%d, want 2", newLS0)
-	}
-
-	// Partition 1 has 1 batch -> should not trim
-	newLS1, origLS1 := pds[1].RetentionScan(-1, oneBatchSize, 100000)
-	if newLS1 != origLS1 {
-		t.Errorf("partition 1: should not trim, newLS=%d, origLS=%d", newLS1, origLS1)
-	}
-
-	// Partition 2 has 2 batches -> should trim 1
-	newLS2, _ := pds[2].RetentionScan(-1, oneBatchSize, 100000)
-	if newLS2 != 1 { // trim offset 0
-		t.Errorf("partition 2: newLS=%d, want 1", newLS2)
-	}
-}
 
 func TestAdvanceLogStartOffset(t *testing.T) {
 	t.Parallel()
@@ -1132,11 +844,13 @@ func TestAdvanceLogStartOffset(t *testing.T) {
 	if pd.BatchCount() != 1 {
 		t.Errorf("batch count: got %d, want 1", pd.BatchCount())
 	}
-	// Remaining batch should be offset 2
-	if pd.batches[0].BaseOffset != 2 {
-		t.Errorf("remaining batch base: got %d, want 2", pd.batches[0].BaseOffset)
-	}
 	pd.RUnlock()
+
+	// Remaining batch should be offset 2
+	fetched := pd.FetchFrom(2, 1024*1024)
+	if len(fetched) == 0 || fetched[0].BaseOffset != 2 {
+		t.Errorf("remaining batch base: expected 2")
+	}
 }
 
 func TestAdvanceLogStartOffsetStraddlingBatch(t *testing.T) {
@@ -1208,85 +922,6 @@ func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
 	// Should have 3 remaining batches (offsets 7, 8, 9)
 	if pd.BatchCount() != 3 {
 		t.Errorf("batch count: got %d, want 3", pd.BatchCount())
-	}
-	pd.RUnlock()
-}
-
-func TestRetentionByTimeRingBuffer(t *testing.T) {
-	t.Parallel()
-
-	pd := newTestPartitionWithRing(64)
-	nowMs := int64(10000)
-
-	pd.Lock()
-	pd.PushBatch(makeSimpleBatch(1, 1000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 1000, NumRecords: 1})
-	pd.PushBatch(makeSimpleBatch(1, 2000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 2000, NumRecords: 1})
-	pd.PushBatch(makeSimpleBatch(1, 8000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 8000, NumRecords: 1})
-	pd.PushBatch(makeSimpleBatch(1, 9000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 9000, NumRecords: 1})
-	pd.Unlock()
-
-	// cutoff = 10000 - 5000 = 5000 -> trim first 2 batches
-	newLS, origLS := pd.RetentionScan(5000, -1, nowMs)
-	if origLS != 0 {
-		t.Errorf("origLogStart: got %d, want 0", origLS)
-	}
-	if newLS != 2 {
-		t.Errorf("newLogStart: got %d, want 2", newLS)
-	}
-
-	// Apply advance
-	pd.CompactionMu.Lock()
-	err := pd.AdvanceLogStartOffset(newLS, nil)
-	pd.CompactionMu.Unlock()
-	if err != nil {
-		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
-	}
-
-	pd.RLock()
-	if pd.LogStart() != 2 {
-		t.Errorf("logStart: got %d, want 2", pd.LogStart())
-	}
-	if pd.BatchCount() != 2 {
-		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
-	}
-	pd.RUnlock()
-}
-
-func TestRetentionBySizeRingBuffer(t *testing.T) {
-	t.Parallel()
-
-	pd := newTestPartitionWithRing(64)
-
-	pd.Lock()
-	pd.PushBatch(makeSimpleBatch(1, 1000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 1000, NumRecords: 1})
-	pd.PushBatch(makeSimpleBatch(1, 2000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 2000, NumRecords: 1})
-	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1})
-	pd.Unlock()
-
-	pd.RLock()
-	totalBytes := pd.TotalBytes()
-	pd.RUnlock()
-
-	retentionBytes := totalBytes * 2 / 3
-
-	newLS, _ := pd.RetentionScan(-1, retentionBytes, 100000)
-	if newLS != 1 {
-		t.Errorf("newLogStart for size retention: got %d, want 1", newLS)
-	}
-
-	pd.CompactionMu.Lock()
-	err := pd.AdvanceLogStartOffset(newLS, nil)
-	pd.CompactionMu.Unlock()
-	if err != nil {
-		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
-	}
-
-	pd.RLock()
-	if pd.LogStart() != 1 {
-		t.Errorf("logStart: got %d, want 1", pd.LogStart())
-	}
-	if pd.BatchCount() != 2 {
-		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
 	}
 	pd.RUnlock()
 }

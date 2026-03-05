@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -142,8 +143,9 @@ func (c *Client) TailGet(ctx context.Context, key string, n int64) ([]byte, int6
 
 // ObjectInfo holds information about an S3 object from listing.
 type ObjectInfo struct {
-	Key  string
-	Size int64
+	Key          string
+	Size         int64
+	LastModified time.Time
 }
 
 // ListObjects lists objects with the given prefix. Returns keys sorted lexicographically.
@@ -162,10 +164,14 @@ func (c *Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, 
 		}
 
 		for _, obj := range out.Contents {
-			objects = append(objects, ObjectInfo{
+			info := ObjectInfo{
 				Key:  aws.ToString(obj.Key),
 				Size: aws.ToInt64(obj.Size),
-			})
+			}
+			if obj.LastModified != nil {
+				info.LastModified = *obj.LastModified
+			}
+			objects = append(objects, info)
 		}
 
 		if !aws.ToBool(out.IsTruncated) {
@@ -223,22 +229,24 @@ func (c *Client) Prefix() string {
 
 // InMemoryS3 implements S3API using an in-memory map. Used for unit tests.
 type InMemoryS3 struct {
-	mu      sync.Mutex
-	objects map[string][]byte
+	mu         sync.Mutex
+	objects    map[string][]byte
+	timestamps map[string]time.Time
 	// Track range request details for testing
 	RangeRequests []RangeRequest
 }
 
 // RangeRequest records a range GET for test assertions.
 type RangeRequest struct {
-	Key       string
-	RangeStr  string
+	Key      string
+	RangeStr string
 }
 
 // NewInMemoryS3 creates a new in-memory S3 implementation.
 func NewInMemoryS3() *InMemoryS3 {
 	return &InMemoryS3{
-		objects: make(map[string][]byte),
+		objects:    make(map[string][]byte),
+		timestamps: make(map[string]time.Time),
 	}
 }
 
@@ -250,7 +258,9 @@ func (m *InMemoryS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ..
 	if err != nil {
 		return nil, err
 	}
-	m.objects[aws.ToString(input.Key)] = data
+	key := aws.ToString(input.Key)
+	m.objects[key] = data
+	m.timestamps[key] = time.Now()
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -318,10 +328,15 @@ func (m *InMemoryS3) ListObjectsV2(_ context.Context, input *s3.ListObjectsV2Inp
 		if strings.HasPrefix(key, prefix) {
 			k := key
 			sz := int64(len(data))
-			contents = append(contents, types.Object{
+			obj := types.Object{
 				Key:  &k,
 				Size: &sz,
-			})
+			}
+			if ts, ok := m.timestamps[key]; ok {
+				t := ts
+				obj.LastModified = &t
+			}
+			contents = append(contents, obj)
 		}
 	}
 

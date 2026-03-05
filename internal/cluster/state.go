@@ -25,9 +25,9 @@ type State struct {
 	logger     *slog.Logger
 
 	// WAL-related state (Phase 3+)
-	walWriter      *wal.Writer
-	walIndex       *wal.Index
-	ringBufferMem  int64 // global memory budget for ring buffers
+	walWriter     *wal.Writer
+	walIndex      *wal.Index
+	ringBufferMem int64 // global memory budget for ring buffers
 
 	// S3-related state (Phase 4)
 	s3Fetcher S3Fetcher // S3 reader adapter (nil if S3 not configured)
@@ -98,11 +98,6 @@ func (s *State) SetWALConfig(w *wal.Writer, idx *wal.Index, ringBufferMem int64)
 	}
 }
 
-// HasWAL returns whether WAL is configured.
-func (s *State) HasWAL() bool {
-	return s.walWriter != nil
-}
-
 // NormalizeTopicName normalizes a topic name for collision detection.
 // Kafka considers topics that differ only in '.' vs '_' as colliding.
 func NormalizeTopicName(name string) string {
@@ -169,10 +164,7 @@ func (s *State) CreateTopic(name string, numPartitions int) (*TopicData, bool) {
 	s.topics[name] = td
 	s.tnorms[NormalizeTopicName(name)] = name
 
-	// Initialize WAL on new partitions if WAL is enabled
-	if s.walWriter != nil {
-		s.initPartitionsWAL(td)
-	}
+	s.initPartitionsWAL(td)
 
 	return td, true
 }
@@ -195,10 +187,7 @@ func (s *State) CreateTopicWithConfigs(name string, numPartitions int, configs m
 	s.topics[name] = td
 	s.tnorms[NormalizeTopicName(name)] = name
 
-	// Initialize WAL on new partitions if WAL is enabled
-	if s.walWriter != nil {
-		s.initPartitionsWAL(td)
-	}
+	s.initPartitionsWAL(td)
 
 	return td, true
 }
@@ -280,10 +269,9 @@ func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 	partitions := make([]*PartData, numPartitions)
 	for i := range partitions {
 		partitions[i] = &PartData{
-			Topic:                name,
-			Index:                int32(i),
-			TopicID:              topicID,
-			maxTimestampBatchIdx: -1,
+			Topic:   name,
+			Index:   int32(i),
+			TopicID: topicID,
 		}
 	}
 
@@ -366,17 +354,14 @@ func (s *State) AddPartitions(topicName string, newCount int) {
 	}
 	for i := current; i < newCount; i++ {
 		pd := &PartData{
-			Topic:                topicName,
-			Index:                int32(i),
-			TopicID:              td.ID,
-			maxTimestampBatchIdx: -1,
+			Topic:   topicName,
+			Index:   int32(i),
+			TopicID: td.ID,
 		}
-		if s.walWriter != nil {
-			totalPartitions := s.countPartitions() + (newCount - current)
-			slots := CalcRingSlots(s.ringBufferMem, totalPartitions, 16*1024)
-			ring := NewRingBuffer(slots)
-			pd.InitWAL(ring, s.walWriter, s.walIndex)
-		}
+		totalPartitions := s.countPartitions() + (newCount - current)
+		slots := CalcRingSlots(s.ringBufferMem, totalPartitions, 16*1024)
+		ring := NewRingBuffer(slots)
+		pd.InitWAL(ring, s.walWriter, s.walIndex)
 		td.Partitions = append(td.Partitions, pd)
 	}
 }
@@ -529,10 +514,9 @@ func (s *State) CreateTopicFromReplay(name string, numPartitions int, topicID [1
 	partitions := make([]*PartData, numPartitions)
 	for i := range partitions {
 		partitions[i] = &PartData{
-			Topic:                name,
-			Index:                int32(i),
-			TopicID:              topicID,
-			maxTimestampBatchIdx: -1,
+			Topic:   name,
+			Index:   int32(i),
+			TopicID: topicID,
 		}
 	}
 
@@ -673,9 +657,9 @@ func (s *State) FlushablePartitions() []FlushablePartition {
 
 			capturedPd := pd
 			result = append(result, FlushablePartition{
-				Topic:     td.Name,
-				Partition: pd.Index,
-				TopicID:   topicID,
+				Topic:       td.Name,
+				Partition:   pd.Index,
+				TopicID:     topicID,
 				S3Watermark: watermark,
 				HW:          hw,
 				Partition_:  capturedPd,

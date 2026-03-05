@@ -23,7 +23,7 @@ func TestMetadataEmptyCluster(t *testing.T) {
 
 	// Request metadata with no topics (empty list, not nil — empty means "give me nothing")
 	req := kmsg.NewMetadataRequest()
-	req.Version = 9 // flexible version
+	req.Version = 9                            // flexible version
 	req.Topics = []kmsg.MetadataRequestTopic{} // empty list = no topics
 
 	resp, err := req.RequestWith(ctx, cl)

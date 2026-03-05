@@ -3,6 +3,7 @@ package handler
 import (
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -17,24 +18,24 @@ func HandleDescribeTransactions(state *cluster.State) server.Handler {
 			ts := kmsg.NewDescribeTransactionsResponseTransactionState()
 			ts.TransactionalID = txnID
 
-			ps := state.PIDManager().GetProducerByTxnID(txnID)
-			if ps == nil {
-				ts.ErrorCode = 79 // TRANSACTIONAL_ID_NOT_FOUND
+			snap, ok := state.PIDManager().GetProducerByTxnIDSnapshot(txnID)
+			if !ok {
+				ts.ErrorCode = kerr.TransactionalIDNotFound.Code
 				resp.TransactionStates = append(resp.TransactionStates, ts)
 				continue
 			}
 
-			ts.ProducerID = ps.ProducerID
-			ts.ProducerEpoch = ps.Epoch
-			ts.TimeoutMillis = ps.TxnTimeoutMs
+			ts.ProducerID = snap.ProducerID
+			ts.ProducerEpoch = snap.Epoch
+			ts.TimeoutMillis = snap.TxnTimeoutMs
 
-			if ps.TxnState == cluster.TxnOngoing {
+			if snap.TxnState == cluster.TxnOngoing {
 				ts.State = "Ongoing"
-				ts.StartTimestamp = ps.TxnStartTime.UnixMilli()
+				ts.StartTimestamp = snap.TxnStartTime.UnixMilli()
 
 				// Build topic-partition list
 				topicParts := make(map[string][]int32)
-				for tp := range ps.TxnPartitions {
+				for tp := range snap.TxnPartitions {
 					topicParts[tp.Topic] = append(topicParts[tp.Topic], tp.Partition)
 				}
 				for topic, parts := range topicParts {

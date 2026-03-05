@@ -30,7 +30,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 		// Fetch sessions: return FETCH_SESSION_ID_NOT_FOUND for non-zero session ID.
 		// This forces clients to fall back to full fetches (Phase 1 simplification).
 		if r.SessionID != 0 {
-			resp.ErrorCode = 70 // FETCH_SESSION_ID_NOT_FOUND
+			resp.ErrorCode = kerr.FetchSessionIDNotFound.Code
 			return resp, nil
 		}
 
@@ -86,6 +86,12 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 			for i, info := range allParts {
 				sp := kmsg.NewFetchResponseTopicPartition()
 				sp.Partition = info.partitionID
+				// Use empty (non-nil) RecordBatches so the wire encoding
+				// produces compact-bytes length 0 (uvarint 1) instead of
+				// null (uvarint 0).  librdkafka reads this field with
+				// rd_kafka_buf_read_arraycnt which treats null (-1) as an
+				// invalid MessageSetSize, causing parse failures.
+				sp.RecordBatches = []byte{}
 
 				if info.td == nil || info.pd == nil {
 					sp.ErrorCode = kerr.UnknownTopicOrPartition.Code
@@ -99,6 +105,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 				pd := info.pd
 				rp := r.Topics[info.topicIdx].Partitions[info.partIdx]
 
+				// Read metadata under RLock, then release before I/O.
 				pd.RLock()
 				hw := pd.HW()
 				logStart := pd.LogStart()
@@ -115,8 +122,10 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 					results[i] = partResult{sp: sp}
 					continue
 				}
+				pd.RUnlock()
 
-				// Fetch batches with per-partition size limit
+				// Fetch batches (FetchFrom manages its own locking;
+				// WAL pread and S3 HTTP happen without holding pd.mu).
 				maxBytes := rp.PartitionMaxBytes
 				if maxBytes <= 0 {
 					maxBytes = 1024 * 1024 // 1MB default
@@ -139,12 +148,13 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 
 					// Get aborted transaction index for this range
 					if len(batches) > 0 {
+						pd.RLock()
 						lastBatch := batches[len(batches)-1]
 						lastOffset := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta) + 1
 						abortedTxns = pd.AbortedTxnsInRange(fetchOffset, lastOffset)
+						pd.RUnlock()
 					}
 				}
-				pd.RUnlock()
 
 				sp.HighWatermark = hw
 				sp.LastStableOffset = lso
@@ -222,7 +232,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 				}
 				if !firstPartitionWithData && responseTotalBytes+dataSize > r.MaxBytes {
 					// Trim this partition's data to fit
-					results[i].sp.RecordBatches = nil
+					results[i].sp.RecordBatches = []byte{}
 					results[i].dataSize = 0
 					continue
 				}
