@@ -52,7 +52,7 @@ func TestGracefulShutdown(t *testing.T) {
 	keys := listS3Objects(t, prefix)
 	found := false
 	for _, key := range keys {
-		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {
+		if strings.Contains(key, topic+"-") && strings.Contains(key, "/0/") && strings.HasSuffix(key, ".obj") {
 			found = true
 			break
 		}

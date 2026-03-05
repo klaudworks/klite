@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/metadata"
@@ -42,6 +44,7 @@ type Broker struct {
 	handlers   *server.HandlerRegistry
 	walWriter  *wal.Writer      // nil if WAL disabled
 	walIndex   *wal.Index       // nil if WAL disabled
+	chunkPool  *chunk.Pool      // nil if WAL disabled
 	metaLog    *metadata.Log    // nil if metadata persistence disabled
 	s3Client   *s3store.Client  // nil if S3 disabled
 	s3Reader   *s3store.Reader  // nil if S3 disabled
@@ -286,6 +289,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// 8c. Start compaction loop (only if S3 is configured)
 	if b.s3Client != nil {
 		go b.compactionLoop(ctx)
+		go b.s3GCLoop(ctx)
 	}
 
 	// 9. Serve connections (blocks until listener closed)
@@ -470,13 +474,15 @@ func (b *Broker) initWAL() error {
 
 	b.walWriter = w
 
-	// Initialize ring buffers on all partitions BEFORE replay so that
-	// CommitBatch can push data into them during WAL replay.
-	ringMem := b.cfg.RingBufferMaxMem
-	if ringMem == 0 {
-		ringMem = 512 * 1024 * 1024 // 512 MiB
+	// Initialize chunk pool on all partitions BEFORE replay so that
+	// PushBatch can write data into chunks during WAL replay.
+	poolMem := b.cfg.ChunkPoolMemory
+	if poolMem == 0 {
+		poolMem = 512 * 1024 * 1024 // 512 MiB
 	}
-	b.state.SetWALConfig(w, idx, ringMem)
+	pool := chunk.NewPool(poolMem, cluster.DefaultMaxMessageBytes)
+	b.chunkPool = pool
+	b.state.SetWALConfig(w, idx, pool)
 
 	// Replay existing WAL entries to rebuild state
 	if err := b.replayWAL(w); err != nil {
@@ -562,15 +568,8 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 			return nil
 		}
 
-		// Rebuild partition state
+		// Rebuild partition state: append to chunk pool and advance HW.
 		pd.Lock()
-		batch := cluster.StoredBatch{
-			BaseOffset:      entry.Offset,
-			LastOffsetDelta: meta.LastOffsetDelta,
-			RawBytes:        entry.Data,
-			MaxTimestamp:    meta.MaxTimestamp,
-			NumRecords:      meta.NumRecords,
-		}
 
 		// Advance HW if needed (WAL can only advance, never reduce)
 		endOffset := lastOffset + 1
@@ -578,16 +577,14 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 			pd.SetHW(endOffset)
 		}
 
-		// Advance logStartOffset if the lowest WAL offset is higher
-		// than the metadata.log value (secondary authority)
-		if entry.Offset > pd.LogStart() {
-			// Only if no earlier entries exist in this partition
-			// This is handled naturally: first WAL entry for a partition
-			// sets the floor. We don't need explicit logic — the metadata.log
-			// value takes precedence and WAL data below it was already skipped.
-		}
-
-		pd.CommitBatch(batch)
+		// Append batch data to chunk pool (replaces ring buffer push).
+		// Data is already offset-assigned in the WAL.
+		pd.AppendToChunk(entry.Data, chunk.ChunkBatch{
+			BaseOffset:      entry.Offset,
+			LastOffsetDelta: meta.LastOffsetDelta,
+			MaxTimestamp:    meta.MaxTimestamp,
+			NumRecords:      meta.NumRecords,
+		})
 		pd.Unlock()
 
 		// Add to WAL index
@@ -641,9 +638,9 @@ func (b *Broker) initS3() error {
 		}
 	}
 
-	prefix := b.cfg.S3Prefix
-	if prefix == "" {
-		prefix = "klite/" + b.clusterID
+	prefix := "klite-" + b.clusterID
+	if b.cfg.S3Prefix != "" {
+		prefix = b.cfg.S3Prefix + "/" + prefix
 	}
 
 	b.s3Client = s3store.NewClient(s3store.ClientConfig{
@@ -659,10 +656,24 @@ func (b *Broker) initS3() error {
 	fetchAdapter := &s3store.ReaderAdapter{Reader: b.s3Reader}
 	b.state.SetS3Fetcher(fetchAdapter)
 
-	// Set up the flusher
+	// Set up the flusher with per-partition thresholds
 	flushInterval := b.cfg.S3FlushInterval
 	if flushInterval == 0 {
-		flushInterval = 10 * time.Minute
+		flushInterval = 60 * time.Second
+	}
+	checkInterval := b.cfg.S3FlushCheckInterval
+	if checkInterval == 0 {
+		checkInterval = 5 * time.Second
+	}
+	targetObjSize := b.cfg.S3TargetObjectSize
+	if targetObjSize == 0 {
+		targetObjSize = 64 * 1024 * 1024 // 64 MiB
+	}
+
+	// Create triggerCh for emergency flush signaling from chunk pool pressure
+	triggerCh := make(chan struct{}, 1)
+	if b.chunkPool != nil {
+		b.chunkPool.SetTriggerCh(triggerCh)
 	}
 
 	flusherCfg := s3store.FlusherConfig{
@@ -670,15 +681,16 @@ func (b *Broker) initS3() error {
 		WALWriter:         b.walWriter,
 		WALIndex:          b.walIndex,
 		FlushInterval:     flushInterval,
-		UploadConcurrency: 4,
+		CheckInterval:     checkInterval,
+		TargetObjectSize:  targetObjSize,
+		UploadConcurrency: 8,
 		Logger:            b.logger,
+		TriggerCh:         triggerCh,
 		MetadataUploader:  b.uploadMetadataLog,
 	}
 
 	partAdapter := &s3PartitionAdapter{
-		state:     b.state,
-		walWriter: b.walWriter,
-		walIndex:  b.walIndex,
+		state: b.state,
 	}
 	b.s3Flusher = s3store.NewFlusher(flusherCfg, partAdapter)
 	b.s3Flusher.Start()
@@ -695,6 +707,8 @@ func (b *Broker) initS3() error {
 		"bucket", b.cfg.S3Bucket,
 		"prefix", prefix,
 		"flush_interval", flushInterval,
+		"check_interval", checkInterval,
+		"target_object_size", targetObjSize,
 	)
 
 	return nil
@@ -739,9 +753,9 @@ func (b *Broker) maybeRecoverFromS3() error {
 		}
 	}
 
-	prefix := b.cfg.S3Prefix
-	if prefix == "" {
-		prefix = "klite/" + b.clusterID
+	prefix := "klite-" + b.clusterID
+	if b.cfg.S3Prefix != "" {
+		prefix = b.cfg.S3Prefix + "/" + prefix
 	}
 
 	client := s3store.NewClient(s3store.ClientConfig{
@@ -788,10 +802,11 @@ func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, 
 		return nil
 	}
 
-	// Parse topic/partition from keys. Key format: prefix/topic/partition/offset.obj
+	// Parse topic/partition from keys. Key format: prefix/topicName-topicID/partition/offset.obj
 	// Skip non-data keys like prefix/metadata.log.
 	type topicInfo struct {
 		maxPartition int32
+		topicID      [16]byte // extracted from the key's hex-encoded topic ID
 	}
 	topics := make(map[string]*topicInfo)
 
@@ -802,18 +817,25 @@ func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, 
 		if len(parts) != 3 {
 			continue // not a data object (e.g. metadata.log)
 		}
-		topicName := parts[0]
-		partIdx, err := strconv.Atoi(parts[1])
-		if err != nil {
+		if !strings.HasSuffix(parts[2], ".obj") {
 			continue
 		}
-		if !strings.HasSuffix(parts[2], ".obj") {
+
+		// parts[0] is "topicName-hexTopicID" (32-char hex suffix)
+		topicDir := parts[0]
+		topicName, parsedID := s3store.ParseTopicDir(topicDir)
+		if topicName == "" {
+			continue
+		}
+
+		partIdx, err := strconv.Atoi(parts[1])
+		if err != nil {
 			continue
 		}
 
 		ti, ok := topics[topicName]
 		if !ok {
-			ti = &topicInfo{maxPartition: -1}
+			ti = &topicInfo{maxPartition: -1, topicID: parsedID}
 			topics[topicName] = ti
 		}
 		if int32(partIdx) > ti.maxPartition {
@@ -843,9 +865,12 @@ func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, 
 
 	for _, name := range topicNames {
 		ti := topics[name]
-		topicID := uuid.New()
-		var idBytes [16]byte
-		copy(idBytes[:], topicID[:])
+		idBytes := ti.topicID
+		var zeroID [16]byte
+		if idBytes == zeroID {
+			topicUUID := uuid.New()
+			copy(idBytes[:], topicUUID[:])
+		}
 
 		entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
 			TopicName:      name,
@@ -867,7 +892,7 @@ func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, 
 		b.logger.Info("inferred topic from S3",
 			"topic", name,
 			"partitions", ti.maxPartition+1,
-			"topic_id", topicID.String())
+			"topic_id", hex.EncodeToString(idBytes[:]))
 	}
 
 	if err := f.Sync(); err != nil {
@@ -898,7 +923,7 @@ func (b *Broker) rehydrateDirtyCounters() {
 		}
 
 		for _, pd := range td.Partitions {
-			prefix := s3store.ObjectKeyPrefix(b.s3Client.Prefix(), td.Name, pd.Index)
+			prefix := s3store.ObjectKeyPrefix(b.s3Client.Prefix(), td.Name, td.ID, pd.Index)
 			objects, err := b.s3Client.ListObjects(ctx, prefix)
 			if err != nil {
 				b.logger.Debug("dirty counter rehydration failed",
@@ -950,7 +975,7 @@ func (b *Broker) probeS3Watermarks() {
 				continue // already has S3 flush watermark
 			}
 
-			s3HW, err := b.s3Reader.DiscoverHW(ctx, td.Name, pd.Index)
+			s3HW, err := b.s3Reader.DiscoverHW(ctx, td.Name, td.ID, pd.Index)
 			if err != nil {
 				b.logger.Debug("S3 HW probe failed", "topic", td.Name, "partition", pd.Index, "err", err)
 				continue
@@ -999,9 +1024,7 @@ func createAWSS3Client(cfg Config) (s3store.S3API, error) {
 
 // s3PartitionAdapter adapts the cluster state to the s3.PartitionProvider interface.
 type s3PartitionAdapter struct {
-	state     *cluster.State
-	walWriter *wal.Writer
-	walIndex  *wal.Index
+	state *cluster.State
 }
 
 func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
@@ -1009,24 +1032,45 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 	var result []s3store.FlushPartition
 
 	for _, fp := range parts {
-		batches := s3store.CollectWALBatches(a.walWriter, a.walIndex, fp.TopicID, fp.Partition, fp.S3Watermark)
-		if len(batches) == 0 {
+		pd := fp.Partition_ // captured partition reference
+
+		// Read chunk state under RLock
+		pd.RLock()
+		hasData := pd.HasChunkData()
+		sealedBytes := pd.SealedChunkBytes()
+		oldestTime := pd.OldestSealedChunkTime()
+		pd.RUnlock()
+
+		if !hasData {
 			continue
 		}
 
-		pd := fp.Partition_ // captured partition reference
 		result = append(result, s3store.FlushPartition{
-			Topic:       fp.Topic,
-			Partition:   fp.Partition,
-			TopicID:     fp.TopicID,
-			S3Watermark: fp.S3Watermark,
-			HW:          fp.HW,
-			Batches:     batches,
+			Topic:           fp.Topic,
+			Partition:       fp.Partition,
+			TopicID:         fp.TopicID,
+			S3Watermark:     fp.S3Watermark,
+			HW:              fp.HW,
+			SealedBytes:     sealedBytes,
+			OldestChunkTime: oldestTime,
+			DetachChunks: func(flushAll bool) ([]*chunk.Chunk, *chunk.Pool) {
+				pd.Lock()
+				chunks := pd.DetachSealedChunks(flushAll)
+				pool := pd.ChunkPool()
+				pd.Unlock()
+				return chunks, pool
+			},
 			AdvanceWatermark: func(newWatermark int64) {
 				pd.Lock()
 				pd.SetS3FlushWatermark(newWatermark)
 				pd.IncrementDirtyObjects()
 				pd.Unlock()
+
+				// Prune WAL index entries for flushed data
+				if walIdx := pd.WalIndex(); walIdx != nil {
+					tp := wal.TopicPartition{TopicID: fp.TopicID, Partition: fp.Partition}
+					walIdx.PruneBefore(tp, newWatermark)
+				}
 			},
 		})
 	}
@@ -1308,6 +1352,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 	newWatermark, err := compactor.CompactPartition(
 		ctx,
 		bestTD.Name,
+		bestTD.ID,
 		bestPD.Index,
 		cleanedUpTo,
 		minCompactionLagMs,

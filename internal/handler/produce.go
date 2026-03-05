@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/klaudworks/klite/internal/wal"
@@ -216,7 +217,7 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 }
 
 // produceWithWAL implements the durable produce path:
-//  1. Reserve offset under partition lock
+//  1. Reserve offset + append to chunk under partition lock
 //  2. Write to WAL (lock released during fsync wait)
 //  3. Commit batch under partition lock (advances HW in order)
 func produceWithWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (baseOffset int64, logStart int64, err error) {
@@ -224,14 +225,24 @@ func produceWithWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, met
 	stored := make([]byte, len(raw))
 	copy(stored, raw)
 
-	// Step 1: Reserve offset (brief write lock)
+	// Step 1: Reserve offset + append to chunk (brief write lock)
+	// Data goes into chunk memory immediately so fetch can see it
+	// after HW advances in CommitBatch.
 	pd.Lock()
 	baseOffset = pd.ReserveOffset(meta)
 	logStart = pd.LogStart()
-	pd.Unlock()
 
-	// Assign the server-side offset into the raw bytes
+	// Assign the server-side offset into the raw bytes (in-place mutation)
 	cluster.AssignOffset(stored, baseOffset)
+
+	// Append offset-assigned bytes to chunk pool (memory)
+	pd.AppendToChunk(stored, chunk.ChunkBatch{
+		BaseOffset:      baseOffset,
+		LastOffsetDelta: meta.LastOffsetDelta,
+		MaxTimestamp:    meta.MaxTimestamp,
+		NumRecords:      meta.NumRecords,
+	})
+	pd.Unlock()
 
 	// Step 2: Write to WAL (pd.mu NOT held — Fetches can proceed)
 	walEntry := &wal.Entry{
@@ -245,7 +256,7 @@ func produceWithWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, met
 		return 0, 0, err
 	}
 
-	// Step 3: Commit batch (brief write lock — advances HW in order)
+	// Step 3: Commit batch (brief write lock — advances HW only, no data copy)
 	batch := cluster.StoredBatch{
 		BaseOffset:      baseOffset,
 		LastOffsetDelta: meta.LastOffsetDelta,

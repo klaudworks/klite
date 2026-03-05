@@ -33,10 +33,16 @@ export default defineConfig({
 					{ label: 'Troubleshooting', slug: 'guides/troubleshooting' },
 				],
 			},
-				{
-					label: 'Reference',
-					autogenerate: { directory: 'reference' },
-				},
+			{
+				label: 'Reference',
+				autogenerate: { directory: 'reference' },
+			},
+			{
+				label: 'Performance',
+				items: [
+					{ label: 'Benchmarks', slug: 'reference/benchmarks' },
+				],
+			},
 			],
 		}),
 	],

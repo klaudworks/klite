@@ -71,6 +71,9 @@ type Writer struct {
 	nextSeq  atomic.Uint64
 	walDir   string
 
+	// Disk usage tracking (for segment cleanup)
+	diskUsage atomic.Int64 // total bytes across all WAL segment files
+
 	// For external callers to check
 	mu      sync.Mutex
 	stopped bool
@@ -152,6 +155,13 @@ func (w *Writer) Start() error {
 		w.current = seg
 		w.segments = []*segmentInfo{seg}
 	}
+
+	// Initialize diskUsage from existing segments
+	var totalSize int64
+	for _, seg := range w.segments {
+		totalSize += seg.size
+	}
+	w.diskUsage.Store(totalSize)
 
 	go w.run()
 	return nil
@@ -245,6 +255,11 @@ func (w *Writer) Dir() string {
 	return w.walDir
 }
 
+// DiskPressure returns the fraction of MaxDiskSize currently used (0.0 to 1.0+).
+func (w *Writer) DiskPressure() float64 {
+	return float64(w.diskUsage.Load()) / float64(w.cfg.MaxDiskSize)
+}
+
 // run is the main writer goroutine loop.
 func (w *Writer) run() {
 	defer close(w.done)
@@ -326,6 +341,7 @@ func (w *Writer) appendEntry(serialized []byte) error {
 		return fmt.Errorf("write entry: %w", err)
 	}
 	w.current.size += int64(n)
+	w.diskUsage.Add(int64(n))
 
 	// Parse entry to update index
 	if len(serialized) > 4 {
@@ -445,6 +461,7 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 		}
 
 		// No references — safe to delete
+		deletedSize := seg.size
 		if seg.file != nil {
 			seg.file.Close()
 			seg.file = nil
@@ -453,6 +470,7 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 			w.logger.Warn("failed to delete WAL segment", "path", seg.path, "err", err)
 			kept = append(kept, seg) // keep on failure
 		} else {
+			w.diskUsage.Add(-deletedSize)
 			w.logger.Info("deleted unreferenced WAL segment", "seq", seg.seq, "path", seg.path)
 		}
 	}
@@ -466,6 +484,7 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 			break
 		}
 
+		deletedSegSize := oldest.size
 		w.idx.PruneSegment(oldest.seq)
 		if oldest.file != nil {
 			oldest.file.Close()
@@ -475,6 +494,7 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 			w.logger.Warn("failed to force-delete WAL segment", "path", oldest.path, "err", err)
 			break
 		}
+		w.diskUsage.Add(-deletedSegSize)
 		w.logger.Warn("force-deleted WAL segment (disk limit exceeded)",
 			"seq", oldest.seq, "path", oldest.path)
 		w.segments = w.segments[1:]

@@ -58,6 +58,7 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 				st.ErrorCode = kerr.UnknownTopicOrPartition.Code
 			} else {
 				st.TopicID = td.ID
+				topicID := td.ID
 				if !state.DeleteTopic(topicName) {
 					st.ErrorCode = kerr.UnknownTopicOrPartition.Code
 				} else {
@@ -65,6 +66,7 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 					if ml := state.MetadataLog(); ml != nil {
 						entry := metadata.MarshalDeleteTopic(&metadata.DeleteTopicEntry{
 							TopicName: topicName,
+							TopicID:   topicID,
 						})
 						if err := ml.AppendSync(entry); err != nil {
 						slog.Warn("metadata.log: failed to persist DeleteTopic",

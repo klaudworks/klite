@@ -42,9 +42,14 @@ func WithDataDir(dir string) BrokerOpt {
 	return func(c *broker.Config) { c.DataDir = dir }
 }
 
-// WithRingBufferMaxMem sets the global ring buffer memory budget.
-func WithRingBufferMaxMem(n int64) BrokerOpt {
-	return func(c *broker.Config) { c.RingBufferMaxMem = n }
+// WithClusterID sets a fixed cluster ID (useful for DR tests across data dir wipes).
+func WithClusterID(id string) BrokerOpt {
+	return func(c *broker.Config) { c.ClusterID = id }
+}
+
+// WithChunkPoolMemory sets the global chunk pool memory budget.
+func WithChunkPoolMemory(n int64) BrokerOpt {
+	return func(c *broker.Config) { c.ChunkPoolMemory = n }
 }
 
 // WithWALSegmentMaxBytes sets the max segment size before rotation.

@@ -7,27 +7,35 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/wal"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
+// DeletedTopic records a topic that was deleted and needs S3 GC.
+type DeletedTopic struct {
+	Name    string
+	TopicID [16]byte
+}
+
 // State holds all in-memory cluster state: topics, partitions, offsets, groups.
 // Protected by a RWMutex for concurrent access.
 type State struct {
-	mu     sync.RWMutex
-	topics map[string]*TopicData // topic name -> topic
-	tnorms map[string]string     // normalized name -> actual topic name (collision detection)
-	groups map[string]*Group     // group ID -> group
-	cfg    Config
+	mu            sync.RWMutex
+	topics        map[string]*TopicData // topic name -> topic
+	tnorms        map[string]string     // normalized name -> actual topic name (collision detection)
+	groups        map[string]*Group     // group ID -> group
+	deletedTopics []DeletedTopic        // topics pending S3 GC
+	cfg           Config
 
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
 
 	// WAL-related state (Phase 3+)
-	walWriter     *wal.Writer
-	walIndex      *wal.Index
-	ringBufferMem int64 // global memory budget for ring buffers
+	walWriter *wal.Writer
+	walIndex  *wal.Index
+	chunkPool *chunk.Pool // global chunk pool (replaces ring buffers)
 
 	// S3-related state (Phase 4)
 	s3Fetcher S3Fetcher // S3 reader adapter (nil if S3 not configured)
@@ -73,27 +81,18 @@ func (s *State) SetLogger(l *slog.Logger) {
 	s.logger = l
 }
 
-// SetWALConfig configures the cluster state for WAL mode.
-// All existing partitions get ring buffers initialized.
-func (s *State) SetWALConfig(w *wal.Writer, idx *wal.Index, ringBufferMem int64) {
+// SetWALConfig configures the cluster state for WAL mode with chunk pool.
+// All existing partitions get initialized with the chunk pool.
+func (s *State) SetWALConfig(w *wal.Writer, idx *wal.Index, pool *chunk.Pool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.walWriter = w
 	s.walIndex = idx
-	s.ringBufferMem = ringBufferMem
-
-	// Initialize ring buffers for all existing partitions
-	totalPartitions := 0
-	for _, td := range s.topics {
-		totalPartitions += len(td.Partitions)
-	}
-
-	slots := CalcRingSlots(ringBufferMem, totalPartitions, 16*1024)
+	s.chunkPool = pool
 
 	for _, td := range s.topics {
 		for _, pd := range td.Partitions {
-			ring := NewRingBuffer(slots)
-			pd.InitWAL(ring, w, idx)
+			pd.InitWAL(pool, w, idx)
 		}
 	}
 }
@@ -244,12 +243,32 @@ func (s *State) AutoCreateEnabled() bool {
 func (s *State) DeleteTopic(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.topics[name]
+	td, ok := s.topics[name]
 	if ok {
+		s.deletedTopics = append(s.deletedTopics, DeletedTopic{
+			Name:    name,
+			TopicID: td.ID,
+		})
 		delete(s.topics, name)
 		delete(s.tnorms, NormalizeTopicName(name))
 	}
 	return ok
+}
+
+// DrainDeletedTopics returns and clears the list of topics pending S3 GC.
+func (s *State) DrainDeletedTopics() []DeletedTopic {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := s.deletedTopics
+	s.deletedTopics = nil
+	return result
+}
+
+// AddDeletedTopic adds a deleted topic to the GC list (used during metadata replay).
+func (s *State) AddDeletedTopic(dt DeletedTopic) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletedTopics = append(s.deletedTopics, dt)
 }
 
 // TopicData holds metadata and partitions for a single topic.
@@ -358,10 +377,7 @@ func (s *State) AddPartitions(topicName string, newCount int) {
 			Index:   int32(i),
 			TopicID: td.ID,
 		}
-		totalPartitions := s.countPartitions() + (newCount - current)
-		slots := CalcRingSlots(s.ringBufferMem, totalPartitions, 16*1024)
-		ring := NewRingBuffer(slots)
-		pd.InitWAL(ring, s.walWriter, s.walIndex)
+		pd.InitWAL(s.chunkPool, s.walWriter, s.walIndex)
 		td.Partitions = append(td.Partitions, pd)
 	}
 }
@@ -609,15 +625,11 @@ func (s *State) StopAllGroups() {
 	}
 }
 
-// initPartitionsWAL initializes ring buffers and WAL references on all partitions of a topic.
+// initPartitionsWAL initializes chunk pool and WAL references on all partitions of a topic.
 // Caller must hold s.mu.Lock().
 func (s *State) initPartitionsWAL(td *TopicData) {
-	totalPartitions := s.countPartitions()
-	slots := CalcRingSlots(s.ringBufferMem, totalPartitions, 16*1024)
-
 	for _, pd := range td.Partitions {
-		ring := NewRingBuffer(slots)
-		pd.InitWAL(ring, s.walWriter, s.walIndex)
+		pd.InitWAL(s.chunkPool, s.walWriter, s.walIndex)
 		if s.s3Fetcher != nil {
 			pd.SetS3Fetcher(s.s3Fetcher)
 		}

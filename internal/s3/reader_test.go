@@ -48,6 +48,7 @@ func TestKeyLookup(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "klite/test",
 	})
+	tid := testTopicID
 
 	reader := NewReader(client, nil)
 
@@ -55,25 +56,25 @@ func TestKeyLookup(t *testing.T) {
 		{RawBytes: makeMinimalBatch(0, 9), BaseOffset: 0, LastOffsetDelta: 9},
 	}
 	obj1 := BuildObject(batches1)
-	key1 := ObjectKey("klite/test", "lookup-test", 0, 0)
+	key1 := ObjectKey("klite/test", "lookup-test", tid, 0, 0)
 
 	batches2 := []BatchData{
 		{RawBytes: makeMinimalBatch(10, 9), BaseOffset: 10, LastOffsetDelta: 9},
 	}
 	obj2 := BuildObject(batches2)
-	key2 := ObjectKey("klite/test", "lookup-test", 0, 10)
+	key2 := ObjectKey("klite/test", "lookup-test", tid, 0, 10)
 
 	ctx := context.Background()
 	require.NoError(t, client.PutObject(ctx, key1, obj1))
 	require.NoError(t, client.PutObject(ctx, key2, obj2))
 
 	// Fetch offset 5 -- should come from first object
-	data, err := reader.Fetch(ctx, "lookup-test", 0, 5, 1024*1024)
+	data, err := reader.Fetch(ctx, "lookup-test", tid, 0, 5, 1024*1024)
 	require.NoError(t, err)
 	require.NotNil(t, data, "should find data for offset 5")
 
 	// Fetch offset 15 -- should come from second object
-	data, err = reader.Fetch(ctx, "lookup-test", 0, 15, 1024*1024)
+	data, err = reader.Fetch(ctx, "lookup-test", tid, 0, 15, 1024*1024)
 	require.NoError(t, err)
 	require.NotNil(t, data, "should find data for offset 15")
 }
@@ -94,21 +95,22 @@ func TestFooterCache(t *testing.T) {
 		{RawBytes: makeMinimalBatch(0, 4), BaseOffset: 0, LastOffsetDelta: 4},
 		{RawBytes: makeMinimalBatch(5, 4), BaseOffset: 5, LastOffsetDelta: 4},
 	}
+	tid := testTopicID
 	obj := BuildObject(batches)
-	key := ObjectKey("klite/test", "cache-test", 0, 0)
+	key := ObjectKey("klite/test", "cache-test", tid, 0, 0)
 
 	ctx := context.Background()
 	require.NoError(t, client.PutObject(ctx, key, obj))
 
 	// First fetch -- footer cache miss
 	require.Equal(t, 0, reader.FooterCacheSize())
-	_, err := reader.Fetch(ctx, "cache-test", 0, 0, 1024*1024)
+	_, err := reader.Fetch(ctx, "cache-test", tid, 0, 0, 1024*1024)
 	require.NoError(t, err)
 	require.Equal(t, 1, reader.FooterCacheSize(), "footer should be cached after first fetch")
 
 	// Second fetch -- footer cache hit (no new S3 GET for footer)
 	rangesBefore := len(mem.RangeRequests)
-	_, err = reader.Fetch(ctx, "cache-test", 0, 5, 1024*1024)
+	_, err = reader.Fetch(ctx, "cache-test", tid, 0, 5, 1024*1024)
 	require.NoError(t, err)
 	require.Equal(t, 1, reader.FooterCacheSize(), "still 1 cached footer")
 	rangesAfter := len(mem.RangeRequests)
@@ -131,12 +133,13 @@ func TestFooterCorrupted(t *testing.T) {
 	for i := range badObj {
 		badObj[i] = 0xAA
 	}
-	key := ObjectKey("klite/test", "corrupt-test", 0, 0)
+	tid := testTopicID
+	key := ObjectKey("klite/test", "corrupt-test", tid, 0, 0)
 
 	ctx := context.Background()
 	require.NoError(t, client.PutObject(ctx, key, badObj))
 
-	_, err := reader.Fetch(ctx, "corrupt-test", 0, 0, 1024*1024)
+	_, err := reader.Fetch(ctx, "corrupt-test", tid, 0, 0, 1024*1024)
 	require.Error(t, err, "should return error for corrupted footer")
 	require.Contains(t, err.Error(), "footer magic", "error should mention footer magic")
 }
@@ -157,14 +160,15 @@ func TestRangeRead(t *testing.T) {
 		{RawBytes: makeMinimalBatch(5, 4), BaseOffset: 5, LastOffsetDelta: 4},
 		{RawBytes: makeMinimalBatch(10, 4), BaseOffset: 10, LastOffsetDelta: 4},
 	}
+	tid := testTopicID
 	obj := BuildObject(batches)
-	key := ObjectKey("klite/test", "range-test", 0, 0)
+	key := ObjectKey("klite/test", "range-test", tid, 0, 0)
 
 	ctx := context.Background()
 	require.NoError(t, client.PutObject(ctx, key, obj))
 
 	// Fetch offset 5 -- should only read the second batch, not the whole object
-	data, err := reader.Fetch(ctx, "range-test", 0, 5, int32(len(batches[1].RawBytes)))
+	data, err := reader.Fetch(ctx, "range-test", tid, 0, 5, int32(len(batches[1].RawBytes)))
 	require.NoError(t, err)
 	require.NotNil(t, data)
 

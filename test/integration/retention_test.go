@@ -92,12 +92,13 @@ func produceRecordWithTimestamp(t *testing.T, cl *kgo.Client, topic string, part
 // topic/partition in the given InMemoryS3.
 func waitForS3Objects(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int, minCount int, timeout time.Duration) {
 	t.Helper()
+	topicPrefix := fmt.Sprintf("%s-", topic)
+	partSuffix := fmt.Sprintf("/%d/", partition)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		count := 0
-		partStr := fmt.Sprintf("%s/%d/", topic, partition)
 		for _, k := range mem.Keys() {
-			if strings.Contains(k, partStr) && strings.HasSuffix(k, ".obj") {
+			if strings.Contains(k, topicPrefix) && strings.Contains(k, partSuffix) && strings.HasSuffix(k, ".obj") {
 				count++
 			}
 		}

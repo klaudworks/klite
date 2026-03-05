@@ -14,6 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testTopicID is a fixed topic UUID used across compactor tests.
+var testTopicID = [16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+
 // --- helpers for building test S3 objects ---
 
 func buildTestObject(t *testing.T, batches []testBatch) []byte {
@@ -70,7 +73,7 @@ func newTestCompactor(t *testing.T, s3mem *InMemoryS3, clk clock.Clock) (*Compac
 
 func putObject(t *testing.T, s3mem *InMemoryS3, prefix, topic string, partition int32, baseOffset int64, data []byte) {
 	t.Helper()
-	key := ObjectKey(prefix, topic, partition, baseOffset)
+	key := ObjectKey(prefix, topic, testTopicID, partition, baseOffset)
 	ctx := context.Background()
 	client := NewClient(ClientConfig{
 		S3Client: s3mem,
@@ -167,14 +170,14 @@ func TestCompactionBasicDedup(t *testing.T) {
 		return nil
 	}
 
-	newWM, err := compactor.CompactPartition(ctx, "topic1", 0, watermark, 0,
+	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, watermark, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Greater(t, newWM, watermark)
 
 	// Verify: read back from S3, parse all records
-	reader.InvalidateFooters("topic1", 0)
-	data, err := reader.Fetch(ctx, "topic1", 0, 0, 1024*1024)
+	reader.InvalidateFooters("topic1", testTopicID, 0)
+	data, err := reader.Fetch(ctx, "topic1", testTopicID, 0, 0, 1024*1024)
 	require.NoError(t, err)
 	require.NotEmpty(t, data)
 
@@ -264,7 +267,7 @@ func TestCompactionNilKeyRetained(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -274,7 +277,7 @@ func TestCompactionNilKeyRetained(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 	require.NotEmpty(t, objects)
 
@@ -335,7 +338,7 @@ func TestCompactionEmptyKeyDedup(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -345,7 +348,7 @@ func TestCompactionEmptyKeyDedup(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 
 	var emptyKeyRecords []string
@@ -411,7 +414,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	// At now=100000s, tombstone timestamp=99990s → age = 10s, exactly at threshold.
 	// With deleteRetentionMs=10000, the tombstone age 10s is NOT greater than 10s,
 	// so it should be retained.
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -422,7 +425,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 		Prefix:   "test-prefix",
 	})
 	var tombstoneFound bool
-	objects, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	for _, oi := range objects {
 		data, _ := client.GetObject(ctx, oi.Key)
 		footer, _ := ParseFooter(data, int64(len(data)))
@@ -470,7 +473,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	}})
 	putObject(t, s3mem2, "test-prefix", "topic1", 0, 1, obj4)
 
-	_, err = compactor2.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err = compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -481,7 +484,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 		Prefix:   "test-prefix",
 	})
 	tombstoneFound = false
-	objects, _ = client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, _ = client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	for _, oi := range objects {
 		data, _ := client2.GetObject(ctx, oi.Key)
 		footer, _ := ParseFooter(data, int64(len(data)))
@@ -549,13 +552,13 @@ func TestCompactionMinLag(t *testing.T) {
 
 	// With 1h min lag, obj2 (30 min old) should be excluded.
 	// Only 1 object in the window => single-object windows are skipped => no compaction.
-	watermark, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 3600000,
+	watermark, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 3600000,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Equal(t, int64(-1), watermark, "should not compact when recent objects are excluded")
 
 	// With 0 min lag (default), both objects are eligible => compaction happens.
-	watermark, err = compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	watermark, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Greater(t, watermark, int64(-1), "should compact with no min lag")
@@ -594,7 +597,7 @@ func TestCompactionPreservesOrder(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -604,7 +607,7 @@ func TestCompactionPreservesOrder(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 
 	type keyOff struct {
@@ -674,7 +677,7 @@ func TestCompactionEmptyBatchSkipped(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -684,7 +687,7 @@ func TestCompactionEmptyBatchSkipped(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 
 	for _, oi := range objects {
@@ -736,7 +739,7 @@ func TestCompactionSparseOffsets(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -746,7 +749,7 @@ func TestCompactionSparseOffsets(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 	require.NotEmpty(t, objects)
 
@@ -863,16 +866,16 @@ func TestCompactionOrphanCleanup(t *testing.T) {
 	})
 
 	// Before compaction, we have 2 objects
-	objsBefore, _ := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objsBefore, _ := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	assert.Len(t, objsBefore, 2, "should have 2 objects before orphan cleanup")
 
 	// Run compaction — orphan cleanup should detect and delete the orphan
-	_, err := compactor2.CompactPartition(ctx, "topic1", 0, 4, 0,
+	_, err := compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, 4, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
 	// After orphan cleanup, the offset-3 object should be deleted (covered by offset-0 object)
-	objsAfter, _ := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objsAfter, _ := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	assert.Len(t, objsAfter, 1, "orphan should be cleaned up")
 }
 
@@ -908,7 +911,7 @@ func TestCompactionCrossWindowDedup(t *testing.T) {
 		return nil
 	}
 
-	newWM, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Greater(t, newWM, int64(-1))
@@ -946,7 +949,7 @@ func TestCompactionOutputFooter(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -956,7 +959,7 @@ func TestCompactionOutputFooter(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 	require.NotEmpty(t, objects)
 
@@ -1011,7 +1014,7 @@ func TestCompactionFooterCacheInvalidation(t *testing.T) {
 	ctx := context.Background()
 
 	// Pre-populate footer cache
-	_, err := reader.Fetch(ctx, "topic1", 0, 0, 1024*1024)
+	_, err := reader.Fetch(ctx, "topic1", testTopicID, 0, 0, 1024*1024)
 	require.NoError(t, err)
 	cachesBefore := reader.FooterCacheSize()
 	assert.Greater(t, cachesBefore, 0, "footer cache should be populated")
@@ -1020,7 +1023,7 @@ func TestCompactionFooterCacheInvalidation(t *testing.T) {
 	compactor.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
 		return nil
 	}
-	_, err = compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1062,7 +1065,7 @@ func TestCompactionCRCValidAfterRewrite(t *testing.T) {
 	compactor.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
 		return nil
 	}
-	_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1072,7 +1075,7 @@ func TestCompactionCRCValidAfterRewrite(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	require.NoError(t, err)
 
 	crcTable := crc32.MakeTable(crc32.Castagnoli)
@@ -1136,7 +1139,7 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 				return nil
 			}
 
-			_, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+			_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 				func() {}, func() {})
 			require.NoError(t, err)
 
@@ -1146,7 +1149,7 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 				Bucket:   "test-bucket",
 				Prefix:   "test-prefix",
 			})
-			objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+			objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 			require.NoError(t, err)
 
 			var recordKeys []string
@@ -1207,7 +1210,7 @@ func TestCompactionIdempotent(t *testing.T) {
 	}
 
 	// First compaction
-	wm1, err := compactor.CompactPartition(ctx, "topic1", 0, -1, 0,
+	wm1, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1217,7 +1220,7 @@ func TestCompactionIdempotent(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects1, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects1, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 
 	var keys1 []string
 	for _, oi := range objects1 {
@@ -1238,12 +1241,12 @@ func TestCompactionIdempotent(t *testing.T) {
 
 	// Second compaction (on already-clean data)
 	// wm1 is the cleanedUpTo — single object won't be re-compacted
-	_, err = compactor.CompactPartition(ctx, "topic1", 0, wm1, 0,
+	_, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, wm1, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
 	// Records should be identical
-	objects2, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", 0))
+	objects2, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
 	var keys2 []string
 	for _, oi := range objects2 {
 		data, _ := client.GetObject(ctx, oi.Key)

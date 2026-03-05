@@ -12,8 +12,8 @@ type ReaderAdapter struct {
 }
 
 // FetchBatches implements cluster.S3Fetcher.
-func (a *ReaderAdapter) FetchBatches(ctx context.Context, topic string, partition int32, offset int64, maxBytes int32) ([]cluster.S3BatchData, error) {
-	batches, err := a.Reader.FetchBatches(ctx, topic, partition, offset, maxBytes)
+func (a *ReaderAdapter) FetchBatches(ctx context.Context, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) ([]cluster.S3BatchData, error) {
+	batches, err := a.Reader.FetchBatches(ctx, topic, topicID, partition, offset, maxBytes)
 	if err != nil {
 		return nil, err
 	}

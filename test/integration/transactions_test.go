@@ -484,7 +484,7 @@ func TestDescribeTransactionsNotFound(t *testing.T) {
 	resp, err := req.RequestWith(ctx, adminCl)
 	require.NoError(t, err)
 	require.Len(t, resp.TransactionStates, 1)
-	require.Equal(t, int16(79), resp.TransactionStates[0].ErrorCode) // TRANSACTIONAL_ID_NOT_FOUND
+	require.Equal(t, int16(105), resp.TransactionStates[0].ErrorCode) // TRANSACTIONAL_ID_NOT_FOUND
 }
 
 func TestListTransactions(t *testing.T) {

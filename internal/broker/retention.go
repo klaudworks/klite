@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/klaudworks/klite/internal/clock"
@@ -65,7 +66,7 @@ func (b *Broker) enforceRetention(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			b.enforcePartitionRetention(ctx, td.Name, pd, retentionMs, retentionBytes, nowMs)
+			b.enforcePartitionRetention(ctx, td.Name, td.ID, pd, retentionMs, retentionBytes, nowMs)
 		}
 	}
 }
@@ -74,12 +75,13 @@ func (b *Broker) enforceRetention(ctx context.Context) {
 func (b *Broker) enforcePartitionRetention(
 	ctx context.Context,
 	topic string,
+	topicID [16]byte,
 	pd *cluster.PartData,
 	retentionMs int64,
 	retentionBytes int64,
 	nowMs int64,
 ) {
-	prefix := s3store.ObjectKeyPrefix(b.s3Client.Prefix(), topic, pd.Index)
+	prefix := s3store.ObjectKeyPrefix(b.s3Client.Prefix(), topic, topicID, pd.Index)
 	objects, err := b.s3Client.ListObjects(ctx, prefix)
 	if err != nil {
 		b.logger.Warn("retention: list objects failed",
@@ -209,9 +211,123 @@ func (b *Broker) enforcePartitionRetention(
 		return
 	}
 
-	b.s3Reader.InvalidateFooters(topic, pd.Index)
+	b.s3Reader.InvalidateFooters(topic, topicID, pd.Index)
 
 	b.logger.Info("retention: deleted S3 objects",
 		"topic", topic, "partition", pd.Index,
 		"objects_deleted", deleted, "new_log_start", actualLogStart)
+}
+
+// s3GCLoop runs a background goroutine that deletes S3 objects for deleted topics.
+func (b *Broker) s3GCLoop(ctx context.Context) {
+	// First tick: scan for orphans left by prior crashes, then GC them
+	// together with any topics deleted during startup replay.
+	orphans := b.scanOrphanedS3Topics()
+	pending := b.state.DrainDeletedTopics()
+	b.deleteTopicObjects(ctx, append(pending, orphans...))
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if pending := b.state.DrainDeletedTopics(); len(pending) > 0 {
+				b.deleteTopicObjects(ctx, pending)
+			}
+		}
+	}
+}
+
+// deleteTopicObjects deletes all S3 objects for the given deleted topics.
+func (b *Broker) deleteTopicObjects(ctx context.Context, topics []cluster.DeletedTopic) {
+	for _, dt := range topics {
+		if ctx.Err() != nil {
+			return
+		}
+		b.gcDeletedTopic(ctx, dt)
+	}
+}
+
+// gcDeletedTopic deletes all S3 objects for a single deleted topic.
+func (b *Broker) gcDeletedTopic(ctx context.Context, dt cluster.DeletedTopic) {
+	topicDir := s3store.TopicDir(dt.Name, dt.TopicID)
+	prefix := b.s3Client.Prefix() + "/" + topicDir + "/"
+
+	objects, err := b.s3Client.ListObjects(ctx, prefix)
+	if err != nil {
+		b.logger.Warn("S3 GC: list failed, will retry",
+			"topic", dt.Name, "err", err)
+		b.state.AddDeletedTopic(dt)
+		return
+	}
+
+	if len(objects) == 0 {
+		b.logger.Info("S3 GC: no objects to delete", "topic", dt.Name)
+		return
+	}
+
+	var keys []string
+	for _, obj := range objects {
+		keys = append(keys, obj.Key)
+	}
+	b.s3Client.DeleteObjectsBatch(ctx, keys)
+
+	b.logger.Info("S3 GC: deleted objects for topic",
+		"topic", dt.Name, "objects", len(keys))
+}
+
+// scanOrphanedS3Topics lists all topic directories in S3 and returns any
+// that don't match a live topic (same name AND same ID). This catches
+// orphans left by crashes between topic deletion and GC completion.
+func (b *Broker) scanOrphanedS3Topics() []cluster.DeletedTopic {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	prefix := b.s3Client.Prefix() + "/"
+	objects, err := b.s3Client.ListObjects(ctx, prefix)
+	if err != nil {
+		b.logger.Warn("S3 orphan scan: list failed", "err", err)
+		return nil
+	}
+
+	// Build set of live topic dirs: "topicName-topicID"
+	liveDirs := make(map[string]bool)
+	for _, td := range b.state.GetAllTopics() {
+		liveDirs[s3store.TopicDir(td.Name, td.ID)] = true
+	}
+
+	// Extract unique topic dirs from S3 keys.
+	// The only non-topic object is the metadata.log backup at prefix level.
+	orphanDirs := make(map[string]bool)
+	metaKey := b.s3Client.Prefix() + "/metadata.log"
+	for _, obj := range objects {
+		if obj.Key == metaKey {
+			continue
+		}
+		rel := strings.TrimPrefix(obj.Key, prefix)
+		dir, _, _ := strings.Cut(rel, "/")
+		if dir != "" && !liveDirs[dir] {
+			orphanDirs[dir] = true
+		}
+	}
+
+	if len(orphanDirs) == 0 {
+		return nil
+	}
+
+	var result []cluster.DeletedTopic
+	for dir := range orphanDirs {
+		name, id := s3store.ParseTopicDir(dir)
+		result = append(result, cluster.DeletedTopic{
+			Name:    name,
+			TopicID: id,
+		})
+	}
+
+	b.logger.Info("S3 orphan scan: found orphaned topic dirs",
+		"orphans", len(result))
+	return result
 }

@@ -717,3 +717,178 @@ func TestIndexPruneBefore(t *testing.T) {
 		t.Errorf("first entry after prune: got base %d, want 5", entries[0].BaseOffset)
 	}
 }
+
+func TestUnflushedBytes(t *testing.T) {
+	t.Parallel()
+
+	idx := NewIndex()
+	tp := TopicPartition{TopicID: [16]byte{1}, Partition: 0}
+
+	idx.Add(tp, IndexEntry{BaseOffset: 0, LastOffset: 4, BatchSize: 100})
+	idx.Add(tp, IndexEntry{BaseOffset: 5, LastOffset: 9, BatchSize: 200})
+	idx.Add(tp, IndexEntry{BaseOffset: 10, LastOffset: 14, BatchSize: 300})
+
+	t.Run("all unflushed", func(t *testing.T) {
+		got := idx.UnflushedBytes(tp, 0)
+		if got != 600 {
+			t.Errorf("UnflushedBytes(0): got %d, want 600", got)
+		}
+	})
+
+	t.Run("partial flush", func(t *testing.T) {
+		// s3Watermark=5 means offsets 0-4 are flushed. Entry with LastOffset=4
+		// has LastOffset < 5, so it's flushed. Entries with LastOffset >= 5 remain.
+		got := idx.UnflushedBytes(tp, 5)
+		if got != 500 {
+			t.Errorf("UnflushedBytes(5): got %d, want 500", got)
+		}
+	})
+
+	t.Run("most flushed", func(t *testing.T) {
+		got := idx.UnflushedBytes(tp, 10)
+		if got != 300 {
+			t.Errorf("UnflushedBytes(10): got %d, want 300", got)
+		}
+	})
+
+	t.Run("all flushed", func(t *testing.T) {
+		got := idx.UnflushedBytes(tp, 15)
+		if got != 0 {
+			t.Errorf("UnflushedBytes(15): got %d, want 0", got)
+		}
+	})
+
+	t.Run("unknown partition", func(t *testing.T) {
+		other := TopicPartition{TopicID: [16]byte{99}, Partition: 0}
+		got := idx.UnflushedBytes(other, 0)
+		if got != 0 {
+			t.Errorf("UnflushedBytes unknown partition: got %d, want 0", got)
+		}
+	})
+}
+
+func TestDiskPressure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	idx := NewIndex()
+	cfg := WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    1 * time.Millisecond,
+		SegmentMaxBytes: 64 * 1024 * 1024,
+		MaxDiskSize:     10000, // small for testing
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+	}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	// Initially zero pressure
+	p := w.DiskPressure()
+	if p != 0 {
+		t.Errorf("initial DiskPressure: got %f, want 0", p)
+	}
+
+	topicID := [16]byte{1, 2, 3}
+	// Write entries to increase disk usage
+	for i := 0; i < 10; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(entry); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	// Pressure should be positive
+	p = w.DiskPressure()
+	if p <= 0 {
+		t.Errorf("DiskPressure after writes: got %f, want > 0", p)
+	}
+
+	usage := w.diskUsage.Load()
+	total := w.TotalDiskSize()
+	if usage != total {
+		t.Errorf("diskUsage (%d) != TotalDiskSize (%d)", usage, total)
+	}
+}
+
+func TestWALCleanupAfterPrune(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	idx := NewIndex()
+	cfg := WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    1 * time.Millisecond,
+		SegmentMaxBytes: 200, // small to force rotation
+		MaxDiskSize:     100 * 1024 * 1024,
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+	}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	topicID := [16]byte{1, 2, 3}
+	tp := TopicPartition{TopicID: topicID, Partition: 0}
+
+	// Write enough to create multiple segments
+	for i := 0; i < 20; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(entry); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	// Track disk usage before prune
+	usageBefore := w.diskUsage.Load()
+
+	filesBefore := countWALFiles(t, walDir)
+	if filesBefore < 2 {
+		t.Skipf("need at least 2 segments, got %d", filesBefore)
+	}
+
+	// Simulate S3 flush: prune the WAL index
+	idx.PruneBefore(tp, 100)
+
+	// Trigger cleanup
+	w.TryCleanupSegments()
+	time.Sleep(100 * time.Millisecond)
+
+	filesAfter := countWALFiles(t, walDir)
+	if filesAfter >= filesBefore {
+		t.Errorf("expected cleanup to delete segments: before=%d, after=%d", filesBefore, filesAfter)
+	}
+
+	// diskUsage should have decreased
+	usageAfter := w.diskUsage.Load()
+	if usageAfter >= usageBefore {
+		t.Errorf("diskUsage should decrease after cleanup: before=%d, after=%d", usageBefore, usageAfter)
+	}
+}

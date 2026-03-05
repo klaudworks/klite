@@ -13,6 +13,12 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
+// s3KeyMatchesPartition returns true if the S3 key belongs to the given topic/partition.
+// Keys have the format: prefix/topicName-topicID/partition/offset.obj
+func s3KeyMatchesPartition(key, topic string, partition int) bool {
+	return strings.Contains(key, topic+"-") && strings.Contains(key, fmt.Sprintf("/%d/", partition))
+}
+
 // TestS3FlushBasic produces data, triggers flush, verifies S3 object exists.
 func TestS3FlushBasic(t *testing.T) {
 	t.Parallel()
@@ -55,7 +61,7 @@ func TestS3FlushBasic(t *testing.T) {
 	keys := mem.Keys()
 	found := false
 	for _, key := range keys {
-		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {
+		if s3KeyMatchesPartition(key, topic, 0) && strings.HasSuffix(key, ".obj") {
 			found = true
 			break
 		}
@@ -105,7 +111,7 @@ func TestS3FlushFooter(t *testing.T) {
 	keys := mem.Keys()
 	var objKey string
 	for _, key := range keys {
-		if strings.Contains(key, topic+"/0/") && strings.HasSuffix(key, ".obj") {
+		if s3KeyMatchesPartition(key, topic, 0) && strings.HasSuffix(key, ".obj") {
 			objKey = key
 			break
 		}
@@ -208,7 +214,7 @@ func TestS3ReadCascade(t *testing.T) {
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
-		WithRingBufferMaxMem(16*16*1024), // tiny ring buffer
+		WithChunkPoolMemory(16*16*1024), // tiny ring buffer
 	)
 
 	admin := NewAdminClient(t, tb.Addr)
@@ -242,7 +248,7 @@ func TestS3ReadCascade(t *testing.T) {
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
-		WithRingBufferMaxMem(16*16*1024),
+		WithChunkPoolMemory(16*16*1024),
 	)
 
 	producer2 := NewClient(t, tb2.Addr,
@@ -314,15 +320,15 @@ func TestS3PerPartitionKeys(t *testing.T) {
 
 	tb.Stop()
 
-	// Check that we have separate objects per partition
+	// Check that we have separate objects per partition.
+	// Key format: prefix/topicName-topicID/partition/offset.obj
 	keys := mem.Keys()
 	partitionObjects := make(map[string]bool)
 	for _, key := range keys {
-		if strings.Contains(key, topic) && strings.HasSuffix(key, ".obj") {
-			// Extract partition from key
+		if strings.Contains(key, topic+"-") && strings.HasSuffix(key, ".obj") {
 			parts := strings.Split(key, "/")
 			for i, p := range parts {
-				if p == topic && i+1 < len(parts) {
+				if strings.HasPrefix(p, topic+"-") && i+1 < len(parts) {
 					partitionObjects[parts[i+1]] = true
 					break
 				}
@@ -438,10 +444,10 @@ func TestS3UnifiedSync(t *testing.T) {
 	hasP1 := false
 	hasMetadata := false
 	for _, key := range keys {
-		if strings.Contains(key, topic+"/0/") {
+		if s3KeyMatchesPartition(key, topic, 0) {
 			hasP0 = true
 		}
-		if strings.Contains(key, topic+"/1/") {
+		if s3KeyMatchesPartition(key, topic, 1) {
 			hasP1 = true
 		}
 		if strings.Contains(key, "metadata.log") {
@@ -461,12 +467,13 @@ func TestS3DisasterRecoveryWithBackup(t *testing.T) {
 	dataDir := t.TempDir()
 	mem := s3store.NewInMemoryS3()
 	prefix := "klite/test"
+	clusterID := "dr-backup-cluster-0001"
 	topic := "s3-dr-backup"
 	numRecords := 10
 
 	// Phase 1: produce + flush
 	tb := StartBroker(t,
-
+		WithClusterID(clusterID),
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -496,9 +503,9 @@ func TestS3DisasterRecoveryWithBackup(t *testing.T) {
 	os.RemoveAll(dataDir)
 	os.MkdirAll(dataDir, 0o755)
 
-	// Phase 2: restart — should recover from S3 backup
+	// Phase 2: restart with same cluster ID — should recover from S3 backup
 	tb2 := StartBroker(t,
-
+		WithClusterID(clusterID),
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -528,7 +535,7 @@ func TestWALReadAfterRestart(t *testing.T) {
 	tb := StartBroker(t,
 
 		WithDataDir(dataDir),
-		WithRingBufferMaxMem(16*16*1024), // tiny
+		WithChunkPoolMemory(16*16*1024), // tiny
 	)
 
 	admin := NewAdminClient(t, tb.Addr)
@@ -557,7 +564,7 @@ func TestWALReadAfterRestart(t *testing.T) {
 	tb2 := StartBroker(t,
 
 		WithDataDir(dataDir),
-		WithRingBufferMaxMem(16*16*1024),
+		WithChunkPoolMemory(16*16*1024),
 	)
 
 	consumer := NewClient(t, tb2.Addr,
@@ -580,12 +587,14 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 	dataDir := t.TempDir()
 	mem := s3store.NewInMemoryS3()
 	prefix := "klite/test"
+	clusterID := "dr-no-backup-cluster-01"
+	resolvedPrefix := prefix + "/klite-" + clusterID
 	topic := "s3-dr-no-backup"
 	numRecords := 10
 
 	// Phase 1: produce + flush to S3
 	tb := StartBroker(t,
-
+		WithClusterID(clusterID),
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),
@@ -626,11 +635,11 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 	os.MkdirAll(dataDir, 0o755)
 
 	// Also delete the metadata.log backup from S3 (simulate backup loss)
-	metaKey := prefix + "/metadata.log"
+	metaKey := resolvedPrefix + "/metadata.log"
 	s3Client := s3store.NewClient(s3store.ClientConfig{
 		S3Client: mem,
 		Bucket:   "test-bucket",
-		Prefix:   prefix,
+		Prefix:   resolvedPrefix,
 	})
 	err = s3Client.DeleteObject(context.Background(), metaKey)
 	require.NoError(t, err)
@@ -641,7 +650,7 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 
 	// Phase 2: restart — should infer topics from S3 key structure
 	tb2 := StartBroker(t,
-
+		WithClusterID(clusterID),
 		WithDataDir(dataDir),
 		WithS3(mem, "test-bucket", prefix),
 		WithS3FlushInterval(24*time.Hour),

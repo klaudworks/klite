@@ -46,7 +46,7 @@ func newRetentionTestBroker(t *testing.T, clk *clock.FakeClock) (*Broker, *s3sto
 }
 
 // putTestObject builds and uploads an S3 object with batches at the given timestamps.
-func putTestObject(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int32, baseOffset int64, timestamps []int64) {
+func putTestObject(t *testing.T, mem *s3store.InMemoryS3, topic string, topicID [16]byte, partition int32, baseOffset int64, timestamps []int64) {
 	t.Helper()
 	var batches []s3store.BatchData
 	for i, ts := range timestamps {
@@ -64,7 +64,7 @@ func putTestObject(t *testing.T, mem *s3store.InMemoryS3, topic string, partitio
 		})
 	}
 	obj := s3store.BuildObject(batches)
-	key := s3store.ObjectKey("klite/test", topic, partition, baseOffset)
+	key := s3store.ObjectKey("klite/test", topic, topicID, partition, baseOffset)
 	client := s3store.NewClient(s3store.ClientConfig{
 		S3Client: mem,
 		Bucket:   "test-bucket",
@@ -75,14 +75,14 @@ func putTestObject(t *testing.T, mem *s3store.InMemoryS3, topic string, partitio
 	}
 }
 
-func listObjectKeys(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int32) []string {
+func listObjectKeys(t *testing.T, mem *s3store.InMemoryS3, topic string, topicID [16]byte, partition int32) []string {
 	t.Helper()
 	client := s3store.NewClient(s3store.ClientConfig{
 		S3Client: mem,
 		Bucket:   "test-bucket",
 		Prefix:   "klite/test",
 	})
-	objs, err := client.ListObjects(context.Background(), s3store.ObjectKeyPrefix("klite/test", topic, partition))
+	objs, err := client.ListObjects(context.Background(), s3store.ObjectKeyPrefix("klite/test", topic, topicID, partition))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +91,11 @@ func listObjectKeys(t *testing.T, mem *s3store.InMemoryS3, topic string, partiti
 		keys = append(keys, o.Key)
 	}
 	return keys
+}
+
+// topicID is a helper to get the topic ID from broker state.
+func topicID(b *Broker, topic string) [16]byte {
+	return b.state.GetTopic(topic).ID
 }
 
 func setPartitionHW(t *testing.T, b *Broker, topic string, partition int, hw int64) {
@@ -113,17 +118,19 @@ func TestRetentionByTime(t *testing.T) {
 		"retention.ms": "5000", // 5 seconds
 	})
 
+	tid := topicID(b, topic)
+
 	// Object 1: timestamps at 90s (90000ms) — expired (100000 - 90000 = 10000 > 5000)
-	putTestObject(t, mem, topic, 0, 0, []int64{90000, 91000, 92000})
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{90000, 91000, 92000})
 
 	// Object 2: timestamps at 98s (98000ms) — within retention
-	putTestObject(t, mem, topic, 0, 3, []int64{98000, 99000})
+	putTestObject(t, mem, topic, tid, 0, 3, []int64{98000, 99000})
 
 	// Set HW to match the uploaded data (5 records total: offsets 0-4)
 	setPartitionHW(t, b, topic, 0, 5)
 
 	// Should have 2 objects before retention
-	keys := listObjectKeys(t, mem, topic, 0)
+	keys := listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 2 {
 		t.Fatalf("expected 2 objects before retention, got %d", len(keys))
 	}
@@ -131,7 +138,7 @@ func TestRetentionByTime(t *testing.T) {
 	b.enforceRetention(context.Background())
 
 	// Object 1 should be deleted, object 2 should survive
-	keys = listObjectKeys(t, mem, topic, 0)
+	keys = listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 1 {
 		t.Fatalf("expected 1 object after retention, got %d", len(keys))
 	}
@@ -158,23 +165,25 @@ func TestRetentionBySize(t *testing.T) {
 		"retention.bytes": "-1", // placeholder, updated below
 	})
 
+	tid := topicID(b, topic)
+
 	// Put 3 objects, each ~100 bytes
-	putTestObject(t, mem, topic, 0, 0, []int64{90000})
-	putTestObject(t, mem, topic, 0, 1, []int64{91000})
-	putTestObject(t, mem, topic, 0, 2, []int64{92000})
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{90000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{91000})
+	putTestObject(t, mem, topic, tid, 0, 2, []int64{92000})
 
 	// Set HW to match (3 records, offsets 0-2)
 	setPartitionHW(t, b, topic, 0, 3)
 
 	// Measure logical data size (sum of batch lengths, not S3 object size)
-	keys := listObjectKeys(t, mem, topic, 0)
+	keys := listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 3 {
 		t.Fatalf("expected 3 objects, got %d", len(keys))
 	}
 	client := s3store.NewClient(s3store.ClientConfig{
 		S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test",
 	})
-	objs, _ := client.ListObjects(context.Background(), s3store.ObjectKeyPrefix("klite/test", topic, 0))
+	objs, _ := client.ListObjects(context.Background(), s3store.ObjectKeyPrefix("klite/test", topic, tid, 0))
 	reader := s3store.NewReader(client, nil)
 	footer0, err := reader.GetFooter(context.Background(), objs[0].Key, objs[0].Size)
 	if err != nil {
@@ -190,7 +199,7 @@ func TestRetentionBySize(t *testing.T) {
 	b.enforceRetention(context.Background())
 
 	// Should have deleted 2 oldest objects, kept 1 newest
-	keys = listObjectKeys(t, mem, topic, 0)
+	keys = listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 1 {
 		t.Fatalf("expected 1 object after size retention, got %d", len(keys))
 	}
@@ -215,13 +224,15 @@ func TestRetentionNeverDeletesLastObject(t *testing.T) {
 		"retention.ms": "1000",
 	})
 
+	tid := topicID(b, topic)
+
 	// Single object — should NOT be deleted even though expired
-	putTestObject(t, mem, topic, 0, 0, []int64{1000})
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{1000})
 	setPartitionHW(t, b, topic, 0, 1)
 
 	b.enforceRetention(context.Background())
 
-	keys := listObjectKeys(t, mem, topic, 0)
+	keys := listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 1 {
 		t.Fatalf("last object should not be deleted, got %d objects", len(keys))
 	}
@@ -239,14 +250,16 @@ func TestRetentionInfiniteSkipped(t *testing.T) {
 		"retention.bytes": "-1",
 	})
 
-	putTestObject(t, mem, topic, 0, 0, []int64{1000})
-	putTestObject(t, mem, topic, 0, 1, []int64{2000})
+	tid := topicID(b, topic)
+
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{1000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{2000})
 	setPartitionHW(t, b, topic, 0, 2)
 
 	b.enforceRetention(context.Background())
 
 	// Nothing should be deleted
-	keys := listObjectKeys(t, mem, topic, 0)
+	keys := listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 2 {
 		t.Fatalf("infinite retention should not delete anything, got %d objects", len(keys))
 	}
@@ -278,14 +291,16 @@ func TestRetentionAdvancesWithClock(t *testing.T) {
 		"retention.ms": "30000", // 30 seconds
 	})
 
+	tid := topicID(b, topic)
+
 	// Object 1: T=25s — cutoff is 50-30=20s, so 25s > 20s → retained
-	putTestObject(t, mem, topic, 0, 0, []int64{25000})
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{25000})
 	// Object 2: T=45s — well within retention
-	putTestObject(t, mem, topic, 0, 1, []int64{45000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{45000})
 	setPartitionHW(t, b, topic, 0, 2)
 
 	b.enforceRetention(context.Background())
-	keys := listObjectKeys(t, mem, topic, 0)
+	keys := listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 2 {
 		t.Fatalf("round 1: expected 2 objects, got %d", len(keys))
 	}
@@ -297,7 +312,7 @@ func TestRetentionAdvancesWithClock(t *testing.T) {
 	b.s3Reader.InvalidateAll()
 
 	b.enforceRetention(context.Background())
-	keys = listObjectKeys(t, mem, topic, 0)
+	keys = listObjectKeys(t, mem, topic, tid, 0)
 	if len(keys) != 1 {
 		t.Fatalf("round 2: expected 1 object after clock advance, got %d", len(keys))
 	}

@@ -26,15 +26,17 @@ type Config struct {
 	// WAL configuration
 	WALSyncIntervalMs  int   // Fsync batch window in milliseconds (default 2)
 	WALSegmentMaxBytes int64 // Max segment size before rotation (default 64 MiB)
-	WALMaxDiskSize     int64 // Max total WAL on disk (default 1 GiB)
-	RingBufferMaxMem   int64 // Global memory budget for ring buffers (default 512 MiB)
+	WALMaxDiskSize     int64 // Max total WAL on disk (default 4 GiB)
+	ChunkPoolMemory    int64 // Global memory budget for chunk pool (default 512 MiB)
 
 	// S3 configuration (Phase 4)
-	S3Bucket        string        // S3 bucket name (empty = S3 disabled)
-	S3Region        string        // S3 region
-	S3Endpoint      string        // Custom S3 endpoint (for LocalStack/MinIO)
-	S3Prefix        string        // S3 key prefix (default: "klite/<clusterID>")
-	S3FlushInterval time.Duration // Unified S3 sync interval (default 10m)
+	S3Bucket             string        // S3 bucket name (empty = S3 disabled)
+	S3Region             string        // S3 region
+	S3Endpoint           string        // Custom S3 endpoint (for LocalStack/MinIO)
+	S3Prefix             string        // Optional S3 path prefix prepended before "klite-<clusterID>"
+	S3FlushInterval      time.Duration // Max age of unflushed data before flush (default 60s)
+	S3TargetObjectSize   int64         // Flush partition when unflushed bytes reach this (default 64 MiB)
+	S3FlushCheckInterval time.Duration // How often the flusher scans partitions (default 5s)
 
 	// S3API allows injecting a mock S3 client for tests.
 	S3API interface{} // s3.S3API when set
@@ -123,14 +125,16 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.S3Bucket, "s3-bucket", cfg.S3Bucket, "S3 bucket name (empty = S3 disabled)")
 	fs.StringVar(&cfg.S3Region, "s3-region", cfg.S3Region, "S3 region (default: us-east-1)")
 	fs.StringVar(&cfg.S3Endpoint, "s3-endpoint", cfg.S3Endpoint, "Custom S3 endpoint (for LocalStack/MinIO)")
-	fs.StringVar(&cfg.S3Prefix, "s3-prefix", cfg.S3Prefix, "S3 key prefix (default: klite/<clusterID>)")
-	fs.DurationVar(&cfg.S3FlushInterval, "s3-flush-interval", cfg.S3FlushInterval, "S3 flush interval (default: 10m)")
+	fs.StringVar(&cfg.S3Prefix, "s3-prefix", cfg.S3Prefix, "Optional S3 path prefix prepended before klite-<clusterID>")
+	fs.DurationVar(&cfg.S3FlushInterval, "s3-flush-interval", cfg.S3FlushInterval, "Max age of unflushed partition data before flush (default: 60s)")
+	fs.Int64Var(&cfg.S3TargetObjectSize, "s3-target-object-size", cfg.S3TargetObjectSize, "Flush partition when unflushed bytes reach this size in bytes (default: 67108864 = 64 MiB)")
+	fs.DurationVar(&cfg.S3FlushCheckInterval, "s3-flush-check-interval", cfg.S3FlushCheckInterval, "How often the flusher scans partitions for flush eligibility (default: 5s)")
 
 	// WAL flags
 	fs.IntVar(&cfg.WALSyncIntervalMs, "wal-sync-interval", cfg.WALSyncIntervalMs, "WAL fsync batch window in milliseconds (default: 2)")
 	fs.Int64Var(&cfg.WALSegmentMaxBytes, "wal-segment-max-bytes", cfg.WALSegmentMaxBytes, "Max WAL segment size before rotation in bytes (default: 67108864 = 64 MiB)")
-	fs.Int64Var(&cfg.WALMaxDiskSize, "wal-max-disk-size", cfg.WALMaxDiskSize, "Max total WAL on disk in bytes (default: 1 GiB)")
-	fs.Int64Var(&cfg.RingBufferMaxMem, "ring-buffer-max-memory", cfg.RingBufferMaxMem, "Global memory budget for ring buffers in bytes (default: 536870912 = 512 MiB)")
+	fs.Int64Var(&cfg.WALMaxDiskSize, "wal-max-disk-size", cfg.WALMaxDiskSize, "Max total WAL on disk in bytes (default: 4 GiB)")
+	fs.Int64Var(&cfg.ChunkPoolMemory, "chunk-pool-memory", cfg.ChunkPoolMemory, "Global memory budget for chunk pool in bytes (default: 536870912 = 512 MiB)")
 
 	// Retention flags
 	fs.DurationVar(&cfg.RetentionCheckInterval, "retention-check-interval", cfg.RetentionCheckInterval, "How often the retention goroutine runs (default: 1h)")

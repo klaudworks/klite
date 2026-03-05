@@ -99,13 +99,14 @@ func (c *Compactor) SetDeleteRetentionMs(ms int64) {
 func (c *Compactor) CompactPartition(
 	ctx context.Context,
 	topic string,
+	topicID [16]byte,
 	partition int32,
 	cleanedUpTo int64,
 	minCompactionLagMs int64,
 	acquireLock func(),
 	releaseLock func(),
 ) (int64, error) {
-	prefix := ObjectKeyPrefix(c.client.prefix, topic, partition)
+	prefix := ObjectKeyPrefix(c.client.prefix, topic, topicID, partition)
 
 	// List all S3 objects for this partition
 	objects, err := c.client.ListObjects(ctx, prefix)
@@ -195,7 +196,7 @@ func (c *Compactor) CompactPartition(
 		}
 
 		acquireLock()
-		newWatermark, err := c.compactWindow(ctx, topic, partition, window, cleanedUpTo)
+		newWatermark, err := c.compactWindow(ctx, topic, topicID, partition, window, cleanedUpTo)
 		releaseLock()
 
 		if err != nil {
@@ -214,6 +215,7 @@ func (c *Compactor) CompactPartition(
 func (c *Compactor) compactWindow(
 	ctx context.Context,
 	topic string,
+	topicID [16]byte,
 	partition int32,
 	window []windowObj,
 	currentCleanedUpTo int64,
@@ -335,7 +337,7 @@ func (c *Compactor) compactWindow(
 		c.client.DeleteObjectsBatch(ctx, keys)
 
 		// Invalidate caches
-		c.reader.InvalidateFooters(topic, partition)
+		c.reader.InvalidateFooters(topic, topicID, partition)
 
 		return lastOffset, nil
 	}
@@ -343,7 +345,7 @@ func (c *Compactor) compactWindow(
 	// Build compacted output object
 	outputData := BuildObject(outputBatches)
 	baseOffset := outputBatches[0].BaseOffset
-	outputKey := ObjectKey(c.client.prefix, topic, partition, baseOffset)
+	outputKey := ObjectKey(c.client.prefix, topic, topicID, partition, baseOffset)
 
 	// PUT the compacted output
 	if err := c.client.PutObject(ctx, outputKey, outputData); err != nil {
@@ -351,7 +353,7 @@ func (c *Compactor) compactWindow(
 	}
 
 	// Invalidate caches
-	c.reader.InvalidateFooters(topic, partition)
+	c.reader.InvalidateFooters(topic, topicID, partition)
 
 	// Compute new watermark
 	lastBatch := outputBatches[len(outputBatches)-1]

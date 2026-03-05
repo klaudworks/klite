@@ -105,6 +105,7 @@ Follow the **testing pyramid**: test at the lowest layer that can verify the beh
 - **No E2E / Kubernetes tests** — everything in this project is testable with unit tests or in-process integration tests.
 - **Do not test third-party library behavior** — e.g., do not write tests that verify franz-go's client encoding. That's their responsibility, not ours.
 - When adding a new feature, ask: "What is the cheapest test that can verify this?" — prefer unit over integration.
+- **`-race` is deterministic** — running `go test -race -count=5` does not catch more race conditions than `-count=1`. The race detector instruments every memory access; repeating runs only helps catch timing-dependent *logic* flakiness, not data races. A single `-race -count=1` pass is sufficient.
 
 ## Code Comments
 

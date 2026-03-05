@@ -49,8 +49,8 @@ func NewReader(client *Client, logger *slog.Logger) *Reader {
 
 // Fetch reads batches from S3 starting at the given offset, up to maxBytes.
 // Returns concatenated RecordBatch bytes.
-func (r *Reader) Fetch(ctx context.Context, topic string, partition int32, offset int64, maxBytes int32) ([]byte, error) {
-	prefix := ObjectKeyPrefix(r.client.prefix, topic, partition)
+func (r *Reader) Fetch(ctx context.Context, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) ([]byte, error) {
+	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 
 	// 1. Find the right S3 object
 	key, objectSize, err := r.findObjectForOffset(ctx, prefix, offset)
@@ -101,8 +101,8 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int32, offse
 
 // FetchBatches reads batches from S3 and returns them as individual BatchData slices.
 // More useful when the caller needs per-batch metadata.
-func (r *Reader) FetchBatches(ctx context.Context, topic string, partition int32, offset int64, maxBytes int32) ([]BatchData, error) {
-	prefix := ObjectKeyPrefix(r.client.prefix, topic, partition)
+func (r *Reader) FetchBatches(ctx context.Context, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) ([]BatchData, error) {
+	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 
 	key, objectSize, err := r.findObjectForOffset(ctx, prefix, offset)
 	if err != nil {
@@ -310,8 +310,8 @@ func (r *Reader) computeEndByte(footer *Footer, startIdx int, maxBytes int32) in
 
 // InvalidateFooters evicts all cached footers for a topic/partition.
 // Called when compaction rewrites objects.
-func (r *Reader) InvalidateFooters(topic string, partition int32) {
-	prefix := ObjectKeyPrefix(r.client.prefix, topic, partition)
+func (r *Reader) InvalidateFooters(topic string, topicID [16]byte, partition int32) {
+	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 
 	r.footerMu.Lock()
 	for key := range r.footerCache {
@@ -346,8 +346,8 @@ func (r *Reader) FooterCacheSize() int {
 
 // DiscoverHW discovers the high-water mark for a topic/partition by inspecting
 // the last S3 object's footer. Returns 0 if no objects exist.
-func (r *Reader) DiscoverHW(ctx context.Context, topic string, partition int32) (int64, error) {
-	prefix := ObjectKeyPrefix(r.client.prefix, topic, partition)
+func (r *Reader) DiscoverHW(ctx context.Context, topic string, topicID [16]byte, partition int32) (int64, error) {
+	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 
 	objects, err := r.getObjectListing(ctx, prefix)
 	if err != nil {
