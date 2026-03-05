@@ -1,0 +1,17 @@
+apiVersion: v2
+name: klite
+description: A Kafka-compatible broker in a single binary, backed by S3.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/klaudworks/klite
+sources:
+  - https://github.com/klaudworks/klite
+keywords:
+  - kafka
+  - broker
+  - streaming
+  - s3
+maintainers:
+  - name: klaudworks
+    url: https://github.com/klaudworks

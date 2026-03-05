@@ -691,6 +691,7 @@ func (b *Broker) initS3() error {
 		Logger:            b.logger,
 		TriggerCh:         triggerCh,
 		MetadataUploader:  b.uploadMetadataLog,
+		Reader:            b.s3Reader,
 	}
 
 	partAdapter := &s3PartitionAdapter{

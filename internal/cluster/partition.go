@@ -304,30 +304,64 @@ func (pd *PartData) RollbackReserve(baseOffset int64) {
 	pd.nextReserve = baseOffset
 }
 
+// SkipOffsets advances nextCommit past a gap of offsets that will never be
+// committed (e.g., WAL write failure). Drains any pending commits that
+// become unblocked. Caller must hold pd.mu.Lock().
+func (pd *PartData) SkipOffsets(baseOffset int64, count int64) {
+	endOffset := baseOffset + count
+	if endOffset <= pd.nextCommit {
+		return // already past this range
+	}
+	if baseOffset == pd.nextCommit {
+		// Gap is exactly at nextCommit — advance past it directly.
+		pd.nextCommit = endOffset
+		pd.hw = endOffset
+		pd.drainPendingCommits()
+	} else {
+		// Gap is ahead of nextCommit (out-of-order skip). Insert a
+		// sentinel into pendingCommits so it drains when we catch up.
+		// LastOffsetDelta = count-1 so that nextCommit advances by count.
+		sentinel := StoredBatch{
+			BaseOffset:      baseOffset,
+			LastOffsetDelta: int32(count - 1),
+			RawBytes:        nil, // nil marks this as a skip sentinel
+		}
+		pd.insertPendingCommit(sentinel)
+	}
+}
+
 // CommitBatch advances HW after WAL fsync completes.
-// The batch data is already in the chunk pool (written during appendToChunk
-// before WAL fsync). This method only advances HW and nextCommit.
+// The batch data is already in the chunk pool (written during AppendToChunk
+// after WAL fsync). This method only advances HW and nextCommit.
 // Called under pd.mu.Lock().
 func (pd *PartData) CommitBatch(batch StoredBatch) {
 	if batch.BaseOffset == pd.nextCommit {
-		// In order: advance HW immediately
-		pd.totalBytes += int64(len(batch.RawBytes))
-		pd.nextCommit = batch.BaseOffset + int64(batch.LastOffsetDelta) + 1
-		pd.hw = pd.nextCommit
-		pd.updateMaxTimestamp(batch.BaseOffset, batch.LastOffsetDelta, batch.MaxTimestamp)
-
-		// Drain any queued commits that are now in order
-		for len(pd.pendingCommits) > 0 && pd.pendingCommits[0].BaseOffset == pd.nextCommit {
-			next := pd.pendingCommits[0].StoredBatch
-			pd.pendingCommits = pd.pendingCommits[1:]
-			pd.totalBytes += int64(len(next.RawBytes))
-			pd.nextCommit = next.BaseOffset + int64(next.LastOffsetDelta) + 1
-			pd.hw = pd.nextCommit
-			pd.updateMaxTimestamp(next.BaseOffset, next.LastOffsetDelta, next.MaxTimestamp)
-		}
+		pd.applyCommit(batch)
+		pd.drainPendingCommits()
 	} else {
 		// Out of order: queue until earlier offsets commit
 		pd.insertPendingCommit(batch)
+	}
+}
+
+// applyCommit advances nextCommit and HW for a single batch. Handles both
+// real batches (RawBytes != nil) and skip sentinels (RawBytes == nil).
+func (pd *PartData) applyCommit(batch StoredBatch) {
+	pd.nextCommit = batch.BaseOffset + int64(batch.LastOffsetDelta) + 1
+	pd.hw = pd.nextCommit
+	if batch.RawBytes != nil {
+		pd.totalBytes += int64(len(batch.RawBytes))
+		pd.updateMaxTimestamp(batch.BaseOffset, batch.LastOffsetDelta, batch.MaxTimestamp)
+	}
+}
+
+// drainPendingCommits processes queued commits (and skip sentinels) that
+// are now in order after nextCommit advanced.
+func (pd *PartData) drainPendingCommits() {
+	for len(pd.pendingCommits) > 0 && pd.pendingCommits[0].BaseOffset == pd.nextCommit {
+		next := pd.pendingCommits[0].StoredBatch
+		pd.pendingCommits = pd.pendingCommits[1:]
+		pd.applyCommit(next)
 	}
 }
 
@@ -393,15 +427,16 @@ func (pd *PartData) FetchFrom(offset int64, maxBytes int32) []StoredBatch {
 		pd.mu.RUnlock()
 		return nil
 	}
-	if batches := pd.fetchFromChunks(offset, maxBytes, hw); len(batches) > 0 {
+	chunkBatches := pd.fetchFromChunks(offset, maxBytes, hw)
+	if len(chunkBatches) > 0 {
 		// Only use chunk results if they actually cover the requested offset.
 		// If the first batch starts beyond the requested offset, the earlier
 		// data must be in S3 (or WAL) — fall through to cold storage so the
 		// consumer sees records in order.
-		first := batches[0]
+		first := chunkBatches[0]
 		if first.BaseOffset <= offset || first.BaseOffset == pd.logStart {
 			pd.mu.RUnlock()
-			return batches
+			return chunkBatches
 		}
 	}
 	// Capture immutable references needed for cold reads before releasing lock.
@@ -414,7 +449,14 @@ func (pd *PartData) FetchFrom(offset int64, maxBytes int32) []StoredBatch {
 	pd.mu.RUnlock()
 
 	// Tier 2 & 3: WAL and S3 reads (no lock held)
-	return fetchFromCold(offset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch)
+	if coldBatches := fetchFromCold(offset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch); len(coldBatches) > 0 {
+		return coldBatches
+	}
+
+	// Cold storage has nothing for this offset. If the chunk pool had data
+	// at a higher offset (gap), return it so the consumer skips past the gap
+	// instead of getting stuck.
+	return chunkBatches
 }
 
 // readFromWAL reads batches from WAL index entries.

@@ -89,7 +89,10 @@ func (f *Footer) FindBatch(offset int64) int {
 	if idx+1 < len(f.Entries) {
 		return idx + 1
 	}
-	return idx
+
+	// Offset is past the last batch in this object — signal "not found"
+	// so the caller can try the next S3 object.
+	return len(f.Entries)
 }
 
 // FirstOffset returns the first offset in the footer, or -1 if empty.

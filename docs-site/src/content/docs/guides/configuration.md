@@ -53,13 +53,13 @@ Any S3-compatible store works: AWS S3, SeaweedFS, MinIO, Garage, etc.
 | `--s3-region` | `KLITE_S3_REGION` | `us-east-1` | AWS region. |
 | `--s3-endpoint` | `KLITE_S3_ENDPOINT` | *(none)* | Custom endpoint for S3-compatible stores. |
 | `--s3-prefix` | `KLITE_S3_PREFIX` | `klite/<clusterID>` | Key prefix for all objects. |
-| `--s3-flush-interval` | `KLITE_S3_FLUSH_INTERVAL` | `10m` | How often to flush WAL data to S3. |
+| `--s3-flush-interval` | `KLITE_S3_FLUSH_INTERVAL` | `60s` | Max age of unflushed partition data before flush. A partition also flushes when it reaches 64 MB. |
 
 **Credentials** use the standard AWS environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`. IAM roles, instance profiles, and IRSA work too.
 
 When `--s3-endpoint` is set, path-style addressing is enabled automatically (required by most S3-compatible stores).
 
-The flush interval and WAL size limit together determine your recovery point objective (RPO). With the defaults (10m flush, 1 GiB WAL), at most 10 minutes of data is at risk if the node crashes before the next flush. Lower the interval for tighter RPO at the cost of more S3 PUT requests.
+The flush interval and size threshold together determine your recovery point objective (RPO). With the defaults (60s / 64 MB per partition), at most 60 seconds of data per partition is at risk if the disk is lost before the next flush. Lower the interval for tighter RPO at the cost of more S3 PUT requests.
 
 ## Topics
 

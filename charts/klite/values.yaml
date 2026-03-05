@@ -1,0 +1,187 @@
+## @section Common parameters
+
+## @param nameOverride Partially override klite.fullname
+nameOverride: ""
+## @param fullnameOverride Fully override klite.fullname
+fullnameOverride: ""
+## @param commonLabels Labels to add to all deployed objects
+commonLabels: {}
+## @param commonAnnotations Annotations to add to all deployed objects
+commonAnnotations: {}
+
+## @section Image parameters
+
+image:
+  ## @param image.registry Image registry (e.g. "ghcr.io")
+  registry: ""
+  ## @param image.repository Image repository
+  repository: klaudworks/klite
+  ## @param image.tag Image tag (defaults to Chart appVersion)
+  tag: ""
+  ## @param image.pullPolicy Image pull policy
+  pullPolicy: IfNotPresent
+
+## @param imagePullSecrets Registry pull secret names
+imagePullSecrets: []
+
+## @section Broker configuration
+
+broker:
+  ## @param broker.listen Kafka listener address inside the container
+  listen: ":9092"
+  ## @param broker.advertisedAddr Address advertised to Kafka clients (default: derived from Service)
+  advertisedAddr: ""
+  ## @param broker.dataDir Data directory for WAL and metadata
+  dataDir: /data
+  ## @param broker.clusterID Kafka cluster ID (empty = auto-generated on first start)
+  clusterID: ""
+  ## @param broker.nodeID Broker node ID
+  nodeID: 0
+  ## @param broker.defaultPartitions Default partition count for auto-created topics
+  defaultPartitions: 1
+  ## @param broker.autoCreateTopics Auto-create topics on Metadata/Produce requests
+  autoCreateTopics: true
+  ## @param broker.logLevel Log level: debug, info, warn, error
+  logLevel: info
+
+  ## @param broker.extraArgs Additional CLI flags passed to klite
+  ## e.g. ["--wal-sync-interval=5", "--chunk-pool-memory=268435456"]
+  extraArgs: []
+
+## @section S3 storage
+
+s3:
+  ## @param s3.bucket S3 bucket name (empty = S3 disabled, data is local-only)
+  bucket: ""
+  ## @param s3.region S3 region
+  region: ""
+  ## @param s3.endpoint Custom S3 endpoint (for MinIO / LocalStack)
+  endpoint: ""
+  ## @param s3.prefix Optional S3 path prefix prepended before klite-<clusterID>
+  prefix: ""
+  ## @param s3.existingSecret Name of an existing Secret containing S3 credentials
+  ## The Secret should have keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+  ## Not needed when using IRSA / pod identity — leave empty.
+  existingSecret: ""
+
+## @section Health probes
+## klite serves /livez and /readyz on a separate HTTP port.
+
+health:
+  ## @param health.enabled Enable the HTTP health endpoint
+  enabled: true
+  ## @param health.port Port for the HTTP health endpoint
+  port: 8080
+
+## @section Kubernetes: Deployment
+
+## @param terminationGracePeriodSeconds Grace period for WAL flush + S3 upload on shutdown
+
+terminationGracePeriodSeconds: 60
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources: {}
+  # requests:
+  #   cpu: 250m
+  #   memory: 512Mi
+  # limits:
+  #   memory: 1Gi
+
+startupProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  failureThreshold: 30
+  periodSeconds: 2
+
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: health
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  initialDelaySeconds: 0
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 2
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+## @param extraEnvVars Extra environment variables for the klite container
+## e.g.
+##   - name: KLITE_LOG_LEVEL
+##     value: debug
+extraEnvVars: []
+
+## @param extraVolumeMounts Extra volume mounts for the klite container
+extraVolumeMounts: []
+## @param extraVolumes Extra volumes for the pod
+extraVolumes: []
+
+## @section Service
+
+service:
+  ## @param service.type Kubernetes Service type
+  type: ClusterIP
+  ## @param service.port Kafka broker port
+  port: 9092
+  ## @param service.nodePort NodePort (only if service.type is NodePort)
+  nodePort: ""
+  ## @param service.annotations Service annotations
+  annotations: {}
+
+## @section ServiceAccount
+## Useful for IRSA (AWS), Workload Identity (GCP), etc.
+
+serviceAccount:
+  ## @param serviceAccount.create Create a ServiceAccount
+  create: true
+  ## @param serviceAccount.name Override the ServiceAccount name
+  name: ""
+  ## @param serviceAccount.annotations ServiceAccount annotations (e.g. IRSA role ARN)
+  annotations: {}
+  ## @param serviceAccount.automountServiceAccountToken Mount the token into pods
+  automountServiceAccountToken: false
+
+## @section Persistence
+## Optional PVC for the WAL / metadata directory.
+## Without a PVC, klite recovers from S3 on every restart (slightly slower, ~60s data-loss window).
+## With a PVC, restarts are instant and the data-loss window shrinks to the WAL fsync interval (~2ms).
+
+persistence:
+  ## @param persistence.enabled Enable persistent storage for the data directory
+  enabled: false
+  ## @param persistence.storageClass StorageClass (empty = cluster default)
+  storageClass: ""
+  ## @param persistence.accessModes PVC access modes
+  accessModes:
+    - ReadWriteOnce
+  ## @param persistence.size PVC size
+  size: 10Gi
+  ## @param persistence.existingClaim Use an existing PVC instead of creating one
+  existingClaim: ""
+  ## @param persistence.annotations PVC annotations
+  annotations: {}

@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "klite.fullname" . }}-test-connection
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "klite.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: tcp-check
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "Testing TCP connection to {{ include "klite.fullname" . }}:{{ .Values.service.port }}..."
+          for i in $(seq 1 10); do
+            if nc -z -w 2 {{ include "klite.fullname" . }} {{ .Values.service.port }}; then
+              echo "Connection successful"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 2
+          done
+          echo "Connection failed after 10 attempts"
+          exit 1

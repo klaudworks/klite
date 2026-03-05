@@ -30,8 +30,8 @@ export default defineConfig({
 					label: 'Concepts',
 					items: [
 						{ label: 'Design Philosophy', slug: 'concepts/design-philosophy' },
-						{ label: 'Architecture', slug: 'concepts/architecture' },
 						{ label: 'Storage', slug: 'concepts/storage' },
+						{ label: 'Durability', slug: 'concepts/durability' },
 					],
 				},
 		{
