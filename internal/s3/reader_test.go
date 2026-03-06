@@ -181,3 +181,51 @@ func TestRangeRead(t *testing.T) {
 			"range read should be smaller than full object")
 	}
 }
+
+// TestFetchBatchesGapBetweenObjects verifies that when the requested offset
+// falls in a gap between two S3 objects, the reader tries the next object
+// instead of returning nil.
+//
+// Setup: Object 1 has offsets 0-9, Object 2 has offsets 20-29. Fetch offset 15,
+// which is between the two objects. findObjectForOffset picks Object 1, but
+// Object 1 doesn't contain offset 15. The reader should try Object 2 and
+// return data starting at offset 20.
+func TestFetchBatchesGapBetweenObjects(t *testing.T) {
+	t.Parallel()
+
+	mem := NewInMemoryS3()
+	client := NewClient(ClientConfig{
+		S3Client: mem,
+		Bucket:   "test-bucket",
+		Prefix:   "klite/test",
+	})
+	tid := testTopicID
+	reader := NewReader(client, nil)
+
+	// Object 1: offsets 0-9
+	batches1 := []BatchData{
+		{RawBytes: makeMinimalBatch(0, 9), BaseOffset: 0, LastOffsetDelta: 9},
+	}
+	obj1 := BuildObject(batches1)
+	key1 := ObjectKey("klite/test", "gap-test", tid, 0, 0)
+
+	// Object 2: offsets 20-29 (gap at 10-19)
+	batches2 := []BatchData{
+		{RawBytes: makeMinimalBatch(20, 9), BaseOffset: 20, LastOffsetDelta: 9},
+	}
+	obj2 := BuildObject(batches2)
+	key2 := ObjectKey("klite/test", "gap-test", tid, 0, 20)
+
+	ctx := context.Background()
+	require.NoError(t, client.PutObject(ctx, key1, obj1))
+	require.NoError(t, client.PutObject(ctx, key2, obj2))
+
+	// Fetch offset 15 — in the gap between objects.
+	// findObjectForOffset should find Object 1 (base offset 0 <= 15).
+	// Object 1 doesn't have offset 15. Reader should try Object 2.
+	result, err := reader.FetchBatches(ctx, "gap-test", tid, 0, 15, 1024*1024)
+	require.NoError(t, err)
+	require.NotEmpty(t, result, "should find data from next object when offset is in gap")
+	require.Equal(t, int64(20), result[0].BaseOffset,
+		"should return batch from Object 2 (next available after gap)")
+}

@@ -620,6 +620,144 @@ func TestIndexLookup(t *testing.T) {
 	})
 }
 
+// TestWriteErrorSignalsAllWaitersAsSuccessful demonstrates the bug where a WAL
+// write failure in the middle of a batch causes ALL pending entries to be
+// signaled as successful via doneCh closure. With the current chan struct{}
+// type, there is no way for the caller to distinguish success from failure.
+//
+// The caller (produce handler) treats a closed doneCh as "fsync complete" and
+// proceeds to CommitBatch — advancing HW for data that was never persisted.
+//
+// This test verifies the contract: AppendAsync must communicate write errors
+// back to callers so they can avoid committing unpersisted data.
+//
+// After the fix, AppendAsync returns <-chan error. Failed entries receive a
+// non-nil error; successful entries receive nil.
+func TestWriteErrorSignalsAllWaitersAsSuccessful(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	idx := NewIndex()
+	// Each serialized entry is ~105 bytes. Use a segment that fits exactly 2.
+	// Write 4 entries to fill 2 segments, consuming the pre-created segment,
+	// then make the directory unwritable for the next rotation.
+	w, err := NewWriter(WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    50 * time.Millisecond,
+		SegmentMaxBytes: 250, // fits ~2 entries, 3rd triggers rotation
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+	}, idx)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer w.Stop()
+
+	topicID := [16]byte{1, 2, 3}
+
+	// Write 4 entries: entries 0-1 fill segment 1, entry 2 triggers rotation
+	// (consuming the pre-created segment), entry 3 fits in segment 2.
+	// After this, segment 2 has entries 2-3 (size ~210). The next write will
+	// trigger rotation again, which will fail because the dir is unwritable.
+	for i := 0; i < 4; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(entry); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	// Wait for the background pre-creation goroutine to finish. After
+	// the rotation for entry 2, the writer kicks off a new pre-creation.
+	// We need it to complete before we make the directory unwritable.
+	time.Sleep(200 * time.Millisecond)
+
+	// Make the WAL directory unwritable so that segment rotation fails.
+	// Any pre-created segment file exists but cannot be used because we
+	// remove it. The in-memory preCreated handle will point to a deleted
+	// file, but rotateSegment closes the old segment first, then tries to
+	// use preCreated — the deleted file's fd is still valid on Unix,
+	// so we take a different approach: just chmod and accept that the
+	// pre-created segment in memory may work for ONE more rotation.
+	// Instead, write 5 entries total to consume TWO pre-created segments.
+	if err := os.Chmod(walDir, 0o555); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Chmod(walDir, 0o755)
+	})
+
+	// Entry 4: 210+105=315>250, triggers rotation. If a pre-created
+	// segment exists in memory, rotation succeeds. If not, it fails.
+	// Either way, entry 5 or 6 will eventually fail because no new
+	// pre-created segment can be created after chmod.
+	//
+	// Try up to 3 entries — at least one must fail.
+	var firstFailOffset int64 = -1
+	for i := 4; i < 7; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(entry); err != nil {
+			firstFailOffset = int64(i)
+			break
+		}
+	}
+
+	if firstFailOffset < 0 {
+		t.Fatal("expected at least one Append to fail after chmod, but all succeeded")
+	}
+
+	// Verify the failed entry is NOT in the index.
+	tp := TopicPartition{TopicID: topicID, Partition: 0}
+	entries := idx.Lookup(tp, 0, 1024*1024)
+
+	var maxIndexedOffset int64 = -1
+	for _, e := range entries {
+		if e.LastOffset > maxIndexedOffset {
+			maxIndexedOffset = e.LastOffset
+		}
+	}
+
+	if maxIndexedOffset >= firstFailOffset {
+		t.Errorf("WAL index contains offset %d; entry at offset %d that failed to write was indexed",
+			maxIndexedOffset, firstFailOffset)
+	}
+
+	// Also verify AppendAsync returns errors correctly.
+	asyncEntry := &Entry{
+		TopicID:   topicID,
+		Partition: 0,
+		Offset:    firstFailOffset + 1,
+		Data:      makeTestBatch(1, 1000),
+	}
+	errCh, enqueueErr := w.AppendAsync(asyncEntry)
+	if enqueueErr != nil {
+		t.Fatalf("AppendAsync enqueue failed: %v", enqueueErr)
+	}
+
+	select {
+	case asyncErr := <-errCh:
+		if asyncErr == nil {
+			t.Errorf("AppendAsync errCh should receive non-nil error, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AppendAsync errCh did not signal within timeout")
+	}
+}
+
 func TestTryCleanupSegments(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

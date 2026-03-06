@@ -3,9 +3,9 @@ title: Benchmarks
 description: End-to-end latency benchmarks for klite under sustained 100K events/sec load.
 ---
 
-import { Tabs, TabItem, LinkButton } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Sustained 100K events/sec over one hour, including network round-trips to and from klite (acks=1). We chose 100K because shortly above that, AWS network-attached EBS volumes become the bottleneck, not klite.
+Sustained 100K events/sec over one hour, including network round-trips to and from klite (acks=1). We chose 100K because shortly above that, AWS disk I/O becomes the bottleneck, not klite.
 
 <Tabs syncKey="metric">
   <TabItem label="avg">
@@ -32,13 +32,35 @@ Sustained 100K events/sec over one hour, including network round-trips to and fr
 
 ## Setup
 
-<LinkButton href="https://github.com/klaudworks/klite/blob/main/infra/bench/README.md" variant="minimal" icon="github">README</LinkButton>
-<LinkButton href="https://github.com/klaudworks/klite/tree/main/cmd/klite-bench" variant="minimal" icon="github">Benchmark code</LinkButton>
-<LinkButton href="https://github.com/klaudworks/klite/tree/main/infra/bench" variant="minimal" icon="github">Terraform</LinkButton>
+Two `m7g.xlarge` (ARM, 4 vCPU, 16 GB) instances on AWS in the same availability zone. One runs klite, the other runs the benchmark client. Separate machines so the numbers include real network hops, not loopback. klite only uses ~6 GB of memory. We need this instance size not for RAM but because AWS throttles disk throughput on smaller instances, and anything below `xlarge` can't sustain 100 MB/s of writes.
 
-Two `m7g.xlarge` (ARM, 4 vCPU, 16 GB) instances on AWS in the same availability zone (eu-west-1). One runs klite, the other runs the benchmark client. The machines are independent so the numbers include real network round-trips, not just loopback. Actual memory usage is closer to 6 GB, we chose these instances because AWS throttles EBS network throughput based on instance size, and a smaller instance cannot sustain 100 MB/s of writes to disk.
+The benchmark produces 100,000 events/sec (~1 KB each, ~97 MB/s) and consumes them back, sustained for one hour. 360 million events total. Acks=1 — klite acknowledges each batch after writing to disk.
 
-The benchmark produces 100,000 events per second (each ~1 KB, roughly 97 MB/s) and consumes them back, sustained for one full hour. That's 360 million events total. Acks are set to 1, meaning klite explicitly acknowledges each event after writing it to disk. No fire-and-forget tricks to make the numbers look better.
+## Reproduce
+
+[`scripts/bench-aws.py`](https://github.com/klaudworks/klite/blob/main/scripts/bench-aws.py) is a self-contained [uv](https://docs.astral.sh/uv/) Python script. Run it directly — `uv` resolves dependencies inline.
+
+**Requirements:**
+
+- [uv](https://docs.astral.sh/uv/)
+- [Terraform](https://www.terraform.io/)
+- [Docker](https://www.docker.com/) with buildx
+- AWS CLI with a configured profile (`aws configure --profile klite-bench`)
+- An SSH key pair (defaults to `~/.ssh/id_ed25519.pub`)
+
+```sh
+./scripts/bench-aws.py up    # provision EC2, build & push Docker images
+./scripts/bench-aws.py run   # run benchmark (100K rec/s, 1KB, acks=1, 1h)
+./scripts/bench-aws.py down  # tear down
+```
+
+Flags override defaults:
+
+```sh
+./scripts/bench-aws.py run --throughput 200000 --acks -1 --partitions 12
+```
+
+Run `./scripts/bench-aws.py --help` for the full list of options.
 
 <script is:inline src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script is:inline src="/bench.js"></script>

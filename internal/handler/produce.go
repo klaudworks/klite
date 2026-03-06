@@ -213,9 +213,17 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 		// All pending entries share the same fsync cycle in the WAL writer,
 		// so this is effectively one fsync wait regardless of partition count.
 		for _, pc := range pendingCommits {
-			produceCommitWAL(pc.pending)
-
 			sp := &resp.Topics[pc.topicIdx].Partitions[pc.partIdx]
+
+			if walErr := produceCommitWAL(pc.pending); walErr != nil {
+				slog.Error("WAL write failed for produce",
+					"topic", pc.topic, "partition", pc.partition,
+					"baseOffset", pc.pending.baseOffset, "err", walErr)
+				sp.ErrorCode = kerr.KafkaStorageError.Code
+				sp.BaseOffset = -1
+				continue
+			}
+
 			sp.BaseOffset = pc.pending.baseOffset
 			sp.LogAppendTime = -1
 			if pc.isLogAppendTime {
@@ -256,27 +264,17 @@ type pendingWAL struct {
 	logStart   int64
 	meta       cluster.BatchMeta
 	stored     []byte
-	doneCh     <-chan struct{}
+	errCh      <-chan error
 }
 
-// produceSubmitWAL is phase 1: reserve offset, enqueue the WAL entry, then
-// append to chunk memory. Returns a pendingWAL that the caller must pass to
-// produceCommitWAL after the fsync channel signals.
+// produceSubmitWAL is phase 1: reserve offset and enqueue the WAL entry.
+// The chunk pool write is deferred to phase 2 (after WAL fsync) so that
+// data never appears in memory before it is durable on disk.
 //
-// Ordering: AcquireSpareChunk (may block, no lock held) → pd.Lock() →
-// reserve offset → AppendAsync → AppendToChunk → pd.Unlock().
-//
-// The spare chunk is acquired before taking the partition lock so that
-// backpressure blocking never holds pd.mu, preventing deadlock with the
-// S3 flusher which needs pd.mu to detach and release chunks.
+// Ordering: pd.Lock() → reserve offset → AppendAsync → pd.Unlock().
 func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (pendingWAL, error) {
 	stored := make([]byte, len(raw))
 	copy(stored, raw)
-
-	// Pre-acquire a spare chunk before taking the partition lock.
-	// This may block if the pool is exhausted (backpressure), which is
-	// safe because we don't hold pd.mu yet.
-	spare := pd.AcquireSpareChunk(len(stored))
 
 	pd.Lock()
 	baseOffset := pd.ReserveOffset(meta)
@@ -284,30 +282,20 @@ func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, m
 	cluster.AssignOffset(stored, baseOffset)
 
 	// Submit WAL entry (non-blocking enqueue). On failure, roll back the
-	// offset reservation so no gap is created.
+	// offset reservation so no gap is created (still under lock).
 	walEntry := &wal.Entry{
 		TopicID:   td.ID,
 		Partition: pd.Index,
 		Offset:    baseOffset,
 		Data:      stored,
 	}
-	doneCh, err := walWriter.AppendAsync(walEntry)
+	errCh, err := walWriter.AppendAsync(walEntry)
 	if err != nil {
 		pd.RollbackReserve(baseOffset)
 		pd.Unlock()
-		pd.ReleaseSpareChunk(spare)
 		return pendingWAL{}, err
 	}
-
-	// WAL enqueue succeeded — safe to place data in the chunk.
-	spare = pd.AppendToChunk(stored, chunk.ChunkBatch{
-		BaseOffset:      baseOffset,
-		LastOffsetDelta: meta.LastOffsetDelta,
-		MaxTimestamp:    meta.MaxTimestamp,
-		NumRecords:      meta.NumRecords,
-	}, spare)
 	pd.Unlock()
-	pd.ReleaseSpareChunk(spare)
 
 	return pendingWAL{
 		pd:         pd,
@@ -315,27 +303,49 @@ func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, m
 		logStart:   logStart,
 		meta:       meta,
 		stored:     stored,
-		doneCh:     doneCh,
+		errCh:      errCh,
 	}, nil
 }
 
-// produceCommitWAL is phase 2: wait for the fsync channel, then commit the
-// batch (advance HW) and notify fetch waiters.
-func produceCommitWAL(p pendingWAL) {
-	<-p.doneCh
+// produceCommitWAL is phase 2: wait for WAL fsync, then write to the chunk
+// pool and commit (advance HW). If the WAL write failed, skip the offsets
+// so the partition doesn't stall. Returns non-nil error on WAL failure.
+func produceCommitWAL(p pendingWAL) error {
+	walErr := <-p.errCh
 
-	batch := cluster.StoredBatch{
+	if walErr != nil {
+		// WAL write failed. Skip these offsets so subsequent commits
+		// can drain past the gap and HW keeps advancing.
+		p.pd.Lock()
+		p.pd.SkipOffsets(p.baseOffset, int64(p.meta.LastOffsetDelta)+1)
+		p.pd.Unlock()
+		return walErr
+	}
+
+	// WAL write succeeded. Write to chunk pool and commit.
+	// Acquire spare chunk outside the lock to avoid deadlock with
+	// the S3 flusher (same rationale as the original design).
+	spare := p.pd.AcquireSpareChunk(len(p.stored))
+
+	p.pd.Lock()
+	spare = p.pd.AppendToChunk(p.stored, chunk.ChunkBatch{
+		BaseOffset:      p.baseOffset,
+		LastOffsetDelta: p.meta.LastOffsetDelta,
+		MaxTimestamp:    p.meta.MaxTimestamp,
+		NumRecords:      p.meta.NumRecords,
+	}, spare)
+	p.pd.CommitBatch(cluster.StoredBatch{
 		BaseOffset:      p.baseOffset,
 		LastOffsetDelta: p.meta.LastOffsetDelta,
 		RawBytes:        p.stored,
 		MaxTimestamp:    p.meta.MaxTimestamp,
 		NumRecords:      p.meta.NumRecords,
-	}
-	p.pd.Lock()
-	p.pd.CommitBatch(batch)
+	})
 	p.pd.Unlock()
+	p.pd.ReleaseSpareChunk(spare)
 
 	p.pd.NotifyWaiters()
+	return nil
 }
 
 // getMaxMessageBytes returns the max.message.bytes config value for the topic.

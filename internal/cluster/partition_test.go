@@ -933,6 +933,180 @@ func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
 	pd.RUnlock()
 }
 
+// --- WAL error recovery tests: SkipOffsets and FetchFrom gap ---
+
+// TestSkipOffsetsUnblocksPendingCommits verifies that SkipOffsets advances
+// nextCommit past a gap, allowing subsequent out-of-order commits that were
+// queued behind the gap to drain and advance HW.
+//
+// Scenario: Reserve offsets for batches A(0-2), B(3-4), C(5). Commit C first
+// (out of order — queued). Skip B (WAL error). Commit A. After A commits,
+// SkipOffsets(B) should drain the gap and then C should also drain, advancing
+// HW to 6.
+func TestSkipOffsetsUnblocksPendingCommits(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithChunks()
+
+	pd.Lock()
+	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2}) // offsets 0-2
+	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1}) // offsets 3-4
+	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 5
+	pd.Unlock()
+
+	_ = base1
+
+	// Commit C (out of order) — queued as pending
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base2, LastOffsetDelta: 0,
+		RawBytes: makeSimpleBatch(1, 3000), MaxTimestamp: 3000, NumRecords: 1,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	if pd.HW() != 0 {
+		t.Errorf("HW after out-of-order C commit: got %d, want 0", pd.HW())
+	}
+	pd.RUnlock()
+
+	// Commit A (in order) — HW should advance to 3
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base0, LastOffsetDelta: 2,
+		RawBytes: makeSimpleBatch(3, 1000), MaxTimestamp: 1000, NumRecords: 3,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	if pd.HW() != 3 {
+		t.Errorf("HW after A commit: got %d, want 3", pd.HW())
+	}
+	pd.RUnlock()
+
+	// Skip B (offsets 3-4) — simulates WAL write failure for batch B.
+	// After skip, nextCommit should jump past 3-4, then drain C from
+	// pendingCommits, advancing HW to 6.
+	pd.Lock()
+	pd.SkipOffsets(base1, 2) // skip 2 offsets starting at base1=3
+	pd.Unlock()
+
+	pd.RLock()
+	hw := pd.HW()
+	pd.RUnlock()
+
+	if hw != 6 {
+		t.Errorf("HW after SkipOffsets: got %d, want 6 (gap should be skipped, C should drain)", hw)
+	}
+}
+
+// TestSkipOffsetsOutOfOrder verifies that SkipOffsets works when the skip
+// arrives before the preceding batch has committed (out-of-order skip).
+func TestSkipOffsetsOutOfOrder(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithChunks()
+
+	pd.Lock()
+	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2}) // offsets 0-2
+	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1}) // offsets 3-4
+	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 5
+	pd.Unlock()
+
+	// Skip B FIRST (before A commits) — out-of-order skip
+	pd.Lock()
+	pd.SkipOffsets(base1, 2)
+	pd.Unlock()
+
+	// HW should still be 0 — A hasn't committed yet
+	pd.RLock()
+	if pd.HW() != 0 {
+		t.Errorf("HW after out-of-order skip: got %d, want 0", pd.HW())
+	}
+	pd.RUnlock()
+
+	// Commit C (out of order)
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base2, LastOffsetDelta: 0,
+		RawBytes: makeSimpleBatch(1, 3000), MaxTimestamp: 3000, NumRecords: 1,
+	})
+	pd.Unlock()
+
+	// HW still 0 — waiting for A
+	pd.RLock()
+	if pd.HW() != 0 {
+		t.Errorf("HW after out-of-order C commit: got %d, want 0", pd.HW())
+	}
+	pd.RUnlock()
+
+	// Commit A — should drain: A(0-2) → skip B(3-4) → C(5) → HW=6
+	pd.Lock()
+	pd.CommitBatch(StoredBatch{
+		BaseOffset: base0, LastOffsetDelta: 2,
+		RawBytes: makeSimpleBatch(3, 1000), MaxTimestamp: 1000, NumRecords: 3,
+	})
+	pd.Unlock()
+
+	pd.RLock()
+	hw := pd.HW()
+	pd.RUnlock()
+
+	if hw != 6 {
+		t.Errorf("HW after all commits + skip: got %d, want 6", hw)
+	}
+}
+
+// TestFetchFromGapReturnsNextAvailableBatch verifies that when the chunk pool
+// has no data at the requested offset but has data at a higher offset, and
+// cold storage (WAL/S3) also has nothing, FetchFrom returns the higher chunk
+// data instead of nil. This prevents consumers from getting stuck on offset
+// gaps caused by WAL write failures.
+//
+// This test uses SetHW to directly set the high watermark, bypassing
+// SkipOffsets/CommitBatch, so it isolates the FetchFrom behavior.
+func TestFetchFromGapReturnsNextAvailableBatch(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartitionWithChunks()
+
+	// Simulate a gap: push batch at offsets 0-2, then push batch at offsets
+	// 5-7 (skipping 3-4). Use PushBatch for 0-2, then manually place
+	// batch 5-7 at the right offset in the chunk pool.
+	raw0 := makeSimpleBatch(3, 1000)
+	raw1 := makeSimpleBatch(3, 2000)
+
+	pd.Lock()
+	// Batch 0: offsets 0-2
+	pd.PushBatch(raw0, BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3}, nil)
+
+	// Reserve and skip offsets 3-4 (just advance nextOffset without data)
+	pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1})
+
+	// Batch 2: offsets 5-7 — assign offset and push to chunk
+	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2})
+	AssignOffset(raw1, base2)
+	pd.AppendToChunk(raw1, chunk.ChunkBatch{
+		BaseOffset: base2, LastOffsetDelta: 2, MaxTimestamp: 2000, NumRecords: 3,
+	}, nil)
+
+	// Directly set HW past the gap. In real code this would be done via
+	// CommitBatch + SkipOffsets, but we're isolating the FetchFrom test.
+	pd.SetHW(8)
+	pd.Unlock()
+
+	// Fetch from offset 3 (in the gap). No WAL or S3 configured, so cold
+	// storage returns nothing. Should return batch at offset 5 instead of nil.
+	result := pd.FetchFrom(3, 1024*1024)
+
+	if len(result) == 0 {
+		t.Fatal("FetchFrom(3) returned no batches; expected batch at offset 5 (skip gap)")
+	}
+	if result[0].BaseOffset != 5 {
+		t.Errorf("FetchFrom(3) first batch base: got %d, want 5", result[0].BaseOffset)
+	}
+}
+
 // TestAcquireSpareChunkDoesNotHoldPartitionLock verifies that when
 // AcquireSpareChunk blocks on an exhausted pool, pd.mu is NOT held.
 // This is the core invariant that prevents deadlock between the produce

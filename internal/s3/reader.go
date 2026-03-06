@@ -52,8 +52,8 @@ func NewReader(client *Client, logger *slog.Logger) *Reader {
 func (r *Reader) Fetch(ctx context.Context, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) ([]byte, error) {
 	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 
-	// 1. Find the right S3 object
-	key, objectSize, err := r.findObjectForOffset(ctx, prefix, offset)
+	// 1. Find the right S3 object (and next object for gap fallback)
+	key, objectSize, nextKey, nextSize, err := r.findObjectForOffset(ctx, prefix, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +61,23 @@ func (r *Reader) Fetch(ctx context.Context, topic string, topicID [16]byte, part
 		return nil, nil // no data in S3 for this offset
 	}
 
-	// 2. Read the footer (cached after first access)
+	data, err := r.fetchRawFromObject(ctx, key, objectSize, offset, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if data != nil {
+		return data, nil
+	}
+
+	// Object doesn't cover offset (gap) — try next object
+	if nextKey == "" {
+		return nil, nil
+	}
+	return r.fetchRawFromObject(ctx, nextKey, nextSize, offset, maxBytes)
+}
+
+// fetchRawFromObject reads concatenated batch bytes from a single S3 object.
+func (r *Reader) fetchRawFromObject(ctx context.Context, key string, objectSize int64, offset int64, maxBytes int32) ([]byte, error) {
 	footer, err := r.GetFooter(ctx, key, objectSize)
 	if err != nil {
 		return nil, fmt.Errorf("read footer for %s: %w", key, err)
@@ -71,23 +87,19 @@ func (r *Reader) Fetch(ctx context.Context, topic string, topicID [16]byte, part
 		return nil, nil
 	}
 
-	// 3. Binary search for the first batch containing offset
 	startIdx := footer.FindBatch(offset)
 	if startIdx >= len(footer.Entries) {
 		return nil, nil
 	}
 
-	// 4. Compute byte range: from the target batch to maxBytes
 	startByte := int64(footer.Entries[startIdx].BytePosition)
 	endByte := r.computeEndByte(footer, startIdx, maxBytes)
 
-	// 5. Range GET only the needed bytes
 	data, err := r.client.RangeGet(ctx, key, startByte, endByte)
 	if err != nil {
 		return nil, fmt.Errorf("range get %s: %w", key, err)
 	}
 
-	// Record range request for testing
 	r.mu.Lock()
 	r.rangeRequests = append(r.rangeRequests, RangeRequestInfo{
 		Key:       key,
@@ -104,7 +116,7 @@ func (r *Reader) Fetch(ctx context.Context, topic string, topicID [16]byte, part
 func (r *Reader) FetchBatches(ctx context.Context, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) ([]BatchData, error) {
 	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 
-	key, objectSize, err := r.findObjectForOffset(ctx, prefix, offset)
+	key, objectSize, nextKey, nextSize, err := r.findObjectForOffset(ctx, prefix, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +124,24 @@ func (r *Reader) FetchBatches(ctx context.Context, topic string, topicID [16]byt
 		return nil, nil
 	}
 
+	result, err := r.fetchFromObject(ctx, key, objectSize, offset, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if len(result) > 0 {
+		return result, nil
+	}
+
+	// The found object doesn't cover the requested offset (gap between
+	// objects). Try the next object — it may start right after the gap.
+	if nextKey == "" {
+		return nil, nil
+	}
+	return r.fetchFromObject(ctx, nextKey, nextSize, offset, maxBytes)
+}
+
+// fetchFromObject reads batches from a single S3 object starting at offset.
+func (r *Reader) fetchFromObject(ctx context.Context, key string, objectSize int64, offset int64, maxBytes int32) ([]BatchData, error) {
 	footer, err := r.GetFooter(ctx, key, objectSize)
 	if err != nil {
 		return nil, fmt.Errorf("read footer for %s: %w", key, err)
@@ -192,13 +222,16 @@ func (r *Reader) RangeRequests() []RangeRequestInfo {
 
 // findObjectForOffset finds the S3 object that contains the given offset.
 // Returns (key, objectSize) or ("", 0) if no object contains the offset.
-func (r *Reader) findObjectForOffset(ctx context.Context, prefix string, offset int64) (string, int64, error) {
+// findObjectForOffset returns the best matching object and optionally the
+// next object. The next object is returned so that FetchBatches can try
+// it when the requested offset falls in a gap between objects.
+func (r *Reader) findObjectForOffset(ctx context.Context, prefix string, offset int64) (key string, size int64, nextKey string, nextSize int64, err error) {
 	objects, err := r.getObjectListing(ctx, prefix)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", 0, err
 	}
 	if len(objects) == 0 {
-		return "", 0, nil
+		return "", 0, "", 0, nil
 	}
 
 	// Objects are sorted by key (which is zero-padded offset).
@@ -212,11 +245,16 @@ func (r *Reader) findObjectForOffset(ctx context.Context, prefix string, offset 
 
 	if idx < 0 {
 		// Offset is before all objects — try the first object
-		// (it may contain the offset if there's a gap)
-		return objects[0].Key, objects[0].Size, nil
+		return objects[0].Key, objects[0].Size, "", 0, nil
 	}
 
-	return objects[idx].Key, objects[idx].Size, nil
+	key = objects[idx].Key
+	size = objects[idx].Size
+	if idx+1 < len(objects) {
+		nextKey = objects[idx+1].Key
+		nextSize = objects[idx+1].Size
+	}
+	return key, size, nextKey, nextSize, nil
 }
 
 // getObjectListing returns the cached object listing for a prefix.
@@ -321,6 +359,16 @@ func (r *Reader) InvalidateFooters(topic string, topicID [16]byte, partition int
 	}
 	r.footerMu.Unlock()
 
+	r.listingMu.Lock()
+	delete(r.listingCache, prefix)
+	r.listingMu.Unlock()
+}
+
+// InvalidateListings clears the object listing cache for a topic/partition.
+// Called by the flusher after uploading new objects so that subsequent reads
+// discover the newly uploaded keys.
+func (r *Reader) InvalidateListings(topic string, topicID [16]byte, partition int32) {
+	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
 	r.listingMu.Lock()
 	delete(r.listingCache, prefix)
 	r.listingMu.Unlock()

@@ -1,0 +1,23 @@
+klite has been deployed.
+
+Kafka endpoint (inside the cluster):
+  {{ include "klite.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+To connect from your local machine:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "klite.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+Then use any Kafka client with bootstrap server: localhost:{{ .Values.service.port }}
+
+{{- if not .Values.s3.bucket }}
+
+WARNING: S3 is not configured. Data is stored locally only.
+  Set s3.bucket to enable durable storage. Without S3, data is lost if the pod
+  is rescheduled to a different node (unless persistence.enabled=true).
+{{- end }}
+
+{{- if and (not .Values.persistence.enabled) .Values.s3.bucket }}
+
+NOTE: Persistence is disabled. The broker will recover from S3 on restart.
+  This adds a few seconds to startup and creates a ~60s data-loss window for
+  in-flight writes. Set persistence.enabled=true to eliminate this.
+{{- end }}

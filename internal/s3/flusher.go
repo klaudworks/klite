@@ -61,6 +61,9 @@ type FlusherConfig struct {
 
 	// MetadataUploader is called periodically to upload metadata.log.
 	MetadataUploader func(ctx context.Context) error
+
+	// Reader is used to invalidate listing caches after new objects are uploaded.
+	Reader *Reader
 }
 
 // Flusher manages the S3 flush pipeline. It periodically scans partitions
@@ -298,6 +301,11 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 				// On failure, release chunks back to pool (data is still in WAL for retry)
 				job.pool.ReleaseMany(job.chunks)
 				return
+			}
+
+			// Invalidate the S3 listing cache so subsequent reads discover the new object
+			if f.cfg.Reader != nil {
+				f.cfg.Reader.InvalidateListings(job.Topic, job.TopicID, job.Partition)
 			}
 
 			// Advance the S3 flush watermark

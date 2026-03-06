@@ -39,8 +39,8 @@ func DefaultWriterConfig() WriterConfig {
 
 // writeRequest is sent from handler goroutines to the WAL writer.
 type writeRequest struct {
-	entry  []byte        // serialized WAL entry (MarshalEntry output)
-	doneCh chan struct{} // closed after fsync completes
+	entry []byte     // serialized WAL entry (MarshalEntry output)
+	errCh chan error // receives nil on success, non-nil on write/fsync failure
 }
 
 // segmentInfo tracks a single WAL segment file.
@@ -191,25 +191,25 @@ func (w *Writer) Append(entry *Entry) error {
 	entry.Sequence = seq
 
 	serialized := MarshalEntry(entry)
-	doneCh := make(chan struct{})
+	errCh := make(chan error, 1)
 
 	select {
-	case w.writeCh <- writeRequest{entry: serialized, doneCh: doneCh}:
+	case w.writeCh <- writeRequest{entry: serialized, errCh: errCh}:
 	case <-w.stopCh:
 		return ErrClosed
 	}
 
 	select {
-	case <-doneCh:
-		return nil
+	case err := <-errCh:
+		return err
 	case <-w.stopCh:
 		return ErrClosed
 	}
 }
 
-// AppendAsync submits a WAL entry for writing, returning a channel that is
-// closed when fsync completes. The caller can select on the channel.
-func (w *Writer) AppendAsync(entry *Entry) (done <-chan struct{}, err error) {
+// AppendAsync submits a WAL entry for writing, returning a channel that
+// receives nil on success or an error on write/fsync failure.
+func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 	w.mu.Lock()
 	if w.stopped {
 		w.mu.Unlock()
@@ -221,11 +221,11 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan struct{}, err error) {
 	entry.Sequence = seq
 
 	serialized := MarshalEntry(entry)
-	doneCh := make(chan struct{})
+	errCh := make(chan error, 1)
 
 	select {
-	case w.writeCh <- writeRequest{entry: serialized, doneCh: doneCh}:
-		return doneCh, nil
+	case w.writeCh <- writeRequest{entry: serialized, errCh: errCh}:
+		return errCh, nil
 	case <-w.stopCh:
 		return nil, ErrClosed
 	}
@@ -321,25 +321,36 @@ func (w *Writer) run() {
 			continue
 		}
 
-		// Phase 2: Write all pending entries
-		for _, req := range pending {
+		// Phase 2: Write all pending entries, tracking where we stop on error.
+		written := 0
+		for i, req := range pending {
 			if err := w.appendEntry(req.entry); err != nil {
 				w.logger.Error("WAL write error", "err", err)
-				// Signal all waiters even on error so they don't block forever
+				written = i
+				// Signal failure to this and all remaining entries.
+				for _, fail := range pending[i:] {
+					fail.errCh <- err
+				}
 				break
 			}
+			written = i + 1
 		}
 
-		// Phase 3: Fsync
-		if w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
+		// Phase 3: Fsync only if at least one entry was written.
+		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
 			if err := w.current.file.Sync(); err != nil {
 				w.logger.Error("WAL fsync error", "err", err)
+				// Fsync failure: none of the written entries are durable.
+				for _, req := range pending[:written] {
+					req.errCh <- err
+				}
+				written = 0
 			}
 		}
 
-		// Phase 4: Signal all waiters
-		for _, req := range pending {
-			close(req.doneCh)
+		// Phase 4: Signal success to entries that were written and fsync'd.
+		for _, req := range pending[:written] {
+			req.errCh <- nil
 		}
 		pending = pending[:0] // reuse slice
 
@@ -405,18 +416,28 @@ func (w *Writer) appendEntry(serialized []byte) error {
 
 // flushAndSync writes pending entries and fsyncs.
 func (w *Writer) flushAndSync(pending []writeRequest) {
-	for _, req := range pending {
+	written := 0
+	for i, req := range pending {
 		if err := w.appendEntry(req.entry); err != nil {
 			w.logger.Error("WAL flush write error", "err", err)
+			for _, fail := range pending[i:] {
+				fail.errCh <- err
+			}
+			break
 		}
+		written = i + 1
 	}
-	if w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
+	if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
 		if err := w.current.file.Sync(); err != nil {
 			w.logger.Error("WAL fsync error during flush", "err", err)
+			for _, req := range pending[:written] {
+				req.errCh <- err
+			}
+			return
 		}
 	}
-	for _, req := range pending {
-		close(req.doneCh)
+	for _, req := range pending[:written] {
+		req.errCh <- nil
 	}
 }
 
