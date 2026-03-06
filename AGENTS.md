@@ -112,6 +112,26 @@ Follow the **testing pyramid**: test at the lowest layer that can verify the beh
 - Do not write low-value comments. Comments should be reserved for high-value information that is not easily understood by reading the code alone.
 - Keep comments concise and to the point.
 
+## Commit Messages
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>: <short summary>
+```
+
+Types:
+- `feat` — new feature or handler
+- `fix` — bug fix
+- `refactor` — code restructuring without behavior change
+- `docs` — documentation only
+- `ci` — CI/CD, Dockerfile, goreleaser
+- `chore` — project setup, dependencies, tooling
+- `test` — adding or fixing tests
+- `perf` — performance improvements
+
+Keep the summary lowercase, imperative, and under 72 characters. No period at the end.
+
 ## Subagents
 
 - Use subagents sparingly. They are useful when a search would return verbose output that would pollute the main context just to find a small piece of detailed information.
