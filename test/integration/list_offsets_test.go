@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -99,7 +100,11 @@ func TestListOffsetsMaxTimestamp(t *testing.T) {
 
 func TestListOffsetsTimestampLookup(t *testing.T) {
 	t.Parallel()
-	tb := StartBroker(t)
+	mem := s3store.NewInMemoryS3()
+	tb := StartBroker(t,
+		WithS3(mem, "test-bucket", "klite/test"),
+		WithS3FlushInterval(24*time.Hour),
+	)
 
 	admin := NewAdminClient(t, tb.Addr)
 	ctx := context.Background()
