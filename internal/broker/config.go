@@ -128,7 +128,7 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.S3Prefix, "s3-prefix", cfg.S3Prefix, "Optional S3 path prefix prepended before klite-<clusterID>")
 	fs.DurationVar(&cfg.S3FlushInterval, "s3-flush-interval", cfg.S3FlushInterval, "Max age of unflushed partition data before flush (default: 60s)")
 	fs.Int64Var(&cfg.S3TargetObjectSize, "s3-target-object-size", cfg.S3TargetObjectSize, "Flush partition when unflushed bytes reach this size in bytes (default: 67108864 = 64 MiB)")
-	fs.DurationVar(&cfg.S3FlushCheckInterval, "s3-flush-check-interval", cfg.S3FlushCheckInterval, "How often the flusher scans partitions for flush eligibility (default: 5s)")
+	fs.DurationVar(&cfg.S3FlushCheckInterval, "s3-flush-check-interval", cfg.S3FlushCheckInterval, "How often the flusher scans partitions for flush eligibility (default: 1s)")
 
 	// WAL flags
 	fs.IntVar(&cfg.WALSyncIntervalMs, "wal-sync-interval", cfg.WALSyncIntervalMs, "WAL fsync batch window in milliseconds (default: 2)")

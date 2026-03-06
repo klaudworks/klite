@@ -44,3 +44,9 @@ variable "bench_instance_type" {
   type        = string
   default     = "m7g.large"
 }
+
+variable "use_spot" {
+  description = "Use spot instances for EC2 (much cheaper for benchmarks)"
+  type        = bool
+  default     = true
+}

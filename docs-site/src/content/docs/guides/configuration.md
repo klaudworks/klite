@@ -45,7 +45,7 @@ When running in Docker without S3, the data directory lives inside the container
 
 When an S3 bucket is configured, klite periodically flushes WAL data to S3 for durable storage. The local WAL acts as a write-ahead buffer -- writes are acknowledged immediately and flushed in the background.
 
-Any S3-compatible store works: AWS S3, SeaweedFS, MinIO, Cloudflare R2, Google Cloud Storage (S3-compatible mode), etc.
+Any S3-compatible store works: AWS S3, SeaweedFS, MinIO, Garage, etc.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|

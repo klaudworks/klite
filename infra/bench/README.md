@@ -1,7 +1,9 @@
 # klite AWS Benchmark Infrastructure
 
 Reproduce a klite vs MSK benchmark on AWS. Everything runs on Graviton arm64
-instances in eu-west-1 using the default VPC.
+spot instances in eu-west-1 using the default VPC.
+
+All orchestration is handled by a single script: `scripts/bench-aws.py`.
 
 ## Architecture
 
@@ -34,448 +36,150 @@ instances in eu-west-1 using the default VPC.
 
 ## Prerequisites
 
-- AWS CLI configured with profile `klite-bench` (IAM user with admin access, account `655506454434`)
-- Terraform >= 1.5 (managed via tfenv; v1.12.2 known to work)
-- Docker with buildx (for cross-compiling arm64 images from a non-arm host)
-- SSH key — the public key content goes in `bench.tfvars`
+- [uv](https://docs.astral.sh/uv/) (Python package runner)
+- AWS CLI configured with profile `klite-bench`
+- Terraform >= 1.5
+- Docker with buildx (for cross-compiling arm64 images)
+- SSH key pair (the script auto-detects `~/.ssh/id_ed25519.pub`)
 
-## Quick Start (copy-paste)
+## Setup
 
-This section has the exact commands to go from zero to a running benchmark.
-Substitute the terraform output values where indicated.
+Edit `infra/bench/bench.tfvars` if you need to change region, profile, or
+instance types. The file is checked into git (no secrets).
 
-```bash
-# 1. Deploy infrastructure
-cd infra/bench
-terraform init   # only needed first time
-terraform apply -var-file=bench.tfvars
-# Note the outputs: klite_public_ip, klite_private_ip, bench_public_ip,
-# ecr_klite, ecr_klite_bench, s3_bucket
-
-# 2. Build and push images (from repo root)
-cd ../..
-aws ecr get-login-password --region eu-west-1 --profile klite-bench \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com
-
-docker buildx build --platform linux/arm64 \
-  -t 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite:latest \
-  -f Dockerfile --push .
-
-docker buildx build --platform linux/arm64 \
-  -t 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  -f Dockerfile.bench --push .
-
-# 3. ECR login on EC2 instances (userdata runs as root, ec2-user needs its own login)
-ssh ec2-user@<klite_public_ip> 'aws ecr get-login-password --region eu-west-1 \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com'
-
-ssh ec2-user@<bench_public_ip> 'aws ecr get-login-password --region eu-west-1 \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com'
-
-# 4. Pull images
-ssh ec2-user@<klite_public_ip> \
-  'docker pull 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite:latest'
-ssh ec2-user@<bench_public_ip> \
-  'docker pull 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest'
-
-# 5. Start klite (use --net host, NOT -p 9092:9092)
-ssh ec2-user@<klite_public_ip> 'docker run -d --name klite \
-  --net host -v /data/klite:/data \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite:latest \
-  --data-dir /data \
-  -advertised-addr <klite_private_ip>:9092 \
-  -s3-bucket <s3_bucket> \
-  -s3-region eu-west-1 \
-  -s3-flush-interval 60s \
-  -wal-max-disk-size 32212254720 \
-  -chunk-pool-memory 4294967296'
-
-# 6. Verify klite is running
-ssh ec2-user@<klite_public_ip> 'docker logs klite'
-# Should show: "klite started" with S3 storage initialized
-
-# 7. Create topic + run 1-hour benchmark
-ssh ec2-user@<bench_public_ip> 'docker run --rm --net host \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  create-topic -bootstrap-server <klite_private_ip>:9092 -topic bench-1h -partitions 6'
-
-ssh ec2-user@<bench_public_ip> 'docker run -d --name bench-1h \
-  --net host -v /tmp/results:/results \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  produce \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-1h \
-  -num-records 360050000 \
-  -record-size 1024 \
-  -producers 4 \
-  -acks -1 \
-  -throughput 100000 \
-  -warmup-records 50000 \
-  -reporting-interval 60000 \
-  -json-output /results/bench-1h.jsonl'
-
-# 8. Monitor progress
-ssh ec2-user@<bench_public_ip> 'docker logs --tail 5 bench-1h'
-
-# 9. Download results when done
-scp ec2-user@<bench_public_ip>:/tmp/results/bench-1h.jsonl tmp/
-
-# 10. Tear down
-cd infra/bench && terraform destroy -var-file=bench.tfvars
-```
-
-## Gotchas and Lessons Learned
-
-### ECR login: userdata runs as root, ec2-user needs separate login
-
-The userdata script runs `docker login` as root. When you SSH in as `ec2-user`
-and try `docker pull`, you get `no basic auth credentials`. You must run ECR
-login again as ec2-user:
+The SSH key is auto-detected from `~/.ssh/id_ed25519.pub` (falling back to
+`~/.ssh/id_rsa.pub`). To use a different key:
 
 ```bash
-aws ecr get-login-password --region eu-west-1 \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com
+./scripts/bench-aws.py up --ssh-key ~/.ssh/my_key.pub
 ```
 
-### Use `--net host`, not `-p 9092:9092`
-
-klite advertises the private IP to clients. With port-mapping (`-p 9092:9092`)
-the client connects to the advertised private IP directly, bypassing Docker's
-port mapping on the bench instance side. Using `--net host` on both containers
-avoids all NAT issues. Use `--net host` on the bench container too.
-
-### klite flags: `-advertised-addr` not `-advertise-addr`
-
-Note the **d** at the end. The flag is `-advertised-addr`.
-
-### The old `-ring-buffer-max-memory` flag is now `-chunk-pool-memory`
-
-The ring buffer memory flag was renamed. The current flag is `-chunk-pool-memory`.
-Default is 536870912 (512 MiB). For benchmarks, use 4294967296 (4 GiB) on
-m7g.xlarge (16 GB RAM).
-
-### Use `docker buildx build --push` for cross-platform builds
-
-On a non-arm host, `docker build` then `docker push` may push the wrong
-platform. Always use `docker buildx build --platform linux/arm64 --push`
-to build and push in one step.
-
-### Wait ~30s after terraform apply before SSHing
-
-EC2 instances need time to boot and run userdata (install Docker, etc.).
-Wait at least 30 seconds after `terraform apply` completes before attempting
-SSH. Docker should be ready by then.
-
-### Instance type: klite is m7g.xlarge, bench is m7g.large
-
-klite needs 4 vCPU / 16 GB (m7g.xlarge) for sustained benchmarks with 4GB
-chunk pool memory. The bench instance only runs the bench client and can be
-m7g.large (2 vCPU / 8 GB).
-
-## Detailed Steps
-
-### 1. Deploy Infrastructure
+## Quick Start
 
 ```bash
-cd infra/bench
+# Bring up infra, build images, push to ECR, pull on instances
+./scripts/bench-aws.py up
 
-# Create your tfvars (gitignored)
-cp bench.tfvars.example bench.tfvars
-# Edit bench.tfvars — set ssh_public_key to your public key contents
-# Set klite_instance_type = "m7g.xlarge"
+# Run a 1-hour benchmark with defaults
+./scripts/bench-aws.py run
 
-terraform init
-terraform apply -var-file=bench.tfvars
+# Check progress
+./scripts/bench-aws.py status
+
+# Tear down when done
+./scripts/bench-aws.py down
 ```
 
-This creates:
-- SSH key pair
-- Security group (SSH from anywhere, Kafka 9092 from VPC)
-- 2 ECR repos (`klite`, `klite-bench`)
-- IAM role with ECR pull + SSM + S3 access
-- S3 bucket for klite data (`klite-bench-data-<random>`, force_destroy=true)
-- EC2 klite instance (m7g.xlarge, gp3 100GB, 3000 IOPS, 125 MB/s throughput)
-- EC2 bench instance (m7g.large, gp3 20GB)
+Results are saved to `tmp/<timestamp>-<mode>.jsonl`.
 
-Terraform outputs:
-```
-klite_public_ip   = "x.x.x.x"        # SSH access
-klite_private_ip  = "172.31.x.x"      # bootstrap server for bench
-bench_public_ip   = "y.y.y.y"         # SSH access
-ecr_klite         = "655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite"
-ecr_klite_bench   = "655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench"
-s3_bucket         = "klite-bench-data-xxxxxxxx"
-```
+## Commands
 
-### 2. Build and Push Docker Images
-
-From the repo root:
+### `up` — Provision infrastructure and deploy images
 
 ```bash
-# ECR login (from your local machine)
-aws ecr get-login-password --region eu-west-1 --profile klite-bench \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com
-
-# Build and push both (use buildx for cross-platform arm64)
-docker buildx build --platform linux/arm64 \
-  -t 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite:latest \
-  -f Dockerfile --push .
-
-docker buildx build --platform linux/arm64 \
-  -t 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  -f Dockerfile.bench --push .
+./scripts/bench-aws.py up
+./scripts/bench-aws.py up --ssh-key ~/.ssh/my_key.pub
 ```
 
-### 3. Pull Images on EC2 Instances
+Runs terraform apply, waits for instances to boot, builds both Docker images
+for linux/arm64, pushes to ECR, and pulls on the EC2 instances. Handles
+terraform init automatically on first run. The SSH public key is auto-detected
+from `~/.ssh/id_ed25519.pub` unless overridden with `--ssh-key`.
+
+### `push` — Rebuild and redeploy images
 
 ```bash
-# ECR login as ec2-user (required — see gotchas above)
-ssh ec2-user@<klite_public_ip> 'aws ecr get-login-password --region eu-west-1 \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com'
-ssh ec2-user@<bench_public_ip> 'aws ecr get-login-password --region eu-west-1 \
-  | docker login --username AWS --password-stdin 655506454434.dkr.ecr.eu-west-1.amazonaws.com'
-
-# Pull
-ssh ec2-user@<klite_public_ip> \
-  'docker pull 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite:latest'
-ssh ec2-user@<bench_public_ip> \
-  'docker pull 655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest'
+./scripts/bench-aws.py push
 ```
 
-### 4. Start klite Broker
+Rebuilds both images and pushes them to the instances without touching
+terraform. Use after code changes between benchmark runs.
+
+### `run` — Execute a benchmark
 
 ```bash
-ssh ec2-user@<klite_public_ip> 'docker run -d --name klite \
-  --net host \
-  -v /data/klite:/data \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite:latest \
-  --data-dir /data \
-  -advertised-addr <klite_private_ip>:9092 \
-  -s3-bucket <s3_bucket> \
-  -s3-region eu-west-1 \
-  -s3-flush-interval 60s \
-  -wal-max-disk-size 32212254720 \
-  -chunk-pool-memory 4294967296'
+./scripts/bench-aws.py run [OPTIONS]
 ```
 
-Key flags:
-- `--net host` — required so clients can reach the advertised private IP
-- `-advertised-addr` — must be the private IP so bench client can connect via VPC
-- `-s3-flush-interval 60s` — flush WAL to S3 every 60 seconds
-- `-wal-max-disk-size 32212254720` — 30GB WAL cap (disk is 100GB)
-- `-chunk-pool-memory 4294967296` — 4GB chunk pool (m7g.xlarge has 16GB RAM)
+Each run gets a unique ID (timestamp) used for the WAL data directory, S3
+prefix, and output filename. Runs are fully isolated — no need to clean S3
+between runs.
 
-Verify it's running:
-```bash
-ssh ec2-user@<klite_public_ip> 'docker logs klite'
-# Should show: "klite started" with S3 storage initialized, flush_interval=1m0s
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--mode` | `produce-consume` | `produce-consume`, `produce`, or `consume` |
+| `--topic` | `bench` | Topic name |
+| `--partitions` | `6` | Partition count |
+| `--num-records` | `360050000` | Total records (1h at 100K/s + 50K warmup) |
+| `--record-size` | `1024` | Bytes per record |
+| `--producers` | `4` | Producer count |
+| `--consumers` | `4` | Consumer count |
+| `--acks` | `1` | Required acks: -1, 0, 1 |
+| `--throughput` | `100000` | Records/sec cap (-1 = unlimited) |
+| `--warmup-records` | `50000` | Warmup records |
+| `--reporting-interval` | `60000` | Report interval in ms |
+| `--label` | | Label appended to output filename |
 
-### 5. Run Benchmarks
-
-All benchmark commands run from the **bench instance**. Always use `--net host`.
-
-#### Create a topic
+### `down` — Tear down infrastructure
 
 ```bash
-ssh ec2-user@<bench_public_ip> 'docker run --rm --net host \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  create-topic \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-test \
-  -partitions 6'
+./scripts/bench-aws.py down
 ```
 
-#### Sustained-load produce benchmark (1 hour)
+### `status` — Check benchmark progress
 
 ```bash
-# 100K records/sec for 1 hour = 360M records + 50K warmup
-# Report every 60 seconds for time-series plotting
-ssh ec2-user@<bench_public_ip> 'docker run -d --name bench-1h \
-  --net host -v /tmp/results:/results \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  produce \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-1h \
-  -num-records 360050000 \
-  -record-size 1024 \
-  -producers 4 \
-  -acks -1 \
-  -throughput 100000 \
-  -warmup-records 50000 \
-  -reporting-interval 60000 \
-  -json-output /results/bench-1h.jsonl'
-
-# Monitor progress
-ssh ec2-user@<bench_public_ip> 'docker logs --tail 5 bench-1h'
+./scripts/bench-aws.py status
 ```
 
-#### Sustained-load produce benchmark (6 hours)
+Shows container status and recent logs on both instances.
+
+### `ssh-klite` / `ssh-bench` — Interactive SSH
 
 ```bash
-# 100K/sec for 6 hours = 2.16B records + 50K warmup
-ssh ec2-user@<bench_public_ip> 'docker run -d --name bench-6h \
-  --net host -v /tmp/results:/results \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  produce \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-6h \
-  -num-records 2160050000 \
-  -record-size 1024 \
-  -producers 4 \
-  -acks -1 \
-  -throughput 100000 \
-  -warmup-records 50000 \
-  -reporting-interval 60000 \
-  -json-output /results/bench-6h.jsonl'
+./scripts/bench-aws.py ssh-klite
+./scripts/bench-aws.py ssh-bench
 ```
 
-#### Max-throughput produce benchmark
+## Benchmark Recipes
+
+### 1-hour produce-consume (default)
 
 ```bash
-ssh ec2-user@<bench_public_ip> 'docker run --rm --net host \
-  -v /tmp/results:/results \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  produce \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-test \
-  -num-records 1000000 \
-  -record-size 1024 \
-  -producers 4 \
-  -acks -1 \
-  -warmup-records 10000 \
-  -json-output /results/produce-max.jsonl'
+./scripts/bench-aws.py run
 ```
 
-#### Consume benchmark
+100K rec/s, 4 producers, 4 consumers, acks=1, 1KB records, 6 partitions.
+
+### 6-hour endurance
 
 ```bash
-ssh ec2-user@<bench_public_ip> 'docker run --rm --net host \
-  -v /tmp/results:/results \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  consume \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-test \
-  -num-records 1000000 \
-  -consumers 4 \
-  -json-output /results/consume.jsonl'
+./scripts/bench-aws.py run --num-records 2160050000 --label 6h
 ```
 
-#### Delete a topic
+### Max-throughput produce
 
 ```bash
-ssh ec2-user@<bench_public_ip> 'docker run --rm --net host \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  delete-topic \
-  -bootstrap-server <klite_private_ip>:9092 \
-  -topic bench-test'
+./scripts/bench-aws.py run --mode produce --throughput -1 --num-records 1000000 --label max-throughput
 ```
 
-## klite-bench CLI Reference
+### Multiple runs with different settings
 
-```
-klite-bench produce [flags]        Run producer throughput/latency test
-klite-bench consume [flags]        Run consumer throughput test
-klite-bench create-topic [flags]   Create a topic
-klite-bench delete-topic [flags]   Delete a topic
-```
+```bash
+./scripts/bench-aws.py up
 
-### produce flags
+./scripts/bench-aws.py run --label acks1
+./scripts/bench-aws.py run --acks -1 --label acks-all
+./scripts/bench-aws.py run --throughput -1 --num-records 5000000 --label burst
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-bootstrap-server` | `localhost:9092` | Broker address(es), comma-separated |
-| `-topic` | `bench` | Topic to produce to |
-| `-num-records` | `1000000` | Total records to produce |
-| `-record-size` | `1000` | Record size in bytes |
-| `-producers` | `1` | Number of concurrent producer clients |
-| `-acks` | `-1` | Required acks: -1 (all/idempotent), 0, 1 |
-| `-throughput` | `-1` | Records/sec cap (-1 = unlimited) |
-| `-batch-max-bytes` | `1048576` | Max bytes per batch (1MB) |
-| `-linger-ms` | `5` | Producer linger in milliseconds |
-| `-max-buffered-records` | `8192` | Max records buffered in client (backpressure) |
-| `-warmup-records` | `0` | Records to discard from stats |
-| `-reporting-interval` | `5000` | Interval in ms between periodic reports |
-| `-json-output` | | Path to JSON Lines time-series file |
-
-### consume flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-bootstrap-server` | `localhost:9092` | Broker address(es), comma-separated |
-| `-topic` | `bench` | Topic to consume from |
-| `-num-records` | `1000000` | Records to consume before stopping |
-| `-consumers` | `1` | Number of concurrent consumers |
-| `-fetch-max-bytes` | `1048576` | Max fetch bytes per partition |
-| `-timeout` | `60000` | Max ms between records before exit |
-| `-reporting-interval` | `5000` | Interval in ms between periodic reports |
-| `-json-output` | | Path to JSON results file |
-
-## JSON Lines Output Format
-
-When `-json-output` is specified, the produce command writes one JSON object
-per line per reporting interval. This is designed for time-series plotting.
-
-Each window line:
-```json
-{
-  "ts": "2026-03-05T15:42:00Z",
-  "elapsed_s": 60.0,
-  "type": "window",
-  "w_records": 1000000,
-  "w_recs_sec": 100000.0,
-  "w_mb_sec": 97.65,
-  "w_avg_ms": 6.2,
-  "w_p50_ms": 6,
-  "w_p95_ms": 9,
-  "w_p99_ms": 10,
-  "w_p999_ms": 16,
-  "w_max_ms": 35,
-  "c_records": 6000000,
-  "c_recs_sec": 100000.0,
-  "c_mb_sec": 97.65,
-  "c_avg_ms": 6.3,
-  "c_max_ms": 35
-}
+./scripts/bench-aws.py down
 ```
 
-Final summary line (type="final") is written at the end.
+Each run produces a separate timestamped file in `tmp/`.
 
-### Plotting with Python
+## Warmup and num-records
 
-```python
-import pandas as pd
-import matplotlib.pyplot as plt
-
-df = pd.read_json("produce.jsonl", lines=True)
-df = df[df["type"] == "window"]
-
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-# Throughput over time
-ax1.plot(df["elapsed_s"] / 3600, df["w_recs_sec"] / 1000, label="records/sec (K)")
-ax1.set_ylabel("Throughput (K records/sec)")
-ax1.legend()
-
-# Latency percentiles over time
-ax2.plot(df["elapsed_s"] / 3600, df["w_p50_ms"], label="p50")
-ax2.plot(df["elapsed_s"] / 3600, df["w_p95_ms"], label="p95")
-ax2.plot(df["elapsed_s"] / 3600, df["w_p99_ms"], label="p99")
-ax2.plot(df["elapsed_s"] / 3600, df["w_p999_ms"], label="p99.9")
-ax2.set_xlabel("Time (hours)")
-ax2.set_ylabel("Latency (ms)")
-ax2.legend()
-
-plt.tight_layout()
-plt.savefig("latency-over-time.png", dpi=150)
-```
-
-## Operational Notes
-
-### Warmup and num-records
-
-The `-warmup-records` count is included in `-num-records`. To get exactly N
-minutes of measured data at rate R, set `num-records = R * N * 60 + warmup`.
+Warmup is included in num-records: `num-records = rate * seconds + warmup`.
 
 | Duration | Rate | Warmup | num-records |
 |----------|------|--------|-------------|
@@ -483,87 +187,84 @@ minutes of measured data at rate R, set `num-records = R * N * 60 + warmup`.
 | 1 hour | 100K/sec | 50K | 360,050,000 |
 | 6 hours | 100K/sec | 50K | 2,160,050,000 |
 
-### Clean start between benchmarks
+## JSONL Output Format
 
-Always start klite fresh between benchmark runs to avoid leftover WAL data
-and S3 objects from prior runs contaminating results:
+Each reporting interval emits one JSON object (type=`window`). A final summary
+(type=`final`) is written at the end.
 
-```bash
-# On klite instance
-ssh ec2-user@<klite_public_ip> 'docker rm -f klite && sudo rm -rf /data/klite/*'
-
-# Clean S3 bucket (from local machine)
-aws s3 rm s3://<s3_bucket>/ --recursive --profile klite-bench
-
-# Then start klite again with docker run ...
+```json
+{"ts":"2026-03-05T15:42:00Z","elapsed_s":60.0,"type":"window","w_records":1000000,"w_recs_sec":100000.0,"w_mb_sec":97.65,"w_avg_ms":6.2,"w_p50_ms":6,"w_p95_ms":9,"w_p99_ms":10,"w_p999_ms":16,"w_max_ms":35,"c_records":6000000,"c_recs_sec":100000.0,"c_mb_sec":97.65,"c_avg_ms":6.3,"c_max_ms":35}
 ```
 
-### Topic lifecycle
+### Plotting
 
-Topics must be explicitly created before and deleted after each benchmark.
-If `create-topic` reports `TOPIC_ALREADY_EXISTS`, use a fresh topic name.
+```python
+import pandas as pd, matplotlib.pyplot as plt
 
-### Verifying broker health after a run
+df = pd.read_json("results.jsonl", lines=True)
+df = df[df["type"] == "window"]
 
-After a benchmark, check klite logs for warnings:
-
-```bash
-ssh ec2-user@<klite_public_ip> 'docker logs klite 2>&1 | grep -iE "error|warn|fail|emergency|force-del"'
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+ax1.plot(df["elapsed_s"] / 3600, df["w_recs_sec"] / 1000)
+ax1.set_ylabel("Throughput (K rec/sec)")
+for p in ["w_p50_ms", "w_p95_ms", "w_p99_ms", "w_p999_ms"]:
+    ax2.plot(df["elapsed_s"] / 3600, df[p], label=p.replace("w_", "").replace("_ms", ""))
+ax2.set_xlabel("Time (hours)"); ax2.set_ylabel("Latency (ms)"); ax2.legend()
+plt.tight_layout(); plt.savefig("latency-over-time.png", dpi=150)
 ```
 
-Key things to look for:
-- `force-deleted WAL segment (disk limit exceeded)` — WAL segments deleted
-  before S3 flush, indicating data loss
-- `emergency flush triggered by WAL pressure` — flusher detected WAL pressure
-- `S3 partition flush failed` — S3 upload errors
+## MSK Comparison
 
-### Downloading results
+To benchmark against MSK instead of klite, enable the MSK cluster in
+`bench.tfvars` and SSH into the bench instance to run the bench container
+directly against the MSK bootstrap servers.
 
 ```bash
-# From your local machine
-scp ec2-user@<bench_public_ip>:/tmp/results/bench-1h.jsonl tmp/
+# In bench.tfvars: enable_msk = true
+./scripts/bench-aws.py up   # ~20 min extra for MSK provisioning
+
+# Get the MSK bootstrap servers
+cd infra/bench && terraform output msk_bootstrap_plaintext
+
+# SSH in and run benchmarks manually against MSK
+./scripts/bench-aws.py ssh-bench
 ```
 
-## Enable MSK (for comparison)
+## Terraform Details
 
-```bash
-# Edit bench.tfvars
-enable_msk = true
+The terraform configuration in `infra/bench/` creates:
 
-# Apply (takes ~20 minutes, costs ~$0.72/hr)
-terraform apply -var-file=bench.tfvars
-```
+- SSH key pair, security group
+- 2 ECR repositories (klite, klite-bench)
+- IAM role with ECR pull + SSM + S3 access
+- S3 bucket (`klite-bench-data-<random>`, force_destroy=true)
+- EC2 klite instance (spot by default, gp3 100GB / 3000 IOPS / 125 MB/s)
+- EC2 bench instance (spot by default, gp3 20GB)
 
-Then run the same benchmarks against the MSK bootstrap servers:
+Spot instances are enabled by default (`use_spot = true` in variables.tf).
+Set `use_spot = false` in `bench.tfvars` to use on-demand instances.
 
-```bash
-ssh ec2-user@<bench_public_ip> 'docker run --rm --net host \
-  -v /tmp/results:/results \
-  655506454434.dkr.ecr.eu-west-1.amazonaws.com/klite-bench:latest \
-  produce \
-  -bootstrap-server <msk_bootstrap_plaintext> \
-  -topic bench-test \
-  ...'
-```
+## Troubleshooting
 
-## Tear Down
+**SSH connection refused right after `up`**: The userdata script installs
+Docker on boot. The script waits up to 120s for SSH, but if Docker isn't
+ready yet, use `./scripts/bench-aws.py status` to check.
 
-```bash
-# Destroy all AWS resources (including S3 bucket and contents)
-cd infra/bench
-terraform destroy -var-file=bench.tfvars
-```
+**Benchmark exits immediately**: Check klite logs with
+`./scripts/bench-aws.py ssh-klite` then `docker logs klite`. Look for
+`force-deleted WAL segment` (data loss), `emergency flush` (WAL pressure),
+or `S3 partition flush failed` (upload errors).
 
-## Cost Estimate
+**ECR login failures**: Verify your AWS profile is configured:
+`aws sts get-caller-identity --profile klite-bench`
 
-| Resource | Cost |
-|----------|------|
-| m7g.xlarge EC2 (klite) | ~$0.15/hr |
-| m7g.large EC2 (bench) | ~$0.08/hr |
-| gp3 100GB + 20GB | ~$0.01/hr |
-| S3 | negligible |
-| MSK 3x kafka.m7g.large (if enabled) | ~$0.72/hr |
-| **Total without MSK** | **~$0.24/hr** |
-| **Total with MSK** | **~$0.96/hr** |
+## Cost
 
-Remember to `terraform destroy` when done.
+| Resource | $/hr (on-demand) | $/hr (spot, typical) |
+|----------|------------------|----------------------|
+| m7g.xlarge (klite) | ~0.15 | ~0.06 |
+| m7g.large (bench) | ~0.08 | ~0.03 |
+| gp3 120GB total | ~0.01 | ~0.01 |
+| MSK 3x kafka.m7g.large | ~0.72 | ~0.72 |
+| **Without MSK** | **~0.24** | **~0.10** |
+| **With MSK** | **~0.96** | **~0.82** |

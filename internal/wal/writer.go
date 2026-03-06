@@ -71,6 +71,15 @@ type Writer struct {
 	nextSeq  atomic.Uint64
 	walDir   string
 
+	// Async segment pre-creation. A background goroutine creates the next
+	// segment file and fsyncs the directory, then delivers it via preCreateCh.
+	// The writer goroutine reads from the channel and parks the result in
+	// preCreated. No locks needed: only the writer goroutine touches
+	// preCreated, and only the background goroutine sends on the channel.
+	preCreated         *segmentInfo
+	preCreateCh        chan *segmentInfo // background -> writer goroutine
+	preCreateInflight  bool             // owned by writer goroutine
+
 	// Disk usage tracking (for segment cleanup)
 	diskUsage atomic.Int64 // total bytes across all WAL segment files
 
@@ -103,14 +112,15 @@ func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
 	}
 
 	w := &Writer{
-		cfg:       cfg,
-		idx:       idx,
-		logger:    cfg.Logger,
-		writeCh:   make(chan writeRequest, 4096),
-		cleanupCh: make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
-		done:      make(chan struct{}),
-		walDir:    walDir,
+		cfg:         cfg,
+		idx:         idx,
+		logger:      cfg.Logger,
+		writeCh:     make(chan writeRequest, 4096),
+		cleanupCh:   make(chan struct{}, 1),
+		preCreateCh: make(chan *segmentInfo, 1),
+		stopCh:      make(chan struct{}),
+		done:        make(chan struct{}),
+		walDir:      walDir,
 	}
 
 	return w, nil
@@ -276,6 +286,12 @@ func (w *Writer) run() {
 			pending = append(pending, req)
 		case <-ticker.C:
 			// fall through to drain
+		case seg := <-w.preCreateCh:
+			if seg != nil {
+				w.preCreated = seg
+			}
+			w.preCreateInflight = false
+			continue
 		case <-w.cleanupCh:
 			w.tryCleanupSegmentsLocked()
 			continue
@@ -291,6 +307,11 @@ func (w *Writer) run() {
 			select {
 			case req := <-w.writeCh:
 				pending = append(pending, req)
+			case seg := <-w.preCreateCh:
+				if seg != nil {
+					w.preCreated = seg
+				}
+				w.preCreateInflight = false
 			default:
 				break drainLoop
 			}
@@ -321,6 +342,9 @@ func (w *Writer) run() {
 			close(req.doneCh)
 		}
 		pending = pending[:0] // reuse slice
+
+		// Kick off async pre-creation if needed
+		w.maybePreCreateSegment()
 	}
 }
 
@@ -396,7 +420,9 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 	}
 }
 
-// rotateSegment closes the current segment and creates a new one.
+// rotateSegment closes the current segment and switches to the next one.
+// If a segment was pre-created, it is used directly (fast path: just a file
+// close, no file creation or directory fsync on the hot path).
 func (w *Writer) rotateSegment() error {
 	// Fsync and close current segment
 	if w.cfg.FsyncEnabled {
@@ -408,25 +434,64 @@ func (w *Writer) rotateSegment() error {
 		w.logger.Warn("WAL segment rotation: close error on old segment", "err", err)
 	}
 
-	// Create new segment
-	newSeq := w.nextSeq.Load()
-	seg, err := w.createSegment(newSeq)
-	if err != nil {
-		return err
-	}
+	if w.preCreated != nil {
+		// Fast path: use the pre-created segment.
+		w.current = w.preCreated
+		w.segments = append(w.segments, w.preCreated)
+		w.preCreated = nil
+	} else {
+		// Slow path: create inline (only happens if writes outpace
+		// pre-creation, e.g. very large batches).
+		newSeq := w.nextSeq.Load()
+		seg, err := w.createSegment(newSeq)
+		if err != nil {
+			return err
+		}
+		w.current = seg
+		w.segments = append(w.segments, seg)
 
-	w.current = seg
-	w.segments = append(w.segments, seg)
-
-	// Fsync the directory to make the new entry durable
-	dir, err := os.Open(w.walDir)
-	if err == nil {
-		dir.Sync()
-		dir.Close()
+		dir, err := os.Open(w.walDir)
+		if err == nil {
+			dir.Sync()
+			dir.Close()
+		}
 	}
 
 	w.tryCleanupSegmentsLocked()
 	return nil
+}
+
+// maybePreCreateSegment kicks off a background goroutine to create the next
+// segment file if one isn't already ready or in flight. The goroutine creates
+// the file, fsyncs the directory, and delivers the result on preCreateCh.
+// The writer goroutine picks it up in the main select loop.
+func (w *Writer) maybePreCreateSegment() {
+	if w.preCreated != nil || w.preCreateInflight {
+		return
+	}
+	w.preCreateInflight = true
+
+	walDir := w.walDir
+	newSeq := w.nextSeq.Load()
+	logger := w.logger
+
+	go func() {
+		seg, err := w.createSegment(newSeq)
+		if err != nil {
+			logger.Warn("async pre-create segment failed", "err", err)
+			// Send nil so the writer goroutine clears the inflight flag.
+			w.preCreateCh <- nil
+			return
+		}
+
+		dir, err := os.Open(walDir)
+		if err == nil {
+			dir.Sync()
+			dir.Close()
+		}
+
+		w.preCreateCh <- seg
+	}()
 }
 
 // TryCleanupSegments signals the writer goroutine to scan the segment list
@@ -595,11 +660,23 @@ func (w *Writer) scanExistingSegments() ([]uint64, error) {
 	return seqs, nil
 }
 
-// closeSegments closes all open segment files.
+// closeSegments closes all open segment files, including any in-flight
+// pre-created segment that hasn't been delivered yet.
 func (w *Writer) closeSegments() {
 	if w.current != nil && w.current.file != nil {
 		w.current.file.Close()
 		w.current.file = nil
+	}
+	if w.preCreated != nil && w.preCreated.file != nil {
+		w.preCreated.file.Close()
+		w.preCreated.file = nil
+	}
+	// Drain any in-flight pre-create result so the goroutine doesn't leak.
+	if w.preCreateInflight {
+		seg := <-w.preCreateCh
+		if seg != nil && seg.file != nil {
+			seg.file.Close()
+		}
 	}
 }
 

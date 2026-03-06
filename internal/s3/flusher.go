@@ -82,7 +82,7 @@ func NewFlusher(cfg FlusherConfig, provider PartitionProvider) *Flusher {
 		cfg.FlushInterval = 60 * time.Second
 	}
 	if cfg.CheckInterval == 0 {
-		cfg.CheckInterval = 5 * time.Second
+		cfg.CheckInterval = 1 * time.Second
 	}
 	if cfg.CheckInterval > cfg.FlushInterval {
 		cfg.CheckInterval = cfg.FlushInterval

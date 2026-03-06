@@ -48,8 +48,9 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 			raw := make([]byte, len(controlBatch))
 			copy(raw, controlBatch)
 
+			spare := pd.AcquireSpareChunk(len(raw))
 			pd.Lock()
-			baseOffset := pd.PushBatch(raw, meta)
+			baseOffset, spare := pd.PushBatch(raw, meta, spare)
 			// Remove open txn tracking
 			pd.RemoveOpenTxn(endState.ProducerID)
 			// If aborting, record the aborted transaction index entry
@@ -63,6 +64,7 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 				}
 			}
 			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
 			pd.NotifyWaiters()
 		}
 

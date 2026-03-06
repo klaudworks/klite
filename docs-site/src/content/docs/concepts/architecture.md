@@ -3,16 +3,7 @@ title: Architecture
 description: How klite works -- single-binary design, WAL + S3 storage, and performance model.
 ---
 
-klite is a Kafka-compatible broker designed around simplicity: one Go binary, one process, zero external dependencies.
-
-## Design philosophy
-
-Traditional Kafka requires multiple brokers, a controller quorum (KRaft or ZooKeeper), and careful operational tuning. klite takes a different approach:
-
-- **Single binary** -- Download and run. No JVM, no classpath, no cluster coordination.
-- **Single broker** -- No replication, no leader election, no inter-broker RPCs. Durability comes from S3, not replicas.
-- **WAL + S3** -- Hot data lives in a local write-ahead log (WAL) on fast storage. Cold data is flushed to S3 for durability and cost efficiency.
-- **Pass-through bytes** -- klite never decodes individual records. RecordBatches are opaque byte slices: read header, assign offset, store, serve. No deserialization, no re-serialization.
+klite is a Kafka-compatible broker designed around simplicity: one Go binary, one process, zero external dependencies. See [Design Philosophy](/concepts/design-philosophy/) for the motivation behind these choices.
 
 ## Data flow
 
@@ -145,8 +136,3 @@ klite is **not** a fit when:
 | **Operations** | Single process | Complex | Medium | Medium |
 | **Best for** | Small/medium, dev, edge | Large-scale production | Medium/large production | Cloud-native, large-scale |
 
-## Next steps
-
-- [Storage](/concepts/storage/) -- deep dive into WAL format, S3 flushing, and retention
-- [Compatibility](/concepts/compatibility/) -- supported Kafka APIs and client libraries
-- [Configuration](/guides/configuration/) -- tune klite for your workload
