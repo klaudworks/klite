@@ -240,6 +240,8 @@ func (b *Broker) Run(ctx context.Context) error {
 		if err := b.initS3(); err != nil {
 			return fmt.Errorf("init S3: %w", err)
 		}
+	} else {
+		b.logger.Warn("no S3 bucket configured; data is stored only in the local WAL — this is suitable for demos but data loss will occur when the WAL exceeds --wal-max-disk-size and old segments are deleted, or if the disk is lost")
 	}
 
 	// 5. Start TCP listener
@@ -474,14 +476,19 @@ func (b *Broker) initWAL() error {
 
 	b.walWriter = w
 
-	// Initialize chunk pool on all partitions BEFORE replay so that
-	// PushBatch can write data into chunks during WAL replay.
-	poolMem := b.cfg.ChunkPoolMemory
-	if poolMem == 0 {
-		poolMem = 512 * 1024 * 1024 // 512 MiB
+	// Initialize chunk pool only when S3 is configured. The pool exists
+	// solely for the S3 flush pipeline — without a flusher, chunks are
+	// never released and producers would deadlock on Acquire().
+	// When S3 is disabled, all reads are served from the WAL.
+	var pool *chunk.Pool
+	if b.cfg.S3Bucket != "" {
+		poolMem := b.cfg.ChunkPoolMemory
+		if poolMem == 0 {
+			poolMem = 512 * 1024 * 1024 // 512 MiB
+		}
+		pool = chunk.NewPool(poolMem, cluster.DefaultMaxMessageBytes)
+		b.chunkPool = pool
 	}
-	pool := chunk.NewPool(poolMem, cluster.DefaultMaxMessageBytes)
-	b.chunkPool = pool
 	b.state.SetWALConfig(w, idx, pool)
 
 	// Replay existing WAL entries to rebuild state
