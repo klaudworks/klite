@@ -69,6 +69,7 @@ type Writer struct {
 	segments []*segmentInfo
 	current  *segmentInfo
 	nextSeq  atomic.Uint64
+	segSeq   uint64 // monotonic segment filename counter, owned by writer goroutine
 	walDir   string
 
 	// Async segment pre-creation. A background goroutine creates the next
@@ -142,6 +143,7 @@ func (w *Writer) Start() error {
 			return fmt.Errorf("open last segment: %w", err)
 		}
 		w.current = seg
+		w.segSeq = lastSeq + 1
 
 		// Track all segments
 		for _, seq := range existingSeqs {
@@ -164,6 +166,7 @@ func (w *Writer) Start() error {
 		}
 		w.current = seg
 		w.segments = []*segmentInfo{seg}
+		w.segSeq = 1
 	}
 
 	// Initialize diskUsage from existing segments
@@ -463,8 +466,9 @@ func (w *Writer) rotateSegment() error {
 	} else {
 		// Slow path: create inline (only happens if writes outpace
 		// pre-creation, e.g. very large batches).
-		newSeq := w.nextSeq.Load()
-		seg, err := w.createSegment(newSeq)
+		seq := w.segSeq
+		w.segSeq++
+		seg, err := w.createSegment(seq)
 		if err != nil {
 			return err
 		}
@@ -493,7 +497,8 @@ func (w *Writer) maybePreCreateSegment() {
 	w.preCreateInflight = true
 
 	walDir := w.walDir
-	newSeq := w.nextSeq.Load()
+	newSeq := w.segSeq
+	w.segSeq++
 	logger := w.logger
 
 	go func() {
