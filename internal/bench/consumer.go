@@ -12,7 +12,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// ConsumerConfig holds consumer benchmark configuration.
 type ConsumerConfig struct {
 	Brokers           []string
 	Topic             string
@@ -25,7 +24,6 @@ type ConsumerConfig struct {
 	Out               io.Writer
 }
 
-// DefaultConsumerConfig returns sensible defaults.
 func DefaultConsumerConfig() ConsumerConfig {
 	return ConsumerConfig{
 		Brokers:           []string{"localhost:9092"},
@@ -39,7 +37,6 @@ func DefaultConsumerConfig() ConsumerConfig {
 	}
 }
 
-// ConsumerResult holds the final metrics from a consumer run.
 type ConsumerResult struct {
 	Records    int64
 	Bytes      int64
@@ -74,7 +71,6 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Create all consumers. Each gets a static InstanceID to avoid rebalance churn.
 	clients := make([]*kgo.Client, cfg.NumConsumers)
 	for i := 0; i < cfg.NumConsumers; i++ {
 		opts := []kgo.Opt{
@@ -87,7 +83,6 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 		}
 		client, err := kgo.NewClient(opts...)
 		if err != nil {
-			// Close any already-created clients.
 			for j := 0; j < i; j++ {
 				clients[j].Close()
 			}
@@ -101,7 +96,6 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 		}
 	}()
 
-	// Start polling goroutines.
 	doneCh := make(chan struct{})
 	for i := 0; i < cfg.NumConsumers; i++ {
 		go func(client *kgo.Client) {
@@ -138,7 +132,6 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 		}(clients[i])
 	}
 
-	// Monitor loop.
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 

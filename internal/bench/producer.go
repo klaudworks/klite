@@ -12,7 +12,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// ProducerConfig holds producer benchmark configuration.
 type ProducerConfig struct {
 	Brokers            []string
 	Topic              string
@@ -30,7 +29,6 @@ type ProducerConfig struct {
 	JSONOut            io.Writer // JSON Lines time-series output (nil = disabled)
 }
 
-// DefaultProducerConfig returns sensible defaults.
 func DefaultProducerConfig() ProducerConfig {
 	return ProducerConfig{
 		Brokers:            []string{"localhost:9092"},
@@ -48,7 +46,6 @@ func DefaultProducerConfig() ProducerConfig {
 	}
 }
 
-// ProducerResult holds the final metrics from a producer run.
 type ProducerResult struct {
 	Records     int64
 	Bytes       int64
@@ -123,7 +120,6 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 		return result, fmt.Errorf("%d records failed", result.Errors)
 	}
 
-	// Check for client-level errors (connection failures etc).
 	for _, err := range errs {
 		if err != nil {
 			return result, err

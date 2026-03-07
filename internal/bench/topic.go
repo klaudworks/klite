@@ -8,8 +8,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// CreateTopic creates a topic with the given partition count.
-// Returns nil if the topic already exists.
 func CreateTopic(ctx context.Context, brokers []string, topic string, partitions int32) error {
 	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
@@ -36,7 +34,6 @@ func CreateTopic(ctx context.Context, brokers []string, topic string, partitions
 	return nil
 }
 
-// DeleteTopic deletes a topic. Returns nil if the topic doesn't exist.
 func DeleteTopic(ctx context.Context, brokers []string, topic string) error {
 	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {

@@ -38,7 +38,6 @@ var (
 	}
 )
 
-// PayloadGenerator builds semi-random JSON payloads of a target size.
 // Not safe for concurrent use — each goroutine needs its own instance.
 type PayloadGenerator struct {
 	targetSize int
@@ -46,8 +45,6 @@ type PayloadGenerator struct {
 	rng        *mrand.Rand
 }
 
-// NewPayloadGenerator creates a generator that produces JSON payloads of
-// exactly targetSize bytes.
 func NewPayloadGenerator(targetSize int) *PayloadGenerator {
 	return &PayloadGenerator{
 		targetSize: targetSize,
@@ -56,7 +53,6 @@ func NewPayloadGenerator(targetSize int) *PayloadGenerator {
 	}
 }
 
-// appendHex writes n random hex characters into b.
 func (g *PayloadGenerator) appendHex(b []byte, n int) []byte {
 	for range n {
 		b = append(b, hexChars[g.rng.IntN(16)])
@@ -64,7 +60,6 @@ func (g *PayloadGenerator) appendHex(b []byte, n int) []byte {
 	return b
 }
 
-// appendUUID writes a random UUID-format string (36 chars) into b.
 func (g *PayloadGenerator) appendUUID(b []byte) []byte {
 	b = g.appendHex(b, 8)
 	b = append(b, '-')
@@ -79,7 +74,7 @@ func (g *PayloadGenerator) appendUUID(b []byte) []byte {
 }
 
 // Generate builds a JSON payload of exactly g.targetSize bytes.
-// The returned slice is valid until the next call to Generate.
+// The returned slice is only valid until the next call to Generate.
 func (g *PayloadGenerator) Generate() []byte {
 	b := g.buf[:0]
 

@@ -5,9 +5,8 @@ import (
 	"time"
 )
 
-// ThroughputThrottler limits throughput to approximately targetThroughput
-// records/sec. Mirrors Kafka's ThroughputThrottler: accumulates a sleep
-// deficit and sleeps when it exceeds 2ms.
+// ThroughputThrottler limits throughput by accumulating a sleep deficit
+// and sleeping when it exceeds 2ms (mirrors Kafka's ThroughputThrottler).
 type ThroughputThrottler struct {
 	targetThroughput float64
 	startTime        time.Time
@@ -20,8 +19,6 @@ type ThroughputThrottler struct {
 
 const minSleepNs = 2_000_000 // 2ms
 
-// NewThroughputThrottler creates a throttler. If targetThroughput < 0, no
-// throttling occurs.
 func NewThroughputThrottler(targetThroughput float64, startTime time.Time) *ThroughputThrottler {
 	sleepTimeNs := int64(0)
 	if targetThroughput > 0 {
@@ -34,7 +31,6 @@ func NewThroughputThrottler(targetThroughput float64, startTime time.Time) *Thro
 	}
 }
 
-// ShouldThrottle returns true if the caller should call Throttle().
 func (t *ThroughputThrottler) ShouldThrottle(amountSoFar int64, sendStart time.Time) bool {
 	if t.targetThroughput < 0 {
 		return false
@@ -43,7 +39,6 @@ func (t *ThroughputThrottler) ShouldThrottle(amountSoFar int64, sendStart time.T
 	return elapsedSec > 0 && (float64(amountSoFar)/elapsedSec) > t.targetThroughput
 }
 
-// Throttle sleeps to maintain the target throughput.
 func (t *ThroughputThrottler) Throttle() {
 	if t.targetThroughput == 0 {
 		// Block indefinitely until woken.
@@ -65,7 +60,6 @@ func (t *ThroughputThrottler) Throttle() {
 	}
 }
 
-// Wakeup unblocks a throttler sleeping with targetThroughput == 0.
 func (t *ThroughputThrottler) Wakeup() {
 	t.mu.Lock()
 	t.wakeup = true

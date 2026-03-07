@@ -13,7 +13,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// ProduceConsumeConfig holds configuration for the combined benchmark.
 type ProduceConsumeConfig struct {
 	Brokers            []string
 	Topic              string
@@ -33,7 +32,6 @@ type ProduceConsumeConfig struct {
 	JSONOut            io.Writer
 }
 
-// DefaultProduceConsumeConfig returns sensible defaults.
 func DefaultProduceConsumeConfig() ProduceConsumeConfig {
 	return ProduceConsumeConfig{
 		Brokers:            []string{"localhost:9092"},
@@ -53,7 +51,6 @@ func DefaultProduceConsumeConfig() ProduceConsumeConfig {
 	}
 }
 
-// ProduceConsumeResult holds the final metrics.
 type ProduceConsumeResult struct {
 	ProducerResult
 	Consumed int64
@@ -84,7 +81,6 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 	var produceDone atomic.Bool
 	expectedRecords := cfg.NumRecords // warmup is extra, NumRecords = measured
 
-	// Start consumers first so they're ready when records arrive.
 	consumerCtx, consumerCancel := context.WithCancel(ctx)
 	defer consumerCancel()
 
@@ -118,8 +114,6 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 		}(client)
 	}
 
-	// Start producers. Distribute measured records and warmup evenly.
-	// Each producer sends warmup + measured records (warmup first).
 	baseMeasured := cfg.NumRecords / int64(cfg.NumProducers)
 	measuredRemainder := cfg.NumRecords % int64(cfg.NumProducers)
 	baseWarmup := cfg.WarmupRecords / int64(cfg.NumProducers)
@@ -150,14 +144,11 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 		}(p, totalForProducer, warmup)
 	}
 
-	// Wait for producers to finish.
 	producerWg.Wait()
 	produceDone.Store(true)
 
-	// Wait for consumers to drain.
 	consumerWg.Wait()
 
-	// Close consumer clients.
 	for _, c := range consumerClients {
 		c.Close()
 	}
@@ -172,7 +163,6 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 		Consumed:       stats.CumConsumed(),
 	}
 
-	// Sanity check.
 	produced := result.Records
 	consumed := pcResult.Consumed
 	if consumed == produced {
@@ -238,8 +228,6 @@ func runPCProducer(ctx context.Context, cfg ProduceConsumeConfig, epoch time.Tim
 
 		val := gen.GenerateCopy()
 
-		// Encode key: warmup flag + monotonic timestamp.
-		// Warmup is determined by the loop counter, not by async callbacks.
 		isWarmup := i < warmupRecords
 		if isWarmup {
 			keyBuf[0] = 0x00

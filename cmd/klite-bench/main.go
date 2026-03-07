@@ -110,7 +110,6 @@ func runProduce(args []string) error {
 	cfg.BatchMaxBytes = int32(*batchMax)
 	cfg.ReportingInterval = time.Duration(*reportingMs) * time.Millisecond
 
-	// Open JSON Lines output file if requested.
 	if jsonOut != "" {
 		f, err := os.Create(jsonOut)
 		if err != nil {
@@ -263,7 +262,6 @@ func runS3Count(args []string) error {
 	}
 	client := s3.NewFromConfig(cfg)
 
-	// List all objects under prefix.
 	type objEntry struct {
 		Key  string
 		Size int64
@@ -283,29 +281,58 @@ func runS3Count(args []string) error {
 		}
 	}
 
+	var dataObjects []objEntry
+	for _, obj := range objects {
+		if !strings.HasSuffix(obj.Key, "metadata.log") {
+			dataObjects = append(dataObjects, obj)
+		}
+	}
+
+	type footerResult struct {
+		key     string
+		records int64
+		err     error
+	}
+
+	const workers = 64
+	work := make(chan objEntry, len(dataObjects))
+	results := make(chan footerResult, len(dataObjects))
+
+	for range workers {
+		go func() {
+			for obj := range work {
+				footer, err := fetchFooter(ctx, client, *bucket, obj.Key, obj.Size)
+				if err != nil {
+					results <- footerResult{key: obj.Key, err: err}
+					continue
+				}
+				results <- footerResult{key: obj.Key, records: footer.TotalRecordCount()}
+			}
+		}()
+	}
+
+	for _, obj := range dataObjects {
+		work <- obj
+	}
+	close(work)
+
 	var totalRecords int64
 	var totalObjects int
 	partitionRecords := map[string]int64{}
 
-	for _, obj := range objects {
-		if strings.HasSuffix(obj.Key, "metadata.log") {
+	for range dataObjects {
+		r := <-results
+		if r.err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: %s: %v\n", r.key, r.err)
 			continue
 		}
-
-		footer, err := fetchFooter(ctx, client, *bucket, obj.Key, obj.Size)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: %s: %v\n", obj.Key, err)
-			continue
-		}
-
-		records := footer.TotalRecordCount()
-		totalRecords += records
+		totalRecords += r.records
 		totalObjects++
 
-		parts := strings.Split(obj.Key, "/")
+		parts := strings.Split(r.key, "/")
 		if len(parts) >= 2 {
 			partKey := parts[len(parts)-2]
-			partitionRecords[partKey] += records
+			partitionRecords[partKey] += r.records
 		}
 	}
 

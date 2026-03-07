@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// WindowSnapshot is one JSON Lines entry written every reporting interval.
 type WindowSnapshot struct {
 	TimestampUTC string  `json:"ts"`
 	ElapsedSec   float64 `json:"elapsed_s"`
@@ -111,14 +110,12 @@ func NewStats(numRecords, warmupRecords int64, reportingInterval time.Duration, 
 	}
 }
 
-// SetJSONOutput sets the writer for JSON Lines time-series output.
 func (s *Stats) SetJSONOutput(w io.Writer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.jsonOut = w
 }
 
-// EnableE2E turns on end-to-end latency tracking for produce-consume mode.
 func (s *Stats) EnableE2E() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,7 +187,6 @@ func (s *Stats) emitWindow(now time.Time) {
 	wAvgLatency := float64(s.windowTotalLatency) / float64(max64(s.windowCount, 1))
 	percs := percentiles(s.windowLatencies, 0.5, 0.95, 0.99, 0.999)
 
-	// Track for final summary.
 	s.allWindowP50 = append(s.allWindowP50, percs[0])
 	s.allWindowP95 = append(s.allWindowP95, percs[1])
 	s.allWindowP99 = append(s.allWindowP99, percs[2])
@@ -221,7 +217,6 @@ func (s *Stats) emitWindow(now time.Time) {
 		s.allWindowE2EP999 = append(s.allWindowE2EP999, e2ePercs[3])
 	}
 
-	// Cumulative.
 	totalElapsedMs := now.Sub(s.start).Milliseconds()
 	if totalElapsedMs == 0 {
 		totalElapsedMs = 1
@@ -230,7 +225,6 @@ func (s *Stats) emitWindow(now time.Time) {
 	cMBPerSec := 1000.0 * float64(s.bytes) / float64(totalElapsedMs) / (1024.0 * 1024.0)
 	cAvgLatency := float64(s.totalLatency) / float64(max64(s.count, 1))
 
-	// Print human-readable.
 	if s.e2eEnabled {
 		_, _ = fmt.Fprintf(s.out, "%d records sent, %.1f records/sec (%.2f MB/sec), "+
 			"produce %d/%d/%d/%d ms (p50/p95/p99/p999), "+
@@ -246,7 +240,6 @@ func (s *Stats) emitWindow(now time.Time) {
 			percs[0], percs[1], percs[2], percs[3], s.windowMaxLatency)
 	}
 
-	// Write JSON Lines.
 	if s.jsonOut != nil {
 		snap := WindowSnapshot{
 			TimestampUTC:  now.UTC().Format(time.RFC3339),
@@ -290,7 +283,6 @@ func (s *Stats) newWindow(now time.Time) {
 	s.windowLatencies = s.windowLatencies[:0]
 }
 
-// PrintTotal prints the final summary.
 func (s *Stats) PrintTotal() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -334,7 +326,6 @@ func (s *Stats) PrintTotal() {
 			p50, p95, p99, p999)
 	}
 
-	// Write final JSON line.
 	if s.jsonOut != nil {
 		now := time.Now()
 		snap := WindowSnapshot{
@@ -367,7 +358,6 @@ func (s *Stats) PrintTotal() {
 	}
 }
 
-// Result returns the final metrics as a structured ProducerResult.
 func (s *Stats) Result() *ProducerResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,14 +385,12 @@ func (s *Stats) Result() *ProducerResult {
 	}
 }
 
-// TotalCount returns the total number of records recorded.
 func (s *Stats) TotalCount() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.count
 }
 
-// CumConsumed returns the total consumed record count (e2e mode).
 func (s *Stats) CumConsumed() int64 {
 	s.e2eMu.Lock()
 	defer s.e2eMu.Unlock()
