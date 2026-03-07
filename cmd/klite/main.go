@@ -22,7 +22,10 @@ func main() {
 
 	fs := flag.CommandLine
 	cfg.RegisterFlags(fs)
-	fs.Parse(os.Args[1:])
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		slog.Error("failed to parse flags", "error", err)
+		os.Exit(1)
+	}
 
 	if *showVersion {
 		fmt.Println("klite", version)
@@ -33,11 +36,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	b := broker.New(cfg)
 	if err := b.Run(ctx); err != nil {
+		stop()
 		slog.Error("broker failed", "error", err)
 		os.Exit(1)
 	}
+	stop()
 }
