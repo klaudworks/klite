@@ -347,6 +347,67 @@ func TestMetadataLogReplayEntryCRCMismatch(t *testing.T) {
 	}
 }
 
+func TestReplaceFromSnapshotBlocksAppend(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ml, err := NewLog(LogConfig{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ml.Close() }()
+
+	var mu sync.Mutex
+	var topics []CreateTopicEntry
+	ml.SetCallbacks(
+		func(e CreateTopicEntry) {
+			mu.Lock()
+			topics = append(topics, e)
+			mu.Unlock()
+		},
+		func(e DeleteTopicEntry) {},
+		func(e AlterConfigEntry) {},
+		func(e OffsetCommitEntry) {},
+		func(e ProducerIDEntry) {},
+		func(e LogStartOffsetEntry) {},
+	)
+
+	// Build a snapshot with a single CreateTopic entry
+	snapshotEntry := MarshalCreateTopic(&CreateTopicEntry{
+		TopicName:      "snapshot-topic",
+		PartitionCount: 1,
+		TopicID:        [16]byte{0xAA},
+	})
+
+	frameSize := 4 + 4 + len(snapshotEntry)
+	frame := make([]byte, frameSize)
+	binary.BigEndian.PutUint32(frame[0:4], uint32(4+len(snapshotEntry)))
+	binary.BigEndian.PutUint32(frame[4:8], crc32.Checksum(snapshotEntry, crc32cTable))
+	copy(frame[8:], snapshotEntry)
+
+	if err := ml.ReplaceFromSnapshot(frame); err != nil {
+		t.Fatalf("ReplaceFromSnapshot: %v", err)
+	}
+
+	mu.Lock()
+	numTopics := len(topics)
+	mu.Unlock()
+
+	if numTopics != 1 {
+		t.Fatalf("expected 1 topic from snapshot replay, got %d", numTopics)
+	}
+
+	// Verify that subsequent appends work correctly
+	entry2 := MarshalCreateTopic(&CreateTopicEntry{
+		TopicName:      "after-snapshot",
+		PartitionCount: 2,
+		TopicID:        [16]byte{0xBB},
+	})
+	if err := ml.AppendSync(entry2); err != nil {
+		t.Fatalf("AppendSync after snapshot: %v", err)
+	}
+}
+
 func TestMetadataLogReplayEntryThreadSafe(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

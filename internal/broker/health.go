@@ -11,6 +11,7 @@ func (b *Broker) startHealthServer() (shutdown func(), err error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", b.handleLivez)
 	mux.HandleFunc("/readyz", b.handleReadyz)
+	mux.HandleFunc("/primaryz", b.handlePrimaryz)
 
 	srv := &http.Server{
 		Handler:      mux,
@@ -47,14 +48,33 @@ func (b *Broker) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	select {
 	case <-b.ready:
-		// In replication mode, standby returns 503.
-		if b.isStandby() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("standby"))
-			return
-		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		if b.isStandby() {
+			_, _ = w.Write([]byte("standby"))
+		} else {
+			_, _ = w.Write([]byte("ok"))
+		}
+	default:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("not ready"))
+	}
+}
+
+// handlePrimaryz returns 200 only when this broker is the active primary.
+// Load balancers on any platform (Traefik, ECS, HAProxy) can use this
+// endpoint to route Kafka traffic to the primary without platform-specific
+// hooks like Kubernetes pod labels.
+func (b *Broker) handlePrimaryz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	if b.isStandby() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("standby"))
+		return
+	}
+	select {
+	case <-b.ready:
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("primary"))
 	default:
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("not ready"))

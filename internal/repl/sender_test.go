@@ -249,6 +249,116 @@ func TestSenderWriteDeadline(t *testing.T) {
 	s.Close()
 }
 
+func TestSenderKeepaliveNoTimeout(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close() //nolint:errcheck
+
+	s := NewSender(client, 100*time.Millisecond, slog.Default())
+	defer s.Close()
+
+	// Read the keepalive frame in background
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		msgType, payload, err := ReadFrame(server)
+		if err != nil {
+			t.Errorf("ReadFrame: %v", err)
+			return
+		}
+		if msgType != MsgWALBatch {
+			t.Errorf("expected MsgWALBatch, got %#x", msgType)
+			return
+		}
+		_, _, entryCount, _, err := UnmarshalWALBatch(payload)
+		if err != nil {
+			t.Errorf("UnmarshalWALBatch: %v", err)
+			return
+		}
+		if entryCount != 0 {
+			t.Errorf("keepalive entryCount: got %d, want 0", entryCount)
+		}
+	}()
+
+	s.SendKeepalive()
+	<-readDone
+
+	// Wait longer than the ack timeout — should NOT produce any timeout error.
+	// If SendKeepalive were using Send(nil,0,0), a pending[0] entry + AfterFunc
+	// timer would fire after 100ms and log a spurious timeout.
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify the sender is still connected (no spurious disconnect from timeout)
+	if !s.Connected() {
+		t.Fatal("sender should still be connected after keepalive")
+	}
+}
+
+func TestSendEntryCount(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close() //nolint:errcheck
+
+	s := NewSender(client, 5*time.Second, slog.Default())
+	defer s.Close()
+
+	// Build a batch with 3 WAL entries
+	var buf []byte
+	for i := uint64(0); i < 3; i++ {
+		buf = append(buf, makeTestWALEntry(i)...)
+	}
+
+	readDone := make(chan struct{})
+	var gotEntryCount uint32
+	go func() {
+		defer close(readDone)
+		_, payload, err := ReadFrame(server)
+		if err != nil {
+			t.Errorf("ReadFrame: %v", err)
+			return
+		}
+		_, _, gotEntryCount, _, err = UnmarshalWALBatch(payload)
+		if err != nil {
+			t.Errorf("UnmarshalWALBatch: %v", err)
+			return
+		}
+		// ACK
+		_ = WriteFrame(server, MsgACK, MarshalACK(2))
+	}()
+
+	ch := s.Send(buf, 0, 2)
+	<-readDone
+
+	if gotEntryCount != 3 {
+		t.Errorf("entryCount: got %d, want 3", gotEntryCount)
+	}
+
+	select {
+	case err := <-ch:
+		if err != nil {
+			t.Fatalf("Send error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestCountEntries(t *testing.T) {
+	// Build a batch with known entry count
+	var buf []byte
+	for i := uint64(0); i < 5; i++ {
+		buf = append(buf, makeTestWALEntry(i)...)
+	}
+
+	got := countEntries(buf)
+	if got != 5 {
+		t.Errorf("countEntries: got %d, want 5", got)
+	}
+
+	// Empty batch
+	if countEntries(nil) != 0 {
+		t.Error("countEntries(nil) should be 0")
+	}
+}
+
 func TestSenderConnected(t *testing.T) {
 	server, client := net.Pipe()
 

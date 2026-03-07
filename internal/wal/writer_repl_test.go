@@ -519,11 +519,11 @@ func TestAppendReplicated(t *testing.T) {
 	}
 	serialized := MarshalEntry(entry)
 
-	skipped, err := w.AppendReplicated(serialized)
+	written, err := w.AppendReplicated(serialized)
 	if err != nil {
 		t.Fatalf("AppendReplicated: %v", err)
 	}
-	if skipped {
+	if !written {
 		t.Fatal("should not skip on first append")
 	}
 
@@ -577,12 +577,12 @@ func TestAppendReplicatedSegmentRotation(t *testing.T) {
 			Offset:    int64(i),
 			Data:      makeTestBatch(1, 1000),
 		}
-		skipped, err := w.AppendReplicated(MarshalEntry(entry))
+		written, err := w.AppendReplicated(MarshalEntry(entry))
 		if err != nil {
 			t.Fatalf("AppendReplicated %d: %v", i, err)
 		}
-		if skipped {
-			t.Fatalf("entry %d should not be skipped", i)
+		if !written {
+			t.Fatalf("entry %d should have been written", i)
 		}
 	}
 
@@ -633,11 +633,11 @@ func TestAppendReplicatedDuplicateSkip(t *testing.T) {
 		Offset:    50,
 		Data:      makeTestBatch(1, 1000),
 	}
-	skipped, err := w.AppendReplicated(MarshalEntry(old))
+	written, err := w.AppendReplicated(MarshalEntry(old))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !skipped {
+	if written {
 		t.Fatal("entry at seq=50 should be skipped (nextSeq=100)")
 	}
 
@@ -649,12 +649,12 @@ func TestAppendReplicatedDuplicateSkip(t *testing.T) {
 		Offset:    100,
 		Data:      makeTestBatch(1, 1000),
 	}
-	skipped, err = w.AppendReplicated(MarshalEntry(cur))
+	written, err = w.AppendReplicated(MarshalEntry(cur))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if skipped {
-		t.Fatal("entry at seq=100 should not be skipped")
+	if !written {
+		t.Fatal("entry at seq=100 should have been written")
 	}
 
 	if w.NextSequence() != 101 {
@@ -818,3 +818,41 @@ func (p *parallelReplicator) Replicate(batch []byte, firstSeq, lastSeq uint64) <
 }
 
 func (p *parallelReplicator) Connected() bool { return true }
+
+func TestSetReplicatorRaceSafe(t *testing.T) {
+	t.Parallel()
+
+	repl := &batchTrackingReplicator{}
+	w := newTestWriter(t, nil)
+
+	// Concurrently set/clear the replicator while writing entries.
+	// With -race this will detect any data race.
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			w.SetReplicator(repl)
+			time.Sleep(time.Millisecond)
+			w.SetReplicator(nil)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			e := &Entry{
+				TopicID:   [16]byte{1, 2, 3},
+				Partition: 0,
+				Offset:    int64(i),
+				Data:      makeTestBatch(1, 100),
+			}
+			_ = w.Append(e)
+		}
+	}()
+
+	wg.Wait()
+}

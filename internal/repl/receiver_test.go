@@ -12,6 +12,9 @@ import (
 	"github.com/klaudworks/klite/internal/wal"
 )
 
+// Compile-time check: wal.Writer must satisfy WALAppender.
+var _ WALAppender = (*wal.Writer)(nil)
+
 // mockWALAppender is a test double for WALAppender.
 type mockWALAppender struct {
 	mu         sync.Mutex
@@ -534,6 +537,101 @@ func TestReceiverReconnect(t *testing.T) {
 	}
 	if epoch != 7 {
 		t.Errorf("epoch: got %d, want 7", epoch)
+	}
+}
+
+// TestReceiverWithRealWALWriter verifies the full receiver → wal.Writer path.
+// This is the key regression test for Bug #1 (AppendReplicated return value
+// semantics): the real wal.Writer must satisfy the WALAppender interface
+// contract where written=true means the entry was appended and requires fsync.
+func TestReceiverWithRealWALWriter(t *testing.T) {
+	t.Parallel()
+
+	primary, standby := net.Pipe()
+	defer primary.Close() //nolint:errcheck
+
+	// Set up a real wal.Writer
+	dir := t.TempDir()
+	idx := wal.NewIndex()
+	w, err := wal.NewWriter(wal.WriterConfig{
+		Dir:             dir,
+		SyncInterval:    1 * time.Millisecond,
+		SegmentMaxBytes: 64 * 1024 * 1024,
+		FsyncEnabled:    true,
+	}, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	ma := &mockMetaAppender{}
+	r := NewReceiver(w, ma, 0, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = r.RunOnConn(ctx, standby)
+	}()
+
+	// Read HELLO
+	msgType, payload, err := ReadFrame(primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgType != MsgHello {
+		t.Fatalf("expected HELLO, got %#x", msgType)
+	}
+	lastSeq, _, err := UnmarshalHello(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lastSeq != 0 {
+		// nextSeq=0 → lastWALSeq=0 (clamped, can't go negative)
+		if w.NextSequence() > 0 && lastSeq != w.NextSequence()-1 {
+			t.Errorf("unexpected lastSeq in HELLO: %d", lastSeq)
+		}
+	}
+
+	// Build and send a batch of 3 entries
+	var entriesBuf bytes.Buffer
+	for i := uint64(0); i < 3; i++ {
+		entriesBuf.Write(makeTestWALEntry(i))
+	}
+	batch := MarshalWALBatch(0, 2, 3, entriesBuf.Bytes())
+	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read ACK — this proves the receiver successfully wrote + fsync'd
+	msgType, payload, err = ReadFrame(primary)
+	if err != nil {
+		t.Fatalf("ReadFrame ACK: %v", err)
+	}
+	if msgType != MsgACK {
+		t.Fatalf("expected ACK, got %#x", msgType)
+	}
+	ackSeq, err := UnmarshalACK(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ackSeq != 2 {
+		t.Errorf("ACK seq: got %d, want 2", ackSeq)
+	}
+
+	// Verify WAL state
+	if w.NextSequence() != 3 {
+		t.Errorf("nextSeq: got %d, want 3", w.NextSequence())
+	}
+
+	// Verify entries are indexed
+	tp := wal.TopicPartition{TopicID: [16]byte{1, 2, 3}, Partition: 0}
+	idxEntries := idx.Lookup(tp, 0, 1024*1024)
+	if len(idxEntries) != 3 {
+		t.Errorf("expected 3 index entries, got %d", len(idxEntries))
 	}
 }
 
