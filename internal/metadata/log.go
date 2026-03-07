@@ -170,6 +170,13 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 
 // Replay reads all entries and calls the appropriate callback for each.
 func (l *Log) Replay() (int, error) {
+	return l.replayLocked()
+}
+
+// replayLocked is the core replay implementation. It opens its own file
+// handle for reading and does not access l.mu-protected fields, so it is
+// safe to call both with and without l.mu held.
+func (l *Log) replayLocked() (int, error) {
 	f, err := os.Open(l.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -528,11 +535,8 @@ func (l *Log) ReplaceFromSnapshot(data []byte) error {
 	l.file = f
 	l.size = int64(len(data))
 
-	// Replay the snapshot (scan and dispatch all entries)
-	// We unlock mu temporarily since Replay opens its own file handle
-	l.mu.Unlock()
-	_, replayErr := l.Replay()
-	l.mu.Lock()
-
+	// Replay the snapshot to rebuild in-memory state.
+	// replayLocked opens its own file handle for reading, safe under l.mu.
+	_, replayErr := l.replayLocked()
 	return replayErr
 }

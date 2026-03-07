@@ -82,6 +82,7 @@ type Elector struct {
 	role                lease.Role
 	cachedETag          string
 	cachedEpoch         int64
+	cachedPrimaryAddr   string // replAddr from the last-read lease body
 	lastSuccessfulRenew time.Time
 	leaseCancel         context.CancelFunc
 }
@@ -112,6 +113,21 @@ func (e *Elector) Role() lease.Role {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.role
+}
+
+func (e *Elector) Epoch() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.cachedEpoch < 0 {
+		return 0
+	}
+	return uint64(e.cachedEpoch)
+}
+
+func (e *Elector) PrimaryAddr() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cachedPrimaryAddr
 }
 
 func (e *Elector) Run(ctx context.Context, cb lease.Callbacks) error {
@@ -249,6 +265,12 @@ func (e *Elector) tryAcquire(ctx context.Context, cb lease.Callbacks) {
 		e.cfg.Logger.Error("s3 lease: unknown version, refusing to claim", "version", body.Version)
 		return
 	}
+
+	// Cache the current primary's replication address so the standby
+	// can discover it via PrimaryAddr().
+	e.mu.Lock()
+	e.cachedPrimaryAddr = body.ReplAddr
+	e.mu.Unlock()
 
 	elapsed := e.cfg.Clock.Since(body.RenewedAt)
 	if elapsed < e.cfg.LeaseDuration {

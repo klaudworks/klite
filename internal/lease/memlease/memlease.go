@@ -56,6 +56,7 @@ type MemElector struct {
 
 	mu          sync.Mutex
 	role        lease.Role
+	epoch       uint64
 	cb          lease.Callbacks
 	running     bool
 	readyCh     chan struct{}      // closed when Run() has set running=true
@@ -76,6 +77,7 @@ func (m *MemElector) elect() {
 		return
 	}
 	m.role = lease.RolePrimary
+	m.epoch++
 	cb := m.cb
 	running := m.running
 
@@ -150,6 +152,19 @@ func (m *MemElector) Role() lease.Role {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.role
+}
+
+// Epoch returns the current lease epoch.
+func (m *MemElector) Epoch() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epoch
+}
+
+// PrimaryAddr returns "". The memlease doesn't track addresses;
+// integration tests wire the receiver externally.
+func (m *MemElector) PrimaryAddr() string {
+	return ""
 }
 
 // compile-time interface check

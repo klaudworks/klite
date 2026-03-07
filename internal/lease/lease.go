@@ -38,6 +38,15 @@ type Elector interface {
 	// Errors are logged but not fatal — the lease expires naturally
 	// if Release fails.
 	Release() error
+
+	// Epoch returns the current lease epoch. Returns 0 if the epoch
+	// is unknown (e.g. the node has never acquired the lease).
+	Epoch() uint64
+
+	// PrimaryAddr returns the replication address of the current
+	// primary, as read from the lease body. Returns "" if unknown
+	// (e.g. this node is primary, or the lease has never been read).
+	PrimaryAddr() string
 }
 
 // Callbacks are invoked by the Elector on role transitions.

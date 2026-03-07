@@ -11,6 +11,19 @@ import (
 
 var errDisconnected = errors.New("repl: standby disconnected")
 
+// countEntries counts length-prefixed WAL entries in a batch.
+func countEntries(batch []byte) uint32 {
+	var n uint32
+	offset := 0
+	for offset+4 <= len(batch) {
+		entryLen := int(batch[offset])<<24 | int(batch[offset+1])<<16 |
+			int(batch[offset+2])<<8 | int(batch[offset+3])
+		offset += 4 + entryLen
+		n++
+	}
+	return n
+}
+
 // Sender streams WAL batches and metadata entries to a standby over a TCP
 // connection. It is used by the primary side.
 type Sender struct {
@@ -52,7 +65,7 @@ func NewSender(conn net.Conn, ackTimeout time.Duration, logger *slog.Logger) *Se
 func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 	ch := make(chan error, 1)
 
-	payload := MarshalWALBatch(firstSeq, lastSeq, 0, batch)
+	payload := MarshalWALBatch(firstSeq, lastSeq, countEntries(batch), batch)
 
 	s.writeMu.Lock()
 	if s.conn != nil {
@@ -119,6 +132,23 @@ func (s *Sender) SendSnapshot(walSeqAfter uint64, metadataLog []byte) error {
 	s.writeMu.Unlock()
 
 	return err
+}
+
+// SendKeepalive writes an empty WAL_BATCH frame (keepalive) to the standby.
+// Unlike Send, it does not register a pending entry or start a timeout timer.
+func (s *Sender) SendKeepalive() {
+	payload := MarshalWALBatch(0, 0, 0, nil)
+
+	s.writeMu.Lock()
+	if s.conn != nil {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.ackTimeout))
+	}
+	err := WriteFrame(s.conn, MsgWALBatch, payload)
+	s.writeMu.Unlock()
+
+	if err != nil {
+		s.logger.Warn("repl sender: keepalive write failed", "err", err)
+	}
 }
 
 // Replicate implements wal.Replicator. It is an alias for Send.

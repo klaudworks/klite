@@ -16,6 +16,11 @@ import (
 
 const diskCleanupThreshold = 0.9
 
+// wrappedReplicator wraps a Replicator in a concrete type so atomic.Value
+// always stores the same type. A nil Replicator is represented by a
+// wrappedReplicator with a nil inner field.
+type wrappedReplicator struct{ inner Replicator }
+
 // Replicator sends WAL batches to a standby for synchronous replication.
 type Replicator interface {
 	// Replicate sends a batch of serialized WAL entries to the standby.
@@ -104,6 +109,11 @@ type Writer struct {
 
 	// noStandbyWarned tracks whether we've logged the no-standby warning
 	noStandbyWarned bool
+
+	// replicator stores the current Replicator behind an atomic.Value
+	// so SetReplicator (called from the broker goroutine) and run()
+	// (the writer goroutine) don't race. Stores nil or a Replicator.
+	replicator atomic.Value // holds Replicator (or wrappedReplicator)
 }
 
 func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
@@ -138,6 +148,9 @@ func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
 		stopCh:      make(chan struct{}),
 		done:        make(chan struct{}),
 		walDir:      walDir,
+	}
+	if cfg.Replicator != nil {
+		w.replicator.Store(wrappedReplicator{inner: cfg.Replicator})
 	}
 
 	return w, nil
@@ -247,7 +260,10 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 // the entry by the primary. Entries with sequence <= nextSequence-1 are
 // silently skipped (duplicate from reconnect). The caller must call Sync()
 // separately after the batch.
-func (w *Writer) AppendReplicated(serializedEntry []byte) (skipped bool, err error) {
+//
+// Returns written=true if the entry was appended to disk, written=false if
+// skipped (duplicate).
+func (w *Writer) AppendReplicated(serializedEntry []byte) (written bool, err error) {
 	if len(serializedEntry) <= 8+8 {
 		return false, fmt.Errorf("replicated entry too short: %d bytes", len(serializedEntry))
 	}
@@ -255,7 +271,7 @@ func (w *Writer) AppendReplicated(serializedEntry []byte) (skipped bool, err err
 	seq := parseSequence(serializedEntry)
 	currentNext := w.nextSeq.Load()
 	if currentNext > 0 && seq < currentNext {
-		return true, nil
+		return false, nil // duplicate, skip
 	}
 
 	if err := w.appendEntry(serializedEntry); err != nil {
@@ -268,7 +284,7 @@ func (w *Writer) AppendReplicated(serializedEntry []byte) (skipped bool, err err
 		w.TryCleanupSegments()
 	}
 
-	return false, nil
+	return true, nil
 }
 
 // Sync fsyncs the current segment file.
@@ -288,11 +304,19 @@ func (w *Writer) SetNextSequence(seq uint64) {
 }
 
 // SetReplicator dynamically sets or clears the replicator.
-// Must only be called when no writes are in flight (e.g., during
-// promotion/demotion after draining or before starting the listener).
+// Safe to call from any goroutine.
 func (w *Writer) SetReplicator(r Replicator) {
-	w.cfg.Replicator = r
+	w.replicator.Store(wrappedReplicator{inner: r})
 	w.noStandbyWarned = false
+}
+
+// getReplicator returns the current Replicator, or nil if none is set.
+func (w *Writer) getReplicator() Replicator {
+	v := w.replicator.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(wrappedReplicator).inner
 }
 
 func (w *Writer) Stop() {
@@ -383,10 +407,11 @@ func (w *Writer) run() {
 
 		// Phase 2: fsync local + replicate in parallel
 		var replCh <-chan error
-		if written > 0 && w.cfg.Replicator != nil && w.cfg.Replicator.Connected() {
+		repl := w.getReplicator()
+		if written > 0 && repl != nil && repl.Connected() {
 			batch := w.collectBatchBytes(pending[:written])
 			firstSeq, lastSeq := w.batchSeqRange(pending[:written])
-			replCh = w.cfg.Replicator.Replicate(batch, firstSeq, lastSeq)
+			replCh = repl.Replicate(batch, firstSeq, lastSeq)
 		}
 
 		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
@@ -415,7 +440,7 @@ func (w *Writer) run() {
 					req.errCh <- replErr
 				}
 			} else {
-				if w.cfg.Replicator != nil && !w.cfg.Replicator.Connected() {
+				if repl != nil && !repl.Connected() {
 					w.logNoStandbyOnce()
 				}
 				for _, req := range pending[:written] {
@@ -501,10 +526,11 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 	}
 
 	// Best-effort replicate on shutdown (short timeout)
-	if w.cfg.Replicator != nil && written > 0 {
+	repl := w.getReplicator()
+	if repl != nil && written > 0 {
 		batch := w.collectBatchBytes(pending[:written])
 		firstSeq, lastSeq := w.batchSeqRange(pending[:written])
-		replCh := w.cfg.Replicator.Replicate(batch, firstSeq, lastSeq)
+		replCh := repl.Replicate(batch, firstSeq, lastSeq)
 		select {
 		case <-replCh:
 		case <-time.After(2 * time.Second):
