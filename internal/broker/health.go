@@ -7,8 +7,6 @@ import (
 	"time"
 )
 
-// startHealthServer starts the HTTP health server.
-// Returns a cleanup function that shuts down the server gracefully.
 func (b *Broker) startHealthServer() (shutdown func(), err error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", b.handleLivez)

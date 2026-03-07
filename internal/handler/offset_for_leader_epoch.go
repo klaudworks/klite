@@ -7,9 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleOffsetForLeaderEpoch returns the OffsetForLeaderEpoch handler (API key 23).
-// For single-broker, epoch is always 0 (pre-WAL) since there are no restarts
-// without data loss. Epoch tracking becomes meaningful in Phase 3.
 func HandleOffsetForLeaderEpoch(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.OffsetForLeaderEpochRequest)

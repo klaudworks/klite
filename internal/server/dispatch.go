@@ -23,13 +23,11 @@ type ConnContext struct {
 // Used for SASL handlers that need to modify connection-level auth state.
 type ConnHandler func(req kmsg.Request, cc ConnContext) (kmsg.Response, error)
 
-// HandlerRegistry maps API keys to handler functions.
 type HandlerRegistry struct {
 	handlers     map[int16]Handler
 	connHandlers map[int16]ConnHandler
 }
 
-// NewHandlerRegistry creates an empty handler registry.
 func NewHandlerRegistry() *HandlerRegistry {
 	return &HandlerRegistry{
 		handlers:     make(map[int16]Handler),
@@ -37,33 +35,26 @@ func NewHandlerRegistry() *HandlerRegistry {
 	}
 }
 
-// Register registers a handler for the given API key.
 func (r *HandlerRegistry) Register(key int16, h Handler) {
 	r.handlers[key] = h
 }
 
-// RegisterConn registers a connection-aware handler for the given API key.
 func (r *HandlerRegistry) RegisterConn(key int16, h ConnHandler) {
 	r.connHandlers[key] = h
 }
 
-// Get returns the handler for the given API key, or nil if not registered.
 func (r *HandlerRegistry) Get(key int16) Handler {
 	return r.handlers[key]
 }
 
-// GetConn returns the connection-aware handler for the given API key.
 func (r *HandlerRegistry) GetConn(key int16) ConnHandler {
 	return r.connHandlers[key]
 }
 
-// dispatch routes a request to the appropriate handler.
-// Returns the response and any error. Unknown API keys are handled
-// at the connection level (close connection) before reaching dispatch.
+// Unknown API keys are handled at the connection level before reaching here.
 func (cc *clientConn) dispatchReq(kreq kmsg.Request) (kmsg.Response, error) {
 	key := kreq.Key()
 
-	// Check for connection-aware handler first (SASL handlers)
 	connHandler := cc.server.handlers.GetConn(key)
 	if connHandler != nil {
 		ctx := ConnContext{

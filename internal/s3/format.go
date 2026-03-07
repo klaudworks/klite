@@ -45,7 +45,6 @@ const (
 	RecordBatchHeaderSize = 61
 )
 
-// BatchIndexEntry represents one entry in the S3 object footer.
 type BatchIndexEntry struct {
 	BaseOffset      int64
 	BytePosition    uint32
@@ -55,47 +54,38 @@ type BatchIndexEntry struct {
 	RecordCount     int32
 }
 
-// LastOffset returns the last Kafka offset in this batch.
 func (e BatchIndexEntry) LastOffset() int64 {
 	return e.BaseOffset + int64(e.LastOffsetDelta)
 }
 
-// Footer represents the parsed batch index footer of an S3 object.
 type Footer struct {
 	Entries []BatchIndexEntry
 }
 
-// FindBatch returns the index of the first batch whose offset range
-// contains the given offset. Uses binary search on BaseOffset.
-// Returns -1 if the offset is before all batches.
+// FindBatch returns the index of the first batch whose offset range contains
+// the given offset. Returns len(Entries) if offset is past all batches.
 func (f *Footer) FindBatch(offset int64) int {
-	// Find the last batch whose BaseOffset <= offset
 	idx := sort.Search(len(f.Entries), func(i int) bool {
 		return f.Entries[i].BaseOffset > offset
 	})
-	idx-- // step back to the batch whose BaseOffset <= offset
+	idx--
 
 	if idx < 0 {
-		return 0 // offset before all batches, start from first
+		return 0
 	}
 
-	// Verify offset is within this batch's range
 	e := &f.Entries[idx]
 	if offset <= e.LastOffset() {
 		return idx
 	}
 
-	// Offset is between batches (gap) — return next batch
 	if idx+1 < len(f.Entries) {
 		return idx + 1
 	}
 
-	// Offset is past the last batch in this object — signal "not found"
-	// so the caller can try the next S3 object.
 	return len(f.Entries)
 }
 
-// FirstOffset returns the first offset in the footer, or -1 if empty.
 func (f *Footer) FirstOffset() int64 {
 	if len(f.Entries) == 0 {
 		return -1
@@ -103,7 +93,6 @@ func (f *Footer) FirstOffset() int64 {
 	return f.Entries[0].BaseOffset
 }
 
-// LastOffset returns the last offset in the footer, or -1 if empty.
 func (f *Footer) LastOffset() int64 {
 	if len(f.Entries) == 0 {
 		return -1
@@ -112,7 +101,6 @@ func (f *Footer) LastOffset() int64 {
 	return last.BaseOffset + int64(last.LastOffsetDelta)
 }
 
-// MaxTimestamp returns the maximum timestamp across all entries, or -1 if empty.
 func (f *Footer) MaxTimestamp() int64 {
 	if len(f.Entries) == 0 {
 		return -1
@@ -126,7 +114,6 @@ func (f *Footer) MaxTimestamp() int64 {
 	return max
 }
 
-// DataSize returns the sum of batch lengths (logical data bytes, excluding footer overhead).
 func (f *Footer) DataSize() int64 {
 	var total int64
 	for i := range f.Entries {
@@ -135,7 +122,6 @@ func (f *Footer) DataSize() int64 {
 	return total
 }
 
-// TotalRecordCount returns the sum of record counts across all entries.
 func (f *Footer) TotalRecordCount() int64 {
 	var total int64
 	for i := range f.Entries {
@@ -144,34 +130,25 @@ func (f *Footer) TotalRecordCount() int64 {
 	return total
 }
 
-// BuildObject assembles an S3 object from raw RecordBatch bytes.
-// Returns the complete object bytes (data + footer).
-//
-// Each batch in the data slice must have a valid 61-byte RecordBatch header.
-// The batchData slice contains (rawBytes, baseOffset, lastOffsetDelta) triples.
 func BuildObject(batches []BatchData) []byte {
 	if len(batches) == 0 {
 		return nil
 	}
 
-	// Calculate total data size
 	var dataSize int
 	for _, b := range batches {
 		dataSize += len(b.RawBytes)
 	}
 
-	// Footer size
 	footerSize := len(batches)*IndexEntrySize + FooterTrailerSize
 	total := dataSize + footerSize
 
 	buf := make([]byte, total)
 
-	// Write data section
 	var pos uint32
 	entries := make([]BatchIndexEntry, len(batches))
 	for i, b := range batches {
 		copy(buf[pos:], b.RawBytes)
-		// Extract maxTimestamp and recordCount from RecordBatch header
 		var maxTs int64
 		var numRec int32
 		if len(b.RawBytes) >= RecordBatchHeaderSize {
@@ -189,7 +166,6 @@ func BuildObject(batches []BatchData) []byte {
 		pos += uint32(len(b.RawBytes))
 	}
 
-	// Write batch index entries
 	off := int(pos)
 	for _, e := range entries {
 		binary.BigEndian.PutUint64(buf[off:off+8], uint64(e.BaseOffset))
@@ -201,29 +177,23 @@ func BuildObject(batches []BatchData) []byte {
 		off += IndexEntrySize
 	}
 
-	// Write entry count and magic
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(entries)))
 	binary.BigEndian.PutUint32(buf[off+4:off+8], FooterMagic)
 
 	return buf
 }
 
-// BatchData holds the data needed to build one batch in an S3 object.
 type BatchData struct {
 	RawBytes        []byte
 	BaseOffset      int64
 	LastOffsetDelta int32
 }
 
-// ParseFooter parses the batch index footer from the tail of an S3 object.
-// tailData should be the last N bytes of the object.
-// objectSize is the total size of the object.
 func ParseFooter(tailData []byte, objectSize int64) (*Footer, error) {
 	if len(tailData) < FooterTrailerSize {
 		return nil, fmt.Errorf("tail data too small: %d bytes", len(tailData))
 	}
 
-	// Read magic and entry count from the very end
 	tailLen := len(tailData)
 	magic := binary.BigEndian.Uint32(tailData[tailLen-4 : tailLen])
 	if magic != FooterMagic {
@@ -235,13 +205,11 @@ func ParseFooter(tailData []byte, objectSize int64) (*Footer, error) {
 		return &Footer{}, nil
 	}
 
-	// Calculate required footer size
 	footerSize := int(entryCount)*IndexEntrySize + FooterTrailerSize
 	if footerSize > len(tailData) {
 		return nil, fmt.Errorf("footer requires %d bytes but tail is only %d bytes (need second read)", footerSize, len(tailData))
 	}
 
-	// Parse entries from the tail
 	entriesStart := tailLen - footerSize
 	entries := make([]BatchIndexEntry, entryCount)
 	for i := range entries {
@@ -289,23 +257,18 @@ func ParseTopicDir(dir string) (string, [16]byte) {
 	return dir[:sep], id
 }
 
-// ObjectKeyPrefix returns the S3 key prefix for a topic/partition.
 func ObjectKeyPrefix(prefix, topic string, topicID [16]byte, partition int32) string {
 	return fmt.Sprintf("%s/%s/%d/", prefix, TopicDir(topic, topicID), partition)
 }
 
-// ObjectKey returns the full S3 key for a partition object at the given base offset.
 func ObjectKey(prefix, topic string, topicID [16]byte, partition int32, baseOffset int64) string {
 	return fmt.Sprintf("%s/%s/%d/%020d.obj", prefix, TopicDir(topic, topicID), partition, baseOffset)
 }
 
-// ZeroPadOffset returns a 20-digit zero-padded string for an offset.
 func ZeroPadOffset(offset int64) string {
 	return fmt.Sprintf("%020d", offset)
 }
 
-// ParseBaseOffsetFromKey extracts the base offset from an S3 object key.
-// The key is expected to end with "/<offset>.obj". Returns -1 on parse failure.
 func ParseBaseOffsetFromKey(key string) int64 {
 	idx := strings.LastIndex(key, "/")
 	if idx < 0 {

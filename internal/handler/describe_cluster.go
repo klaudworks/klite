@@ -15,7 +15,6 @@ type DescribeClusterConfig struct {
 	ClusterID      string
 }
 
-// HandleDescribeCluster returns the DescribeCluster handler (API key 60).
 func HandleDescribeCluster(cfg DescribeClusterConfig) server.Handler {
 	advHost, advPortStr, _ := net.SplitHostPort(cfg.AdvertisedAddr)
 	advPort, _ := strconv.Atoi(advPortStr)

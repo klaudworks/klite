@@ -6,8 +6,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleTxnOffsetCommit returns the TxnOffsetCommit handler (API key 28).
-// Supports v0-v4.
 func HandleTxnOffsetCommit(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.TxnOffsetCommitRequest)

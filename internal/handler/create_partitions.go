@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleCreatePartitions returns the CreatePartitions handler (API key 37).
 func HandleCreatePartitions(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.CreatePartitionsRequest)

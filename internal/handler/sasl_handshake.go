@@ -7,9 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleSASLHandshake returns the SASLHandshake handler (key 17).
-// v0 is not supported (uses implicit auth flow without SASLAuthenticate framing).
-// v1 is supported.
 func HandleSASLHandshake() server.ConnHandler {
 	return func(req kmsg.Request, cc server.ConnContext) (kmsg.Response, error) {
 		r := req.(*kmsg.SASLHandshakeRequest)

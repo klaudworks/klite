@@ -9,8 +9,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleSASLAuthenticate returns the SASLAuthenticate handler (key 36).
-// Supports PLAIN (1 round) and SCRAM-SHA-256/512 (2 rounds).
 func HandleSASLAuthenticate(store *sasl.Store) server.ConnHandler {
 	return func(req kmsg.Request, cc server.ConnContext) (kmsg.Response, error) {
 		r := req.(*kmsg.SASLAuthenticateRequest)

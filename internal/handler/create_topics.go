@@ -25,20 +25,16 @@ var validTopicConfigs = map[string]bool{
 	"delete.retention.ms":    true,
 }
 
-// HandleCreateTopics returns the CreateTopics handler (API key 19).
-// Supports v2-v7.
 func HandleCreateTopics(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.CreateTopicsRequest)
 		resp := r.ResponseKind().(*kmsg.CreateTopicsResponse)
 
-		// Version validation
 		minV, maxV, ok := VersionRange(19)
 		if !ok || r.Version < minV || r.Version > maxV {
 			return resp, nil
 		}
 
-		// Check for duplicates in the request
 		uniq := make(map[string]struct{}, len(r.Topics))
 		for _, rt := range r.Topics {
 			if _, dup := uniq[rt.Topic]; dup {
@@ -54,7 +50,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 			uniq[rt.Topic] = struct{}{}
 		}
 
-		// Build normalized name map for collision detection within this request
 		normalizedInReq := make(map[string]string, len(r.Topics))
 		for _, rt := range r.Topics {
 			normalizedInReq[cluster.NormalizeTopicName(rt.Topic)] = rt.Topic
@@ -64,28 +59,24 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 			st := kmsg.NewCreateTopicsResponseTopic()
 			st.Topic = rt.Topic
 
-			// 1. Validate topic name
 			if errMsg := cluster.ValidateTopicName(rt.Topic); errMsg != "" {
 				st.ErrorCode = kerr.InvalidTopicException.Code
 				resp.Topics = append(resp.Topics, st)
 				continue
 			}
 
-			// 2. Check if topic already exists
 			if state.TopicExists(rt.Topic) {
 				st.ErrorCode = kerr.TopicAlreadyExists.Code
 				resp.Topics = append(resp.Topics, st)
 				continue
 			}
 
-			// 3. Check collision with existing topics (dot/underscore normalization)
 			if colliding := state.CheckTopicCollision(rt.Topic); colliding != "" {
 				st.ErrorCode = kerr.InvalidTopicException.Code
 				resp.Topics = append(resp.Topics, st)
 				continue
 			}
 
-			// 4. Check collision within the request itself
 			normalized := cluster.NormalizeTopicName(rt.Topic)
 			if orig := normalizedInReq[normalized]; orig != rt.Topic {
 				st.ErrorCode = kerr.InvalidTopicException.Code
@@ -93,7 +84,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// 5. Determine partition count
 			var numPartitions int
 			if len(rt.ReplicaAssignment) > 0 {
 				// ReplicaAssignment provided: NumPartitions and ReplicationFactor must be -1
@@ -143,7 +133,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				}
 			}
 
-			// 6. Parse and validate configs
 			configs := make(map[string]string)
 			configInvalid := false
 			for _, c := range rt.Configs {
@@ -161,7 +150,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// 7. ValidateOnly: don't actually create
 			if r.ValidateOnly {
 				st.NumPartitions = int32(numPartitions)
 				st.ReplicationFactor = 1 // always 1 for single broker
@@ -176,7 +164,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// 8. Create the topic
 			td, created := state.CreateTopicWithConfigs(rt.Topic, numPartitions, configs)
 			if !created {
 				// Race: topic was created between our check and create call
@@ -185,7 +172,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// 8b. Persist to metadata.log
 			if ml := state.MetadataLog(); ml != nil {
 				entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
 					TopicName:      td.Name,
@@ -199,7 +185,6 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				}
 			}
 
-			// 9. Populate response
 			st.TopicID = td.ID
 			st.NumPartitions = int32(numPartitions)
 			st.ReplicationFactor = 1 // always 1 for single broker

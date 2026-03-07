@@ -14,7 +14,6 @@ import (
 	"github.com/klaudworks/klite/internal/clock"
 )
 
-// WriterConfig holds configuration for the WAL writer.
 type WriterConfig struct {
 	Dir             string        // WAL directory
 	SyncInterval    time.Duration // Fsync batch window (default 2ms)
@@ -25,7 +24,6 @@ type WriterConfig struct {
 	Logger          *slog.Logger
 }
 
-// DefaultWriterConfig returns a WriterConfig with production defaults.
 func DefaultWriterConfig() WriterConfig {
 	return WriterConfig{
 		SyncInterval:    2 * time.Millisecond,
@@ -37,13 +35,11 @@ func DefaultWriterConfig() WriterConfig {
 	}
 }
 
-// writeRequest is sent from handler goroutines to the WAL writer.
 type writeRequest struct {
 	entry []byte     // serialized WAL entry (MarshalEntry output)
 	errCh chan error // receives nil on success, non-nil on write/fsync failure
 }
 
-// segmentInfo tracks a single WAL segment file.
 type segmentInfo struct {
 	seq    uint64   // starting sequence number
 	file   *os.File // open file handle
@@ -53,8 +49,7 @@ type segmentInfo struct {
 	maxSeq uint64   // maximum WAL sequence in this segment
 }
 
-// Writer is the WAL writer goroutine. It serializes all WAL writes,
-// batches fsyncs, and manages segment rotation.
+// Writer serializes all WAL writes, batches fsyncs, and manages segment rotation.
 type Writer struct {
 	cfg    WriterConfig
 	idx    *Index
@@ -89,7 +84,6 @@ type Writer struct {
 	stopped bool
 }
 
-// NewWriter creates a new WAL writer. Call Start() to begin the writer goroutine.
 func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
 	if cfg.Clock == nil {
 		cfg.Clock = clock.RealClock{}
@@ -127,16 +121,13 @@ func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
 	return w, nil
 }
 
-// Start opens or creates the initial segment and starts the writer goroutine.
 func (w *Writer) Start() error {
-	// Scan existing segments to determine next sequence
 	existingSeqs, err := w.scanExistingSegments()
 	if err != nil {
 		return fmt.Errorf("scan existing segments: %w", err)
 	}
 
 	if len(existingSeqs) > 0 {
-		// Open the last segment for appending
 		lastSeq := existingSeqs[len(existingSeqs)-1]
 		seg, err := w.openSegment(lastSeq, true)
 		if err != nil {
@@ -145,7 +136,6 @@ func (w *Writer) Start() error {
 		w.current = seg
 		w.segSeq = lastSeq + 1
 
-		// Track all segments
 		for _, seq := range existingSeqs {
 			if seq == lastSeq {
 				w.segments = append(w.segments, seg)
@@ -159,7 +149,6 @@ func (w *Writer) Start() error {
 			}
 		}
 	} else {
-		// Create first segment
 		seg, err := w.createSegment(0)
 		if err != nil {
 			return fmt.Errorf("create first segment: %w", err)
@@ -169,7 +158,6 @@ func (w *Writer) Start() error {
 		w.segSeq = 1
 	}
 
-	// Initialize diskUsage from existing segments
 	var totalSize int64
 	for _, seg := range w.segments {
 		totalSize += seg.size
@@ -180,8 +168,7 @@ func (w *Writer) Start() error {
 	return nil
 }
 
-// Append submits a WAL entry for writing. Blocks until fsync completes.
-// Returns ErrClosed if the writer has been stopped.
+// Append blocks until the entry is written and fsync'd.
 func (w *Writer) Append(entry *Entry) error {
 	w.mu.Lock()
 	if w.stopped {
@@ -210,8 +197,6 @@ func (w *Writer) Append(entry *Entry) error {
 	}
 }
 
-// AppendAsync submits a WAL entry for writing, returning a channel that
-// receives nil on success or an error on write/fsync failure.
 func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 	w.mu.Lock()
 	if w.stopped {
@@ -234,17 +219,14 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 	}
 }
 
-// NextSequence returns the next sequence number that will be assigned.
 func (w *Writer) NextSequence() uint64 {
 	return w.nextSeq.Load()
 }
 
-// SetNextSequence sets the next sequence number (used during replay).
 func (w *Writer) SetNextSequence(seq uint64) {
 	w.nextSeq.Store(seq)
 }
 
-// Stop stops the writer goroutine and flushes pending writes.
 func (w *Writer) Stop() {
 	w.mu.Lock()
 	if w.stopped {
@@ -258,12 +240,10 @@ func (w *Writer) Stop() {
 	<-w.done
 }
 
-// Index returns the WAL index.
 func (w *Writer) Index() *Index {
 	return w.idx
 }
 
-// Dir returns the WAL directory.
 func (w *Writer) Dir() string {
 	return w.walDir
 }
@@ -273,7 +253,6 @@ func (w *Writer) DiskPressure() float64 {
 	return float64(w.diskUsage.Load()) / float64(w.cfg.MaxDiskSize)
 }
 
-// run is the main writer goroutine loop.
 func (w *Writer) run() {
 	defer close(w.done)
 
@@ -283,12 +262,10 @@ func (w *Writer) run() {
 	var pending []writeRequest
 
 	for {
-		// Phase 1: Wait for at least one event
 		select {
 		case req := <-w.writeCh:
 			pending = append(pending, req)
 		case <-ticker.C:
-			// fall through to drain
 		case seg := <-w.preCreateCh:
 			if seg != nil {
 				w.preCreated = seg
@@ -304,7 +281,6 @@ func (w *Writer) run() {
 			return
 		}
 
-		// Phase 1b: Non-blocking drain of all queued entries
 	drainLoop:
 		for {
 			select {
@@ -324,13 +300,11 @@ func (w *Writer) run() {
 			continue
 		}
 
-		// Phase 2: Write all pending entries, tracking where we stop on error.
 		written := 0
 		for i, req := range pending {
 			if err := w.appendEntry(req.entry); err != nil {
 				w.logger.Error("WAL write error", "err", err)
 				written = i
-				// Signal failure to this and all remaining entries.
 				for _, fail := range pending[i:] {
 					fail.errCh <- err
 				}
@@ -339,7 +313,6 @@ func (w *Writer) run() {
 			written = i + 1
 		}
 
-		// Phase 3: Fsync only if at least one entry was written.
 		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
 			if err := w.current.file.Sync(); err != nil {
 				w.logger.Error("WAL fsync error", "err", err)
@@ -351,27 +324,21 @@ func (w *Writer) run() {
 			}
 		}
 
-		// Phase 4: Signal success to entries that were written and fsync'd.
 		for _, req := range pending[:written] {
 			req.errCh <- nil
 		}
-		pending = pending[:0] // reuse slice
-
-		// Kick off async pre-creation if needed
+		pending = pending[:0]
 		w.maybePreCreateSegment()
 	}
 }
 
-// appendEntry writes a single serialized entry to the current segment.
 func (w *Writer) appendEntry(serialized []byte) error {
-	// Check if we need to rotate
 	if w.current.size+int64(len(serialized)) > w.cfg.SegmentMaxBytes && w.current.size > 0 {
 		if err := w.rotateSegment(); err != nil {
 			return fmt.Errorf("rotate segment: %w", err)
 		}
 	}
 
-	// Record file offset before write
 	fileOffset := w.current.size
 
 	n, err := w.current.file.Write(serialized)
@@ -381,7 +348,6 @@ func (w *Writer) appendEntry(serialized []byte) error {
 	w.current.size += int64(n)
 	w.diskUsage.Add(int64(n))
 
-	// Parse entry to update index
 	if len(serialized) > 4 {
 		entry, parseErr := UnmarshalEntry(serialized[4:]) // skip 4-byte length prefix
 		if parseErr == nil {
@@ -407,7 +373,6 @@ func (w *Writer) appendEntry(serialized []byte) error {
 			}
 			w.idx.Add(tp, idxEntry)
 
-			// Update segment seq range
 			if entry.Sequence > w.current.maxSeq {
 				w.current.maxSeq = entry.Sequence
 			}
@@ -417,7 +382,6 @@ func (w *Writer) appendEntry(serialized []byte) error {
 	return nil
 }
 
-// flushAndSync writes pending entries and fsyncs.
 func (w *Writer) flushAndSync(pending []writeRequest) {
 	written := 0
 	for i, req := range pending {
@@ -448,7 +412,6 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 // If a segment was pre-created, it is used directly (fast path: just a file
 // close, no file creation or directory fsync on the hot path).
 func (w *Writer) rotateSegment() error {
-	// Fsync and close current segment
 	if w.cfg.FsyncEnabled {
 		if err := w.current.file.Sync(); err != nil {
 			w.logger.Warn("WAL segment rotation: fsync error on old segment", "err", err)
@@ -459,7 +422,6 @@ func (w *Writer) rotateSegment() error {
 	}
 
 	if w.preCreated != nil {
-		// Fast path: use the pre-created segment.
 		w.current = w.preCreated
 		w.segments = append(w.segments, w.preCreated)
 		w.preCreated = nil
@@ -531,8 +493,6 @@ func (w *Writer) TryCleanupSegments() {
 	}
 }
 
-// tryCleanupSegmentsLocked is called from the writer goroutine.
-// It deletes segments with no remaining WAL index references.
 func (w *Writer) tryCleanupSegmentsLocked() {
 	if len(w.segments) <= 1 {
 		return
@@ -540,7 +500,6 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 
 	var kept []*segmentInfo
 	for _, seg := range w.segments {
-		// Never delete the current segment
 		if seg == w.current {
 			kept = append(kept, seg)
 			continue
@@ -551,7 +510,6 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 			continue
 		}
 
-		// No references — safe to delete
 		deletedSize := seg.size
 		if seg.file != nil {
 			_ = seg.file.Close()
@@ -592,7 +550,6 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 	}
 }
 
-// createSegment creates a new segment file with the given starting sequence.
 func (w *Writer) createSegment(seq uint64) (*segmentInfo, error) {
 	name := segmentFilename(seq)
 	path := filepath.Join(w.walDir, name)
@@ -612,7 +569,6 @@ func (w *Writer) createSegment(seq uint64) (*segmentInfo, error) {
 	}, nil
 }
 
-// openSegment opens an existing segment for appending.
 func (w *Writer) openSegment(seq uint64, forAppend bool) (*segmentInfo, error) {
 	name := segmentFilename(seq)
 	path := filepath.Join(w.walDir, name)
@@ -643,7 +599,6 @@ func (w *Writer) openSegment(seq uint64, forAppend bool) (*segmentInfo, error) {
 	}, nil
 }
 
-// openSegmentReadOnly opens an existing segment read-only and returns its info.
 func (w *Writer) openSegmentReadOnly(seq uint64) (*segmentInfo, error) {
 	name := segmentFilename(seq)
 	path := filepath.Join(w.walDir, name)
@@ -662,7 +617,6 @@ func (w *Writer) openSegmentReadOnly(seq uint64) (*segmentInfo, error) {
 	}, nil
 }
 
-// scanExistingSegments returns sorted sequence numbers of existing segment files.
 func (w *Writer) scanExistingSegments() ([]uint64, error) {
 	entries, err := os.ReadDir(w.walDir)
 	if err != nil {
@@ -686,8 +640,6 @@ func (w *Writer) scanExistingSegments() ([]uint64, error) {
 	return seqs, nil
 }
 
-// closeSegments closes all open segment files, including any in-flight
-// pre-created segment that hasn't been delivered yet.
 func (w *Writer) closeSegments() {
 	if w.current != nil && w.current.file != nil {
 		_ = w.current.file.Close()
@@ -706,12 +658,10 @@ func (w *Writer) closeSegments() {
 	}
 }
 
-// segmentFilename returns the filename for a segment with the given sequence.
 func segmentFilename(seq uint64) string {
 	return fmt.Sprintf("%020d.wal", seq)
 }
 
-// parseSegmentFilename extracts the sequence number from a segment filename.
 func parseSegmentFilename(name string) (uint64, bool) {
 	if len(name) != 24 || name[20:] != ".wal" {
 		return 0, false
@@ -721,9 +671,7 @@ func parseSegmentFilename(name string) (uint64, bool) {
 	return seq, err == nil
 }
 
-// ReadBatch reads a batch from a WAL segment using the index entry information.
 func (w *Writer) ReadBatch(entry IndexEntry) ([]byte, error) {
-	// Find the segment file
 	segPath := filepath.Join(w.walDir, segmentFilename(entry.SegmentSeq))
 
 	f, err := os.Open(segPath)
@@ -732,18 +680,16 @@ func (w *Writer) ReadBatch(entry IndexEntry) ([]byte, error) {
 	}
 	defer f.Close() //nolint:errcheck // best-effort close
 
-	// Read the full entry from disk
 	entryBuf := make([]byte, entry.EntrySize)
 	_, err = f.ReadAt(entryBuf, entry.FileOffset)
 	if err != nil {
 		return nil, fmt.Errorf("read entry from segment: %w", err)
 	}
 
-	// Parse the entry to extract the batch data
 	if len(entryBuf) <= 4 {
 		return nil, fmt.Errorf("entry too small")
 	}
-	parsed, err := UnmarshalEntry(entryBuf[4:]) // skip length prefix
+	parsed, err := UnmarshalEntry(entryBuf[4:])
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal entry: %w", err)
 	}
@@ -827,7 +773,6 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 	return nil
 }
 
-// TotalDiskSize returns the total size of all WAL segments.
 func (w *Writer) TotalDiskSize() int64 {
 	var total int64
 	for _, seg := range w.segments {
@@ -836,7 +781,6 @@ func (w *Writer) TotalDiskSize() int64 {
 	return total
 }
 
-// SegmentCount returns the number of WAL segments.
 func (w *Writer) SegmentCount() int {
 	return len(w.segments)
 }

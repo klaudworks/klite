@@ -6,8 +6,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleListTransactions returns the ListTransactions handler (API key 66).
-// Supports v0-v1.
 func HandleListTransactions(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ListTransactionsRequest)
@@ -15,13 +13,11 @@ func HandleListTransactions(state *cluster.State) server.Handler {
 
 		snapshots := state.PIDManager().AllTransactions()
 
-		// Build state filter set
 		stateFilter := make(map[string]bool)
 		for _, s := range r.StateFilters {
 			stateFilter[s] = true
 		}
 
-		// Build producer ID filter set
 		pidFilter := make(map[int64]bool)
 		for _, pid := range r.ProducerIDFilters {
 			pidFilter[pid] = true
@@ -35,12 +31,10 @@ func HandleListTransactions(state *cluster.State) server.Handler {
 				txnState = "Empty"
 			}
 
-			// Apply state filter
 			if len(stateFilter) > 0 && !stateFilter[txnState] {
 				continue
 			}
 
-			// Apply producer ID filter
 			if len(pidFilter) > 0 && !pidFilter[snap.ProducerID] {
 				continue
 			}

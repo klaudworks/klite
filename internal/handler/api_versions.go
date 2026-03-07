@@ -6,12 +6,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// apiVersions lists the API keys and version ranges this broker supports.
-// This is the single source of truth for the ApiVersions response and for
-// version validation in the dispatch path. New handlers added in later phases
-// must add their entry here.
 var apiVersions = []kmsg.ApiVersionsResponseApiKey{
-	// Phase 1: Core data path
 	{ApiKey: 0, MinVersion: 3, MaxVersion: 11}, // Produce
 	{ApiKey: 1, MinVersion: 4, MaxVersion: 16}, // Fetch
 	{ApiKey: 2, MinVersion: 1, MaxVersion: 8},  // ListOffsets
@@ -19,7 +14,6 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 18, MinVersion: 0, MaxVersion: 4}, // ApiVersions
 	{ApiKey: 19, MinVersion: 2, MaxVersion: 7}, // CreateTopics
 
-	// Phase 2: Consumer groups
 	{ApiKey: 8, MinVersion: 0, MaxVersion: 9},  // OffsetCommit
 	{ApiKey: 9, MinVersion: 0, MaxVersion: 9},  // OffsetFetch
 	{ApiKey: 10, MinVersion: 0, MaxVersion: 6}, // FindCoordinator
@@ -29,7 +23,6 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 14, MinVersion: 0, MaxVersion: 5}, // SyncGroup
 	{ApiKey: 47, MinVersion: 0, MaxVersion: 0}, // OffsetDelete
 
-	// Phase 3: Admin APIs
 	{ApiKey: 15, MinVersion: 0, MaxVersion: 6}, // DescribeGroups
 	{ApiKey: 16, MinVersion: 0, MaxVersion: 5}, // ListGroups
 	{ApiKey: 20, MinVersion: 0, MaxVersion: 6}, // DeleteTopics
@@ -43,7 +36,6 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 44, MinVersion: 0, MaxVersion: 1}, // IncrementalAlterConfigs
 	{ApiKey: 60, MinVersion: 0, MaxVersion: 2}, // DescribeCluster
 
-	// Phase 4: Transactions
 	{ApiKey: 22, MinVersion: 0, MaxVersion: 5}, // InitProducerID
 	{ApiKey: 24, MinVersion: 0, MaxVersion: 4}, // AddPartitionsToTxn
 	{ApiKey: 25, MinVersion: 0, MaxVersion: 3}, // AddOffsetsToTxn
@@ -53,15 +45,12 @@ var apiVersions = []kmsg.ApiVersionsResponseApiKey{
 	{ApiKey: 65, MinVersion: 0, MaxVersion: 0}, // DescribeTransactions
 	{ApiKey: 66, MinVersion: 0, MaxVersion: 1}, // ListTransactions
 
-	// Phase 5: SASL Authentication
 	{ApiKey: 17, MinVersion: 1, MaxVersion: 1}, // SASLHandshake (v0 not supported)
 	{ApiKey: 36, MinVersion: 0, MaxVersion: 2}, // SASLAuthenticate
 	{ApiKey: 50, MinVersion: 0, MaxVersion: 0}, // DescribeUserScramCredentials
 	{ApiKey: 51, MinVersion: 0, MaxVersion: 0}, // AlterUserScramCredentials
 }
 
-// apiVersionsMap is a lookup table built from apiVersions for fast version
-// validation. Populated by init().
 var apiVersionsMap map[int16]kmsg.ApiVersionsResponseApiKey
 
 func init() {
@@ -71,8 +60,6 @@ func init() {
 	}
 }
 
-// VersionRange returns the supported version range for an API key.
-// Returns ok=false if the key is not supported.
 func VersionRange(key int16) (min, max int16, ok bool) {
 	v, exists := apiVersionsMap[key]
 	if !exists {
@@ -81,19 +68,14 @@ func VersionRange(key int16) (min, max int16, ok bool) {
 	return v.MinVersion, v.MaxVersion, true
 }
 
-// HandleApiVersions returns the ApiVersions handler.
-// ApiVersions is special: even for unsupported request versions, we return
-// the full version list with UNSUPPORTED_VERSION error code so the client
-// can negotiate down.
+// HandleApiVersions returns the ApiVersions handler. Even for unsupported
+// request versions, we return the full version list with UNSUPPORTED_VERSION
+// so the client can negotiate down.
 func HandleApiVersions() server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ApiVersionsRequest)
 		resp := r.ResponseKind().(*kmsg.ApiVersionsResponse)
 
-		// Check if the requested version is within our supported range.
-		// For ApiVersions specifically, we still return the full response
-		// (with error code) so the client can learn our supported versions
-		// and downgrade.
 		minV, maxV, ok := VersionRange(18)
 		if !ok || r.Version < minV || r.Version > maxV {
 			// Downgrade response to v0 for maximum compatibility

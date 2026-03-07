@@ -10,7 +10,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleIncrementalAlterConfigs returns the IncrementalAlterConfigs handler (API key 44).
 func HandleIncrementalAlterConfigs(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.IncrementalAlterConfigsRequest)
@@ -38,7 +37,6 @@ func HandleIncrementalAlterConfigs(state *cluster.State) server.Handler {
 						case kmsg.IncrementalAlterConfigOpSet:
 							if rc.Value != nil {
 								state.SetTopicConfig(rr.ResourceName, rc.Name, *rc.Value)
-								// Persist to metadata.log
 								if ml := state.MetadataLog(); ml != nil {
 									entry := metadata.MarshalAlterConfig(&metadata.AlterConfigEntry{
 										TopicName: rr.ResourceName,
@@ -74,8 +72,7 @@ func HandleIncrementalAlterConfigs(state *cluster.State) server.Handler {
 	}
 }
 
-// HandleAlterConfigs returns the AlterConfigs handler (API key 33).
-// This is the legacy non-incremental API — it replaces all configs.
+// HandleAlterConfigs is the legacy non-incremental API — it replaces all configs.
 func HandleAlterConfigs(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.AlterConfigsRequest)
@@ -97,9 +94,7 @@ func HandleAlterConfigs(state *cluster.State) server.Handler {
 				}
 
 				if !r.ValidateOnly {
-					// Full replacement: clear existing configs, apply new ones
 					state.ReplaceTopicConfigs(rr.ResourceName, rr.Configs)
-					// Persist each config to metadata.log
 					if ml := state.MetadataLog(); ml != nil {
 						for _, c := range rr.Configs {
 							if c.Value != nil {

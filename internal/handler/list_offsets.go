@@ -7,15 +7,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleListOffsets returns the ListOffsets handler (API key 2).
-// Supports v1-8. IsolationLevel (v2+) controls whether Latest (-1) returns
-// HW (read_uncommitted) or LSO (read_committed).
 func HandleListOffsets(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ListOffsetsRequest)
 		resp := r.ResponseKind().(*kmsg.ListOffsetsResponse)
 
-		// Version validation
 		minV, maxV, ok := VersionRange(2)
 		if !ok || r.Version < minV || r.Version > maxV {
 			return resp, nil

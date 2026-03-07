@@ -5,13 +5,11 @@ import (
 	"sync"
 )
 
-// TopicPartition is a key for the WAL index.
 type TopicPartition struct {
 	TopicID   [16]byte
 	Partition int32
 }
 
-// IndexEntry maps a batch's offset range to its location in a WAL segment.
 type IndexEntry struct {
 	BaseOffset  int64  // First Kafka offset in the batch
 	LastOffset  int64  // BaseOffset + LastOffsetDelta
@@ -22,29 +20,25 @@ type IndexEntry struct {
 	WALSequence uint64 // WAL sequence number of this entry
 }
 
-// Index is an in-memory index mapping (topic, partition, offset) to WAL positions.
-// Thread-safe via RWMutex.
+// Index is thread-safe via RWMutex.
 type Index struct {
 	mu         sync.RWMutex
 	partitions map[TopicPartition][]IndexEntry
 }
 
-// NewIndex creates a new empty WAL index.
 func NewIndex() *Index {
 	return &Index{
 		partitions: make(map[TopicPartition][]IndexEntry),
 	}
 }
 
-// Add inserts a new index entry. Entries must be added in offset order per partition.
+// Add inserts a new index entry. Entries must be added in offset order.
 func (idx *Index) Add(tp TopicPartition, entry IndexEntry) {
 	idx.mu.Lock()
 	idx.partitions[tp] = append(idx.partitions[tp], entry)
 	idx.mu.Unlock()
 }
 
-// Lookup finds index entries for the given partition starting at fetchOffset,
-// collecting up to maxBytes of batch data.
 func (idx *Index) Lookup(tp TopicPartition, fetchOffset int64, maxBytes int32) []IndexEntry {
 	idx.mu.RLock()
 	entries := idx.partitions[tp]
@@ -54,7 +48,6 @@ func (idx *Index) Lookup(tp TopicPartition, fetchOffset int64, maxBytes int32) [
 		return nil
 	}
 
-	// Binary search for the first entry whose LastOffset >= fetchOffset
 	startIdx := sort.Search(len(entries), func(i int) bool {
 		return entries[i].LastOffset >= fetchOffset
 	})
@@ -79,7 +72,6 @@ func (idx *Index) Lookup(tp TopicPartition, fetchOffset int64, maxBytes int32) [
 	return result
 }
 
-// PruneBefore removes all index entries for a partition whose LastOffset < newLogStart.
 func (idx *Index) PruneBefore(tp TopicPartition, newLogStart int64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -98,7 +90,6 @@ func (idx *Index) PruneBefore(tp TopicPartition, newLogStart int64) {
 	}
 }
 
-// PruneSegment removes all index entries referencing the given segment.
 func (idx *Index) PruneSegment(segmentSeq uint64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -118,8 +109,6 @@ func (idx *Index) PruneSegment(segmentSeq uint64) {
 	}
 }
 
-// PartitionEntries returns a copy of all index entries for a partition.
-// Used during segment cleanup to check if entries still reference a segment.
 func (idx *Index) PartitionEntries(tp TopicPartition) []IndexEntry {
 	idx.mu.RLock()
 	entries := idx.partitions[tp]
@@ -129,7 +118,6 @@ func (idx *Index) PartitionEntries(tp TopicPartition) []IndexEntry {
 	return result
 }
 
-// SegmentReferenced returns true if any index entry references the given segment.
 func (idx *Index) SegmentReferenced(segmentSeq uint64) bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -143,8 +131,6 @@ func (idx *Index) SegmentReferenced(segmentSeq uint64) bool {
 	return false
 }
 
-// UnflushedBytes returns the total bytes of WAL entries for a partition
-// that have not yet been flushed to S3 (entries where LastOffset >= s3Watermark).
 func (idx *Index) UnflushedBytes(tp TopicPartition, s3Watermark int64) int64 {
 	idx.mu.RLock()
 	entries := idx.partitions[tp]
@@ -159,10 +145,8 @@ func (idx *Index) UnflushedBytes(tp TopicPartition, s3Watermark int64) int64 {
 	return total
 }
 
-// OldestUnflushedTimestamp returns the WAL sequence number of the oldest
-// unflushed entry for a partition (entries where LastOffset >= s3Watermark).
-// Returns 0 if no unflushed entries exist. The WAL sequence can be used
-// as a monotonic proxy for age (assigned at write time).
+// OldestUnflushedSequence returns the WAL sequence of the oldest unflushed entry.
+// WAL sequence serves as a monotonic proxy for age (assigned at write time).
 func (idx *Index) OldestUnflushedSequence(tp TopicPartition, s3Watermark int64) uint64 {
 	idx.mu.RLock()
 	entries := idx.partitions[tp]
@@ -176,7 +160,6 @@ func (idx *Index) OldestUnflushedSequence(tp TopicPartition, s3Watermark int64) 
 	return 0
 }
 
-// AllPartitions returns all tracked topic-partitions.
 func (idx *Index) AllPartitions() []TopicPartition {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()

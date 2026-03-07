@@ -8,7 +8,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDeleteRecords returns the DeleteRecords handler (API key 21).
 func HandleDeleteRecords(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DeleteRecordsRequest)
@@ -42,7 +41,6 @@ func HandleDeleteRecords(state *cluster.State) server.Handler {
 
 				pd := td.Partitions[rp.Partition]
 
-				// Validate under read lock first
 				pd.RLock()
 				targetOffset := rp.Offset
 				if targetOffset == -1 {

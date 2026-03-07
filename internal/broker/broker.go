@@ -30,33 +30,30 @@ import (
 	"github.com/klaudworks/klite/internal/wal"
 )
 
-// Broker is the top-level klite broker.
 type Broker struct {
-	cfg          Config
-	listener     net.Listener
-	clusterID    string
-	state        *cluster.State
-	shutdownCh   chan struct{} // closed on shutdown to wake all blockers
-	done         chan struct{} // closed when Run() returns
-	ready        chan struct{} // closed when initialization is complete
-	logger       *slog.Logger
-	server       *server.Server
-	handlers     *server.HandlerRegistry
-	walWriter    *wal.Writer      // nil if WAL disabled
-	walIndex     *wal.Index       // nil if WAL disabled
-	chunkPool    *chunk.Pool      // nil if WAL disabled
-	metaLog      *metadata.Log    // nil if metadata persistence disabled
-	s3Client     *s3store.Client  // nil if S3 disabled
-	s3Reader     *s3store.Reader  // nil if S3 disabled
-	s3Flusher    *s3store.Flusher // nil if S3 disabled
-	saslStore    *sasl.Store      // nil if SASL disabled
-	fetchMetrics *cluster.FetchMetrics
+	cfg        Config
+	listener   net.Listener
+	clusterID  string
+	state      *cluster.State
+	shutdownCh chan struct{} // closed on shutdown to wake all blockers
+	done       chan struct{} // closed when Run() returns
+	ready      chan struct{} // closed when initialization is complete
+	logger     *slog.Logger
+	server     *server.Server
+	handlers   *server.HandlerRegistry
+	walWriter  *wal.Writer
+	walIndex   *wal.Index
+	chunkPool  *chunk.Pool
+	metaLog    *metadata.Log
+	s3Client   *s3store.Client
+	s3Reader   *s3store.Reader
+	s3Flusher  *s3store.Flusher
+	saslStore  *sasl.Store
 
 	mu   sync.Mutex
 	quit bool
 }
 
-// New creates a new Broker with the given config.
 func New(cfg Config) *Broker {
 	logger := setupLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
@@ -73,18 +70,16 @@ func New(cfg Config) *Broker {
 	state.SetLogger(logger)
 
 	b := &Broker{
-		cfg:          cfg,
-		state:        state,
-		shutdownCh:   shutdownCh,
-		done:         make(chan struct{}),
-		ready:        make(chan struct{}),
-		logger:       logger,
-		server:       srv,
-		handlers:     handlers,
-		fetchMetrics: &cluster.FetchMetrics{},
+		cfg:        cfg,
+		state:      state,
+		shutdownCh: shutdownCh,
+		done:       make(chan struct{}),
+		ready:      make(chan struct{}),
+		logger:     logger,
+		server:     srv,
+		handlers:   handlers,
 	}
 
-	// Initialize SASL if enabled
 	if cfg.SASLEnabled {
 		b.initSASLStore()
 		srv.SetSASLEnabled(true)
@@ -94,7 +89,6 @@ func New(cfg Config) *Broker {
 	return b
 }
 
-// initSASLStore creates and populates the SASL credential store.
 func (b *Broker) initSASLStore() {
 	if b.cfg.SASLStore != nil {
 		b.saslStore = b.cfg.SASLStore.(*sasl.Store)
@@ -102,7 +96,6 @@ func (b *Broker) initSASLStore() {
 	}
 	b.saslStore = sasl.NewStore()
 
-	// Add CLI-flag user
 	if b.cfg.SASLUser != "" && b.cfg.SASLPassword != "" {
 		switch b.cfg.SASLMechanism {
 		case sasl.MechanismPlain:
@@ -119,23 +112,18 @@ func (b *Broker) initSASLStore() {
 	}
 }
 
-// registerBaseHandlers wires up handlers that don't depend on runtime state.
 func (b *Broker) registerBaseHandlers() {
 	b.handlers.Register(18, handler.HandleApiVersions())
 
-	// SASL handlers are registered early (before runtime handlers)
-	// because they only depend on the SASL store, not on cluster state.
 	if b.saslStore != nil {
 		b.handlers.RegisterConn(17, handler.HandleSASLHandshake())
 		b.handlers.RegisterConn(36, handler.HandleSASLAuthenticate(b.saslStore))
 	}
 }
 
-// registerRuntimeHandlers wires up handlers that depend on runtime state
-// (cluster ID, advertised address, etc.). Must be called after initialization.
 func (b *Broker) registerRuntimeHandlers(advAddr string) {
-	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter, b.fetchMetrics))
-	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh, b.fetchMetrics))
+	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter))
+	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh))
 	b.handlers.Register(2, handler.HandleListOffsets(b.state))
 	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
 		NodeID:         b.cfg.NodeID,
@@ -156,7 +144,6 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 	b.handlers.Register(14, handler.HandleSyncGroup(b.state))
 	b.handlers.Register(47, handler.HandleOffsetDelete(b.state))
 
-	// Phase 3: Admin APIs
 	b.handlers.Register(15, handler.HandleDescribeGroups(b.state))
 	b.handlers.Register(16, handler.HandleListGroups(b.state))
 	b.handlers.Register(20, handler.HandleDeleteTopics(b.state))
@@ -177,13 +164,11 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 		ClusterID:      b.clusterID,
 	}))
 
-	// Phase 5: SASL credential management
 	if b.saslStore != nil {
 		b.handlers.Register(50, handler.HandleDescribeUserScramCredentials(b.saslStore))
 		b.handlers.Register(51, handler.HandleAlterUserScramCredentials(b.saslStore, b.metaLog))
 	}
 
-	// Phase 4: Transactions
 	b.handlers.Register(22, handler.HandleInitProducerID(b.state))
 	b.handlers.Register(24, handler.HandleAddPartitionsToTxn(b.state))
 	b.handlers.Register(25, handler.HandleAddOffsetsToTxn(b.state))
@@ -198,26 +183,22 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 func (b *Broker) Run(ctx context.Context) error {
 	defer close(b.done)
 
-	// 1. Create/open data directory
 	if err := os.MkdirAll(b.cfg.DataDir, 0o755); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	// 2. Load or generate cluster ID
 	cid, err := b.loadOrCreateClusterID()
 	if err != nil {
 		return fmt.Errorf("cluster ID: %w", err)
 	}
 	b.clusterID = cid
 
-	// 2b. If S3 is configured, attempt disaster recovery if needed
 	if b.cfg.S3Bucket != "" {
 		if err := b.maybeRecoverFromS3(); err != nil {
 			b.logger.Warn("S3 disaster recovery failed, continuing without", "err", err)
 		}
 	}
 
-	// 3. Initialize metadata.log (replay metadata first)
 	if err := b.initMetadataLog(); err != nil {
 		return fmt.Errorf("init metadata.log: %w", err)
 	}
@@ -227,17 +208,14 @@ func (b *Broker) Run(ctx context.Context) error {
 		b.applyCLISASLUser()
 	}
 
-	// Validate SASL: if enabled but no credentials configured, refuse to start
 	if b.cfg.SASLEnabled && b.saslStore != nil && b.saslStore.Empty() {
 		return fmt.Errorf("SASL is enabled but no credentials are configured; add users via --sasl-user/--sasl-password or config file")
 	}
 
-	// 4. Initialize WAL (replay WAL after metadata)
 	if err := b.initWAL(); err != nil {
 		return fmt.Errorf("init WAL: %w", err)
 	}
 
-	// 4b. Initialize S3 if configured
 	if b.cfg.S3Bucket != "" {
 		if err := b.initS3(); err != nil {
 			return fmt.Errorf("init S3: %w", err)
@@ -246,7 +224,6 @@ func (b *Broker) Run(ctx context.Context) error {
 		b.logger.Warn("no S3 bucket configured; data is stored only in the local WAL — this is suitable for demos but data loss will occur when the WAL exceeds --wal-max-disk-size and old segments are deleted, or if the disk is lost")
 	}
 
-	// 5. Start TCP listener
 	ln := b.cfg.Listener
 	if ln == nil {
 		ln, err = net.Listen("tcp", b.cfg.Listen)
@@ -256,17 +233,14 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.listener = ln
 
-	// 6. Resolve advertised address (after listener is bound so we know the real port)
 	advAddr, warn := b.resolveAdvertisedAddr()
 	if warn {
 		b.logger.Warn("--advertised-addr not set, using derived address in Metadata responses; clients outside this host won't be able to connect",
 			"advertised_addr", advAddr)
 	}
 
-	// 7. Register handlers that depend on runtime state
 	b.registerRuntimeHandlers(advAddr)
 
-	// 8. Log startup
 	b.logger.Info("klite started",
 		"listen", b.listener.Addr().String(),
 		"advertised_addr", advAddr,
@@ -275,10 +249,8 @@ func (b *Broker) Run(ctx context.Context) error {
 		"data_dir", b.cfg.DataDir,
 	)
 
-	// Signal that initialization is complete
 	close(b.ready)
 
-	// 8a. Start HTTP health server if configured (opt-in via --health-addr)
 	var healthShutdown func()
 	if b.cfg.HealthAddr != "" || b.cfg.HealthListener != nil {
 		healthShutdown, err = b.startHealthServer()
@@ -287,25 +259,18 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	// 8b. Start retention loop
 	go b.retentionLoop(ctx)
 
-	// 8c. Start compaction loop (only if S3 is configured)
 	if b.s3Client != nil {
 		go b.compactionLoop(ctx)
 		go b.s3GCLoop(ctx)
 	}
 
-	// 8d. Start fetch metrics reporter
-	go b.fetchMetricsLoop(ctx)
-
-	// 9. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- b.server.Serve(b.listener)
 	}()
 
-	// Wait for context cancellation or serve error
 	var serveReturned bool
 	select {
 	case <-ctx.Done():
@@ -316,39 +281,30 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	// 10. Shutdown sequence
 	b.shutdown()
 	if healthShutdown != nil {
 		healthShutdown()
 	}
 
-	// 11. Wait for Serve() to return so no new connections are accepted
 	if !serveReturned {
 		<-errCh
 	}
 
-	// 12. Close chunk pool to unblock any producers stuck in Acquire
 	if b.chunkPool != nil {
 		b.chunkPool.Close()
 	}
 
-	// 13. Wait for all connections to drain
 	b.server.Wait()
-
-	// 14. Stop all group goroutines
 	b.state.StopAllGroups()
 
-	// 15. Run unified S3 sync (flush all partitions + upload metadata.log)
 	if b.s3Flusher != nil {
-		b.s3Flusher.Stop() // Stop triggers a final flush
+		b.s3Flusher.Stop()
 	}
 
-	// 16. Stop WAL writer (flush pending writes)
 	if b.walWriter != nil {
 		b.walWriter.Stop()
 	}
 
-	// 17. Close metadata log
 	if b.metaLog != nil {
 		_ = b.metaLog.Close()
 	}
@@ -357,8 +313,6 @@ func (b *Broker) Run(ctx context.Context) error {
 	return nil
 }
 
-// initMetadataLog initializes the metadata.log, sets up replay callbacks,
-// replays existing entries to rebuild state, then compacts if needed.
 func (b *Broker) initMetadataLog() error {
 	ml, err := metadata.NewLog(metadata.LogConfig{
 		DataDir: b.cfg.DataDir,
@@ -368,40 +322,31 @@ func (b *Broker) initMetadataLog() error {
 		return err
 	}
 
-	// Set replay callbacks to rebuild cluster state
 	ml.SetCallbacks(
-		// CREATE_TOPIC
 		func(e metadata.CreateTopicEntry) {
 			b.state.CreateTopicFromReplay(e.TopicName, int(e.PartitionCount), e.TopicID, e.Configs)
 		},
-		// DELETE_TOPIC
 		func(e metadata.DeleteTopicEntry) {
 			b.state.DeleteTopic(e.TopicName)
 		},
-		// ALTER_CONFIG
 		func(e metadata.AlterConfigEntry) {
 			b.state.SetTopicConfig(e.TopicName, e.Key, e.Value)
 		},
-		// OFFSET_COMMIT
 		func(e metadata.OffsetCommitEntry) {
 			b.state.SetCommittedOffsetFromReplay(e.Group, e.Topic, e.Partition, e.Offset, e.Metadata)
 		},
-		// PRODUCER_ID (Phase 4)
 		func(e metadata.ProducerIDEntry) {
 			b.state.PIDManager().SetNextPID(e.NextProducerID)
 		},
-		// LOG_START_OFFSET
 		func(e metadata.LogStartOffsetEntry) {
 			b.state.SetLogStartOffsetFromReplay(e.TopicName, e.Partition, e.LogStartOffset)
 		},
 	)
 
-	// Compaction watermark replay callback
 	ml.SetCompactionWatermarkCallback(func(e metadata.CompactionWatermarkEntry) {
 		b.state.SetCompactionWatermarkFromReplay(e.TopicName, e.Partition, e.CleanedUpTo)
 	})
 
-	// Set up SCRAM credential replay callbacks if SASL is enabled
 	if b.saslStore != nil {
 		ml.SetScramCallbacks(
 			func(e metadata.ScramCredentialEntry) {
@@ -429,7 +374,6 @@ func (b *Broker) initMetadataLog() error {
 		)
 	}
 
-	// Replay existing entries
 	count, err := ml.Replay()
 	if err != nil {
 		_ = ml.Close()
@@ -440,10 +384,7 @@ func (b *Broker) initMetadataLog() error {
 		b.logger.Info("metadata.log replay complete", "entries", count)
 	}
 
-	// Set up snapshot function for compaction
 	ml.SetSnapshotFn(b.state.SnapshotEntries)
-
-	// Compact if needed (after replay, live state is in memory)
 	ml.Compact()
 
 	b.metaLog = ml
@@ -452,7 +393,6 @@ func (b *Broker) initMetadataLog() error {
 	return nil
 }
 
-// initWAL initializes the WAL writer and replays existing WAL segments.
 func (b *Broker) initWAL() error {
 	walDir := filepath.Join(b.cfg.DataDir, "wal")
 
@@ -503,12 +443,10 @@ func (b *Broker) initWAL() error {
 	}
 	b.state.SetWALConfig(w, idx, pool)
 
-	// Replay existing WAL entries to rebuild state
 	if err := b.replayWAL(w); err != nil {
 		return fmt.Errorf("replay WAL: %w", err)
 	}
 
-	// Start the writer goroutine (after replay, so no concurrent writes during rebuild)
 	if err := w.Start(); err != nil {
 		return fmt.Errorf("start WAL writer: %w", err)
 	}
@@ -642,7 +580,6 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 	return nil
 }
 
-// initS3 initializes the S3 storage layer.
 func (b *Broker) initS3() error {
 	var s3api s3store.S3API
 	if b.cfg.S3API != nil {
@@ -652,7 +589,6 @@ func (b *Broker) initS3() error {
 			return fmt.Errorf("S3API config field must implement s3.S3API interface")
 		}
 	} else {
-		// Create a real AWS S3 client
 		var err error
 		s3api, err = createAWSS3Client(b.cfg)
 		if err != nil {
@@ -674,11 +610,9 @@ func (b *Broker) initS3() error {
 
 	b.s3Reader = s3store.NewReader(b.s3Client, b.logger)
 
-	// Set S3 fetcher on all existing partitions
 	fetchAdapter := &s3store.ReaderAdapter{Reader: b.s3Reader}
 	b.state.SetS3Fetcher(fetchAdapter)
 
-	// Set up the flusher with per-partition thresholds
 	flushInterval := b.cfg.S3FlushInterval
 	if flushInterval == 0 {
 		flushInterval = 60 * time.Second
@@ -692,7 +626,6 @@ func (b *Broker) initS3() error {
 		targetObjSize = 64 * 1024 * 1024 // 64 MiB
 	}
 
-	// Create triggerCh for emergency flush signaling from chunk pool pressure
 	triggerCh := make(chan struct{}, 1)
 	if b.chunkPool != nil {
 		b.chunkPool.SetTriggerCh(triggerCh)
@@ -705,7 +638,7 @@ func (b *Broker) initS3() error {
 		FlushInterval:     flushInterval,
 		CheckInterval:     checkInterval,
 		TargetObjectSize:  targetObjSize,
-		UploadConcurrency: 8,
+		UploadConcurrency: 16,
 		Logger:            b.logger,
 		TriggerCh:         triggerCh,
 		MetadataUploader:  b.uploadMetadataLog,
@@ -737,7 +670,6 @@ func (b *Broker) initS3() error {
 	return nil
 }
 
-// uploadMetadataLog uploads the metadata.log file to S3.
 func (b *Broker) uploadMetadataLog(ctx context.Context) error {
 	if b.metaLog == nil || b.s3Client == nil {
 		return nil
@@ -798,7 +730,6 @@ func (b *Broker) maybeRecoverFromS3() error {
 		return b.inferTopicsFromS3(ctx, client, prefix, metaPath)
 	}
 
-	// Write metadata.log to disk
 	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
 		return fmt.Errorf("write recovered metadata.log: %w", err)
 	}
@@ -1020,7 +951,6 @@ func (b *Broker) probeS3Watermarks() {
 	}
 }
 
-// createAWSS3Client creates an AWS S3 client from broker config.
 func createAWSS3Client(cfg Config) (s3store.S3API, error) {
 	region := cfg.S3Region
 	if region == "" {
@@ -1045,7 +975,6 @@ func createAWSS3Client(cfg Config) (s3store.S3API, error) {
 	return s3sdk.NewFromConfig(awsCfg, s3Opts...), nil
 }
 
-// s3PartitionAdapter adapts the cluster state to the s3.PartitionProvider interface.
 type s3PartitionAdapter struct {
 	state *cluster.State
 }
@@ -1057,7 +986,6 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 	for _, fp := range parts {
 		pd := fp.Partition_ // captured partition reference
 
-		// Read chunk state under RLock
 		pd.RLock()
 		hasData := pd.HasChunkData()
 		sealedBytes := pd.SealedChunkBytes()
@@ -1089,7 +1017,6 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 				pd.IncrementDirtyObjects()
 				pd.Unlock()
 
-				// Prune WAL index entries for flushed data
 				if walIdx := pd.WalIndex(); walIdx != nil {
 					tp := wal.TopicPartition{TopicID: fp.TopicID, Partition: fp.Partition}
 					walIdx.PruneBefore(tp, newWatermark)
@@ -1101,24 +1028,19 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 	return result
 }
 
-// Wait blocks until Run() returns.
 func (b *Broker) Wait() {
 	<-b.done
 }
 
-// ShutdownCh returns a channel that is closed when the broker is shutting down.
 func (b *Broker) ShutdownCh() <-chan struct{} {
 	return b.shutdownCh
 }
 
-// ClusterID returns the broker's cluster ID. Blocks until initialization is complete.
 func (b *Broker) ClusterID() string {
 	<-b.ready
 	return b.clusterID
 }
 
-// Addr returns the listener address, or empty string if not listening.
-// Blocks until initialization is complete.
 func (b *Broker) Addr() string {
 	<-b.ready
 	if b.listener != nil {
@@ -1127,23 +1049,18 @@ func (b *Broker) Addr() string {
 	return ""
 }
 
-// Ready returns a channel that is closed when the broker has finished initialization.
 func (b *Broker) Ready() <-chan struct{} {
 	return b.ready
 }
 
-// Handlers returns the handler registry for registering API handlers.
 func (b *Broker) Handlers() *server.HandlerRegistry {
 	return b.handlers
 }
 
-// resolveAdvertisedAddr determines the advertised address from config,
-// falling back to the actual listener address if not explicitly configured.
 func (b *Broker) resolveAdvertisedAddr() (addr string, warn bool) {
 	if b.cfg.AdvertisedAddr != "" {
 		return b.cfg.AdvertisedAddr, false
 	}
-	// Use the actual listener address (important for tests with random ports)
 	if b.listener != nil {
 		laddr := b.listener.Addr().String()
 		host, port, err := net.SplitHostPort(laddr)
@@ -1154,7 +1071,6 @@ func (b *Broker) resolveAdvertisedAddr() (addr string, warn bool) {
 			return laddr, false
 		}
 	}
-	// Fallback to config
 	return b.cfg.ResolveAdvertisedAddr()
 }
 
@@ -1166,10 +1082,8 @@ func (b *Broker) shutdown() {
 	}
 	b.quit = true
 
-	// 1. Close shutdownCh to wake all blockers
 	close(b.shutdownCh)
 
-	// 2. Close listener to stop accepting
 	if b.listener != nil {
 		_ = b.listener.Close()
 	}
@@ -1180,7 +1094,6 @@ func (b *Broker) shutdown() {
 func (b *Broker) loadOrCreateClusterID() (string, error) {
 	metaPath := filepath.Join(b.cfg.DataDir, "meta.properties")
 
-	// Try to read existing
 	data, err := os.ReadFile(metaPath)
 	if err == nil {
 		cid := parseClusterID(string(data))
@@ -1194,13 +1107,11 @@ func (b *Broker) loadOrCreateClusterID() (string, error) {
 		}
 	}
 
-	// Generate or use configured
 	cid := b.cfg.ClusterID
 	if cid == "" {
 		cid = generateClusterID()
 	}
 
-	// Persist
 	content := fmt.Sprintf("cluster.id=%s\n", cid)
 	if err := os.WriteFile(metaPath, []byte(content), 0o644); err != nil {
 		return "", fmt.Errorf("write meta.properties: %w", err)
@@ -1209,7 +1120,6 @@ func (b *Broker) loadOrCreateClusterID() (string, error) {
 	return cid, nil
 }
 
-// parseClusterID extracts the cluster.id value from meta.properties content.
 func parseClusterID(content string) string {
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
@@ -1220,14 +1130,11 @@ func parseClusterID(content string) string {
 	return ""
 }
 
-// generateClusterID generates a Kafka-compatible cluster ID (base64-encoded UUID, 22 chars).
 func generateClusterID() string {
 	id := uuid.New()
 	return base64.RawURLEncoding.EncodeToString(id[:])
 }
 
-// applyCLISASLUser re-applies the CLI-specified SASL user to override
-// any persisted credentials for the same user.
 func (b *Broker) applyCLISASLUser() {
 	switch b.cfg.SASLMechanism {
 	case sasl.MechanismPlain:
@@ -1241,7 +1148,6 @@ func (b *Broker) applyCLISASLUser() {
 	}
 }
 
-// scramMechName converts a mechanism number to a name string.
 func scramMechName(mech int8) string {
 	switch mech {
 	case 1:
@@ -1253,7 +1159,6 @@ func scramMechName(mech int8) string {
 	}
 }
 
-// compactionLoop runs the background compaction goroutine.
 func (b *Broker) compactionLoop(ctx context.Context) {
 	interval := b.cfg.CompactionCheckInterval
 	if interval == 0 {
@@ -1296,7 +1201,6 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 	}
 }
 
-// compactOneDirtyPartition finds the most eligible partition and compacts it.
 func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32) {
 	topics := b.state.GetAllTopics()
 
@@ -1353,7 +1257,6 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		return
 	}
 
-	// Determine topic-level configs
 	minCompactionLagMs := int64(0)
 	if v, ok := bestTD.Configs["min.compaction.lag.ms"]; ok {
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -1400,52 +1303,6 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 	}
 }
 
-// fetchMetricsLoop logs fetch long-poll metrics every 5 seconds.
-// Only emits a log line when there is fetch activity in the interval.
-func (b *Broker) fetchMetricsLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-b.shutdownCh:
-			return
-		case <-ticker.C:
-			s := b.fetchMetrics.SnapshotAndReset()
-			if s.IsZero() {
-				continue
-			}
-			b.logger.Info("fetch metrics",
-				"immediate", s.ImmediateData,
-				"longpoll", s.LongPollEntered,
-				"woken_by_produce", s.WokenByNotify,
-				"woken_by_timer", s.WokenByTimer,
-				"wait_<1ms", s.WaitUnder1ms,
-				"wait_1-5ms", s.WaitUnder5ms,
-				"wait_5-20ms", s.WaitUnder20ms,
-				"wait_20-100ms", s.WaitUnder100ms,
-				"wait_>100ms", s.WaitOver100ms,
-				"handler_<1ms", s.HandlerUnder1ms,
-				"handler_1-5ms", s.HandlerUnder5ms,
-				"handler_5-20ms", s.HandlerUnder20ms,
-				"handler_20-100ms", s.HandlerUnder100ms,
-				"handler_>100ms", s.HandlerOver100ms,
-				"reg_on_0", s.RegisteredOnZero,
-				"reg_on_1", s.RegisteredOnOne,
-				"reg_on_2+", s.RegisteredOnMany,
-				"zero_reason_nil_pd", s.SkippedNilPD,
-				"zero_reason_error", s.SkippedError,
-				"err_below_start", s.ErrBelowStart,
-				"err_above_hw", s.ErrAboveHW,
-				"notify_calls", s.NotifyCalls,
-				"waiters_found", s.NotifyWaitersHit,
-			)
-		}
-	}
-}
-
-// setupLogger creates an slog.Logger with the given level.
 func setupLogger(level string) *slog.Logger {
 	var lvl slog.Level
 	switch strings.ToLower(level) {

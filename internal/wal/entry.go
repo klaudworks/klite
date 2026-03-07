@@ -25,7 +25,6 @@ const (
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Entry represents a single WAL entry for a partition's RecordBatch.
 type Entry struct {
 	Sequence  uint64   // WAL sequence number (monotonic)
 	TopicID   [16]byte // Topic UUID
@@ -34,8 +33,6 @@ type Entry struct {
 	Data      []byte   // Raw RecordBatch bytes (already offset-assigned)
 }
 
-// MarshalEntry serializes a WAL entry into the on-disk format.
-// Returns the complete entry bytes including length prefix and CRC.
 func MarshalEntry(e *Entry) []byte {
 	payloadLen := entryFixedPayload + len(e.Data)
 	total := 4 + 4 + payloadLen
@@ -63,21 +60,19 @@ func MarshalEntry(e *Entry) []byte {
 	return buf
 }
 
-// UnmarshalEntry parses a WAL entry from the payload bytes (after length prefix).
-// The payload should start at the CRC field.
+// UnmarshalEntry parses payload bytes starting at the CRC field (after length prefix).
 func UnmarshalEntry(payload []byte) (Entry, error) {
 	if len(payload) < 4+entryFixedPayload {
 		return Entry{}, io.ErrUnexpectedEOF
 	}
 
-	// Validate CRC
 	storedCRC := binary.BigEndian.Uint32(payload[0:4])
 	actualCRC := crc32.Checksum(payload[4:], crc32cTable)
 	if storedCRC != actualCRC {
 		return Entry{}, ErrCRCMismatch
 	}
 
-	off := 4 // skip CRC
+	off := 4
 	seq := binary.BigEndian.Uint64(payload[off : off+8])
 	off += 8
 

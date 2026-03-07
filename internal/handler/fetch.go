@@ -9,20 +9,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleFetch returns the Fetch handler (API key 1).
-// Supports v4-16.
-//
-// Implements long-polling (MaxWaitMs/MinBytes), size limits (MaxBytes,
-// PartitionMaxBytes), KIP-74 (first batch always returned even if oversized),
-// fetch sessions (FETCH_SESSION_ID_NOT_FOUND for non-zero), and TopicID
-// resolution for v13+.
-func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.FetchMetrics) server.Handler {
+func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
-		handlerStart := time.Now()
 		r := req.(*kmsg.FetchRequest)
 		resp := r.ResponseKind().(*kmsg.FetchResponse)
 
-		// Version validation
 		minV, maxV, ok := VersionRange(1)
 		if !ok || r.Version < minV || r.Version > maxV {
 			return resp, nil
@@ -35,7 +26,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 			return resp, nil
 		}
 
-		// Resolve all topics and partitions upfront.
 		type partFetchInfo struct {
 			td          *cluster.TopicData
 			pd          *cluster.PartData
@@ -49,7 +39,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 		var allParts []partFetchInfo
 
 		for ti, rt := range r.Topics {
-			// Resolve topic
 			var td *cluster.TopicData
 			if r.Version >= 13 && rt.TopicID != [16]byte{} {
 				td = state.GetTopicByID(rt.TopicID)
@@ -73,7 +62,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 			}
 		}
 
-		// Perform the initial fetch and check if we need to long-poll.
 		type partResult struct {
 			sp       kmsg.FetchResponseTopicPartition
 			hasData  bool
@@ -118,11 +106,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 				fr := pd.Fetch(rp.FetchOffset, maxBytes)
 
 				if fr.Err != 0 {
-					if rp.FetchOffset < fr.LogStart {
-						fm.ErrBelowStart.Add(1)
-					} else {
-						fm.ErrAboveHW.Add(1)
-					}
 					sp.ErrorCode = fr.Err
 					sp.HighWatermark = fr.HW
 					sp.LastStableOffset = fr.LSO
@@ -161,7 +144,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 				sp.LastStableOffset = fr.LSO
 				sp.LogStartOffset = fr.LogStart
 
-				// Add aborted transaction info to response
 				if readCommitted {
 					for _, at := range abortedTxns {
 						sp.AbortedTransactions = append(sp.AbortedTransactions, kmsg.FetchResponseTopicPartitionAbortedTransaction{
@@ -171,7 +153,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 					}
 				}
 
-				// Serialize batch data into Records
 				dataSize := 0
 				if len(batches) > 0 {
 					for _, b := range batches {
@@ -193,74 +174,33 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 
 		results, totalBytes := doFetch()
 
-		// Long-polling: if we have less than MinBytes and MaxWaitMs > 0, wait
-		// for new data or timeout.
-		needsLongPoll := int32(totalBytes) < r.MinBytes && r.MaxWaitMillis > 0
-		if !needsLongPoll {
-			fm.ImmediateData.Add(1)
-		} else {
-			fm.LongPollEntered.Add(1)
-
-			// Create a shared waiter and register on partitions that had no data
+		if int32(totalBytes) < r.MinBytes && r.MaxWaitMillis > 0 {
 			w := cluster.NewFetchWaiter()
 			var regCount int
-			var skippedNilPD, skippedError int
 			for i, info := range allParts {
-				if info.pd == nil {
-					skippedNilPD++
+				if info.pd == nil || results[i].sp.ErrorCode != 0 || results[i].hasData {
 					continue
 				}
-				if results[i].sp.ErrorCode != 0 {
-					skippedError++
-					continue
-				}
-				if !results[i].hasData {
-					info.pd.RegisterWaiter(w)
-					regCount++
-				}
-			}
-			if regCount == 0 {
-				if skippedNilPD > 0 {
-					fm.SkippedNilPD.Add(1)
-				}
-				if skippedError > 0 {
-					fm.SkippedError.Add(1)
-				}
-			}
-			switch regCount {
-			case 0:
-				fm.RegisteredOnZero.Add(1)
-			case 1:
-				fm.RegisteredOnOne.Add(1)
-			default:
-				fm.RegisteredOnMany.Add(1)
+				info.pd.RegisterWaiter(w)
+				regCount++
 			}
 
 			// If no partitions were registered, skip the wait entirely —
 			// nothing can wake us, so we'd always hit the timer.
 			if regCount > 0 {
-				// Block until woken, timeout, or shutdown
-				waitStart := time.Now()
 				timer := time.NewTimer(time.Duration(r.MaxWaitMillis) * time.Millisecond)
 				select {
 				case <-w.Ch():
-					fm.WokenByNotify.Add(1)
 				case <-timer.C:
-					fm.WokenByTimer.Add(1)
 				case <-shutdownCh:
-					fm.WokenByShutdown.Add(1)
 				}
 				timer.Stop()
-				fm.RecordWait(time.Since(waitStart).Milliseconds())
 			}
 
-			// Re-fetch ALL partitions (not just the one that woke us)
 			results, _ = doFetch()
 		}
 
-		// Apply response-level MaxBytes across all partitions.
-		// Iterate through partitions and trim when we exceed MaxBytes,
-		// but always include at least one complete partition's data (KIP-74).
+		// KIP-74: always include at least one partition's data even if oversized.
 		if r.MaxBytes > 0 {
 			var responseTotalBytes int32
 			firstPartitionWithData := true
@@ -280,9 +220,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 			}
 		}
 
-		// Build the response
-		// Group results back into topic responses
-		topicMap := make(map[int]int) // topicIdx -> index in resp.Topics
+		topicMap := make(map[int]int)
 		for i, info := range allParts {
 			tidx, exists := topicMap[info.topicIdx]
 			if !exists {
@@ -298,7 +236,6 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.F
 			resp.Topics[tidx].Partitions = append(resp.Topics[tidx].Partitions, results[i].sp)
 		}
 
-		fm.RecordHandlerDuration(time.Since(handlerStart).Milliseconds())
 		return resp, nil
 	}
 }

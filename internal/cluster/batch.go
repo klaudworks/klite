@@ -6,11 +6,8 @@ import (
 	"hash/crc32"
 )
 
-// ErrShortBatch is returned when the raw batch is shorter than the 61-byte header.
 var ErrShortBatch = errors.New("batch too short: need at least 61 bytes")
 
-// BatchMeta holds fields extracted from the 61-byte RecordBatch header.
-// Extracted via direct byte reads — no kmsg.RecordBatch.ReadFrom().
 type BatchMeta struct {
 	BatchLength     int32
 	Magic           int8
@@ -65,41 +62,29 @@ func ParseBatchHeader(raw []byte) (BatchMeta, error) {
 	}, nil
 }
 
-// DefaultMaxMessageBytes is the default value for the max.message.bytes topic config.
 const DefaultMaxMessageBytes = 1048588
 
-// crc32cTable is the CRC-32C (Castagnoli) table used for RecordBatch CRC.
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 // SetLogAppendTime overwrites timestamps and attributes in the raw batch bytes
-// for LogAppendTime semantics. It sets BaseTimestamp and MaxTimestamp to the
-// given value, sets the timestamp type bit in Attributes, and recalculates
-// the CRC. The raw slice is mutated in-place. The returned BatchMeta reflects
-// the updated values.
+// for LogAppendTime semantics, and recalculates the CRC.
 func SetLogAppendTime(raw []byte, nowMillis int64, meta *BatchMeta) {
-	// Set BaseTimestamp (bytes 27-34)
 	binary.BigEndian.PutUint64(raw[27:35], uint64(nowMillis))
-	// Set MaxTimestamp (bytes 35-42)
 	binary.BigEndian.PutUint64(raw[35:43], uint64(nowMillis))
 
-	// Set timestamp type bit (bit 3 of Attributes, bytes 21-22)
 	attrs := binary.BigEndian.Uint16(raw[21:23])
 	attrs |= 0x0008 // bit 3 = LogAppendTime
 	binary.BigEndian.PutUint16(raw[21:23], attrs)
 
-	// Recalculate CRC over bytes 21+ and write to bytes 17-20
 	newCRC := crc32.Checksum(raw[21:], crc32cTable)
 	binary.BigEndian.PutUint32(raw[17:21], newCRC)
 
-	// Update meta to reflect changes
 	meta.BaseTimestamp = nowMillis
 	meta.MaxTimestamp = nowMillis
 	meta.Attributes = int16(attrs)
 	meta.CRC = newCRC
 }
 
-// ValidateBatchCRC checks the CRC32C of a raw RecordBatch.
-// CRC covers bytes 21 to end. Returns true if valid.
 func ValidateBatchCRC(raw []byte, expectedCRC uint32) bool {
 	if len(raw) < 22 {
 		return false

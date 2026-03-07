@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDescribeUserScramCredentials returns the handler for key 50.
 func HandleDescribeUserScramCredentials(store *sasl.Store) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DescribeUserSCRAMCredentialsRequest)
@@ -18,10 +17,8 @@ func HandleDescribeUserScramCredentials(store *sasl.Store) server.Handler {
 			return resp, nil
 		}
 
-		// Determine which users to describe
-		describe := make(map[string]bool) // false=normal, true=duplicated
+		describe := make(map[string]bool)
 		if r.Users == nil {
-			// null = list all SCRAM users
 			all := store.ListScramUsers()
 			for u := range all {
 				describe[u] = false

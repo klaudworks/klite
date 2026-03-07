@@ -12,7 +12,6 @@ const (
 	defaultMaxConnections = 10000
 )
 
-// Server manages TCP connections and dispatches Kafka requests.
 type Server struct {
 	handlers   *HandlerRegistry
 	shutdownCh <-chan struct{}
@@ -26,7 +25,6 @@ type Server struct {
 	wg sync.WaitGroup
 }
 
-// NewServer creates a new Server.
 func NewServer(handlers *HandlerRegistry, shutdownCh <-chan struct{}, logger *slog.Logger) *Server {
 	return &Server{
 		handlers:   handlers,
@@ -36,18 +34,14 @@ func NewServer(handlers *HandlerRegistry, shutdownCh <-chan struct{}, logger *sl
 	}
 }
 
-// SetSASLEnabled configures whether SASL authentication is required.
 func (s *Server) SetSASLEnabled(enabled bool) {
 	s.saslEnabled = enabled
 }
 
-// Serve accepts connections on ln and handles them until the listener is closed.
-// It returns nil on clean shutdown.
 func (s *Server) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Check if we're shutting down
 			select {
 			case <-s.shutdownCh:
 				return nil
@@ -60,7 +54,6 @@ func (s *Server) Serve(ln net.Listener) error {
 			continue
 		}
 
-		// Check connection limit
 		if s.connCount.Load() >= s.maxConns {
 			s.logger.Warn("connection limit reached, rejecting",
 				"remote", conn.RemoteAddr(), "limit", s.maxConns)
@@ -83,12 +76,10 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
-// Wait blocks until all active connections have been closed.
 func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
-// ConnCount returns the current number of active connections.
 func (s *Server) ConnCount() int64 {
 	return s.connCount.Load()
 }

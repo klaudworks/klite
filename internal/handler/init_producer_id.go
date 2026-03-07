@@ -10,8 +10,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleInitProducerID returns the InitProducerID handler (API key 22).
-// Supports v0-v5.
 func HandleInitProducerID(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.InitProducerIDRequest)
@@ -39,7 +37,6 @@ func HandleInitProducerID(state *cluster.State) server.Handler {
 		resp.ProducerID = pid
 		resp.ProducerEpoch = epoch
 
-		// Persist next producer ID to metadata.log
 		if ml := state.MetadataLog(); ml != nil {
 			entry := metadata.MarshalProducerID(&metadata.ProducerIDEntry{
 				NextProducerID: state.PIDManager().NextPID(),

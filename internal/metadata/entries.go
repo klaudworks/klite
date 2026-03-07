@@ -18,7 +18,6 @@ const (
 	EntryCompactionWatermark   byte = 0x09
 )
 
-// CreateTopicEntry records a topic creation.
 type CreateTopicEntry struct {
 	TopicName      string
 	PartitionCount int32
@@ -26,20 +25,17 @@ type CreateTopicEntry struct {
 	Configs        map[string]string
 }
 
-// DeleteTopicEntry records a topic deletion.
 type DeleteTopicEntry struct {
 	TopicName string
 	TopicID   [16]byte
 }
 
-// AlterConfigEntry records a single config change on a topic.
 type AlterConfigEntry struct {
 	TopicName string
 	Key       string
 	Value     string
 }
 
-// OffsetCommitEntry records a committed offset for a consumer group.
 type OffsetCommitEntry struct {
 	Group     string
 	Topic     string
@@ -48,23 +44,20 @@ type OffsetCommitEntry struct {
 	Metadata  string
 }
 
-// ProducerIDEntry records the next producer ID counter.
 type ProducerIDEntry struct {
 	NextProducerID int64
 }
 
-// LogStartOffsetEntry records an advanced logStartOffset for a partition.
 type LogStartOffsetEntry struct {
 	TopicName      string
 	Partition      int32
 	LogStartOffset int64
 }
 
-// --- Serialization ---
-//
-// Each entry: [1 byte type][type-specific payload]
-// Strings are encoded as [2 byte uint16 len][bytes].
-// Config maps: [2 byte uint16 count] then (key, value) pairs.
+// Serialization format:
+//   Each entry: [1B type][type-specific payload]
+//   Strings: [2B uint16 len][bytes]
+//   Config maps: [2B uint16 count] then (key, value) string pairs.
 
 func putString(buf []byte, off int, s string) int {
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(s)))
@@ -86,14 +79,8 @@ func getString(buf []byte, off int) (string, int, error) {
 	return s, off + n, nil
 }
 
-// MarshalCreateTopic serializes a CreateTopicEntry.
 func MarshalCreateTopic(e *CreateTopicEntry) []byte {
-	// Calculate size
-	size := 1                    // type
-	size += 2 + len(e.TopicName) // topic name
-	size += 4                    // partition count
-	size += 16                   // topic ID
-	size += 2                    // config count
+	size := 1 + 2 + len(e.TopicName) + 4 + 16 + 2
 	for k, v := range e.Configs {
 		size += 2 + len(k) + 2 + len(v)
 	}
@@ -115,7 +102,6 @@ func MarshalCreateTopic(e *CreateTopicEntry) []byte {
 	return buf
 }
 
-// UnmarshalCreateTopic deserializes a CreateTopicEntry from payload (after type byte).
 func UnmarshalCreateTopic(payload []byte) (CreateTopicEntry, error) {
 	var e CreateTopicEntry
 	off := 0
@@ -161,7 +147,6 @@ func UnmarshalCreateTopic(payload []byte) (CreateTopicEntry, error) {
 	return e, nil
 }
 
-// MarshalDeleteTopic serializes a DeleteTopicEntry.
 func MarshalDeleteTopic(e *DeleteTopicEntry) []byte {
 	size := 1 + 2 + len(e.TopicName) + 16
 	buf := make([]byte, size)
@@ -171,7 +156,6 @@ func MarshalDeleteTopic(e *DeleteTopicEntry) []byte {
 	return buf
 }
 
-// UnmarshalDeleteTopic deserializes a DeleteTopicEntry.
 func UnmarshalDeleteTopic(payload []byte) (DeleteTopicEntry, error) {
 	var e DeleteTopicEntry
 	var err error
@@ -186,7 +170,6 @@ func UnmarshalDeleteTopic(payload []byte) (DeleteTopicEntry, error) {
 	return e, nil
 }
 
-// MarshalAlterConfig serializes an AlterConfigEntry.
 func MarshalAlterConfig(e *AlterConfigEntry) []byte {
 	size := 1 + 2 + len(e.TopicName) + 2 + len(e.Key) + 2 + len(e.Value)
 	buf := make([]byte, size)
@@ -198,7 +181,6 @@ func MarshalAlterConfig(e *AlterConfigEntry) []byte {
 	return buf
 }
 
-// UnmarshalAlterConfig deserializes an AlterConfigEntry.
 func UnmarshalAlterConfig(payload []byte) (AlterConfigEntry, error) {
 	var e AlterConfigEntry
 	off := 0
@@ -216,7 +198,6 @@ func UnmarshalAlterConfig(payload []byte) (AlterConfigEntry, error) {
 	return e, err
 }
 
-// MarshalOffsetCommit serializes an OffsetCommitEntry.
 func MarshalOffsetCommit(e *OffsetCommitEntry) []byte {
 	size := 1 + 2 + len(e.Group) + 2 + len(e.Topic) + 4 + 8 + 2 + len(e.Metadata)
 	buf := make([]byte, size)
@@ -232,7 +213,6 @@ func MarshalOffsetCommit(e *OffsetCommitEntry) []byte {
 	return buf
 }
 
-// UnmarshalOffsetCommit deserializes an OffsetCommitEntry.
 func UnmarshalOffsetCommit(payload []byte) (OffsetCommitEntry, error) {
 	var e OffsetCommitEntry
 	off := 0
@@ -263,7 +243,6 @@ func UnmarshalOffsetCommit(payload []byte) (OffsetCommitEntry, error) {
 	return e, err
 }
 
-// MarshalProducerID serializes a ProducerIDEntry.
 func MarshalProducerID(e *ProducerIDEntry) []byte {
 	buf := make([]byte, 1+8)
 	buf[0] = EntryProducerID
@@ -271,7 +250,6 @@ func MarshalProducerID(e *ProducerIDEntry) []byte {
 	return buf
 }
 
-// UnmarshalProducerID deserializes a ProducerIDEntry.
 func UnmarshalProducerID(payload []byte) (ProducerIDEntry, error) {
 	if len(payload) < 8 {
 		return ProducerIDEntry{}, fmt.Errorf("short read for producer ID")
@@ -281,7 +259,6 @@ func UnmarshalProducerID(payload []byte) (ProducerIDEntry, error) {
 	}, nil
 }
 
-// MarshalLogStartOffset serializes a LogStartOffsetEntry.
 func MarshalLogStartOffset(e *LogStartOffsetEntry) []byte {
 	size := 1 + 2 + len(e.TopicName) + 4 + 8
 	buf := make([]byte, size)
@@ -294,7 +271,6 @@ func MarshalLogStartOffset(e *LogStartOffsetEntry) []byte {
 	return buf
 }
 
-// UnmarshalLogStartOffset deserializes a LogStartOffsetEntry.
 func UnmarshalLogStartOffset(payload []byte) (LogStartOffsetEntry, error) {
 	var e LogStartOffsetEntry
 	off := 0
@@ -318,16 +294,12 @@ func UnmarshalLogStartOffset(payload []byte) (LogStartOffsetEntry, error) {
 	return e, nil
 }
 
-// --- Compaction Watermark Entry ---
-
-// CompactionWatermarkEntry records the cleanedUpTo offset for a partition.
 type CompactionWatermarkEntry struct {
 	TopicName   string
 	Partition   int32
 	CleanedUpTo int64
 }
 
-// MarshalCompactionWatermark serializes a CompactionWatermarkEntry.
 func MarshalCompactionWatermark(e *CompactionWatermarkEntry) []byte {
 	size := 1 + 2 + len(e.TopicName) + 4 + 8
 	buf := make([]byte, size)
@@ -340,7 +312,6 @@ func MarshalCompactionWatermark(e *CompactionWatermarkEntry) []byte {
 	return buf
 }
 
-// UnmarshalCompactionWatermark deserializes a CompactionWatermarkEntry.
 func UnmarshalCompactionWatermark(payload []byte) (CompactionWatermarkEntry, error) {
 	var e CompactionWatermarkEntry
 	off := 0
@@ -364,9 +335,6 @@ func UnmarshalCompactionWatermark(payload []byte) (CompactionWatermarkEntry, err
 	return e, nil
 }
 
-// --- SCRAM Credential Entries ---
-
-// ScramCredentialEntry records a SCRAM credential upsert.
 type ScramCredentialEntry struct {
 	Username   string
 	Mechanism  int8 // 1=SHA-256, 2=SHA-512
@@ -376,7 +344,6 @@ type ScramCredentialEntry struct {
 	MechName   string // "SCRAM-SHA-256" or "SCRAM-SHA-512" (not persisted, derived from Mechanism)
 }
 
-// ScramCredentialDeleteEntry records a SCRAM credential deletion.
 type ScramCredentialDeleteEntry struct {
 	Username  string
 	Mechanism int8
@@ -404,7 +371,6 @@ func getBytes(buf []byte, off int) ([]byte, int, error) {
 	return b, off + n, nil
 }
 
-// MarshalScramCredential serializes a ScramCredentialEntry.
 func MarshalScramCredential(e *ScramCredentialEntry) []byte {
 	size := 1 + 2 + len(e.Username) + 1 + 4 + 2 + len(e.Salt) + 2 + len(e.SaltedPass)
 	buf := make([]byte, size)
@@ -420,7 +386,6 @@ func MarshalScramCredential(e *ScramCredentialEntry) []byte {
 	return buf
 }
 
-// UnmarshalScramCredential deserializes a ScramCredentialEntry.
 func UnmarshalScramCredential(payload []byte) (ScramCredentialEntry, error) {
 	var e ScramCredentialEntry
 	off := 0
@@ -451,7 +416,6 @@ func UnmarshalScramCredential(payload []byte) (ScramCredentialEntry, error) {
 	return e, nil
 }
 
-// MarshalScramCredentialDelete serializes a ScramCredentialDeleteEntry.
 func MarshalScramCredentialDelete(e *ScramCredentialDeleteEntry) []byte {
 	size := 1 + 2 + len(e.Username) + 1
 	buf := make([]byte, size)
@@ -462,7 +426,6 @@ func MarshalScramCredentialDelete(e *ScramCredentialDeleteEntry) []byte {
 	return buf
 }
 
-// UnmarshalScramCredentialDelete deserializes a ScramCredentialDeleteEntry.
 func UnmarshalScramCredentialDelete(payload []byte) (ScramCredentialDeleteEntry, error) {
 	var e ScramCredentialDeleteEntry
 	off := 0

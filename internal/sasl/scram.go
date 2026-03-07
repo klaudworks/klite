@@ -26,7 +26,6 @@ const (
 	MaxIterations     = 16384
 )
 
-// ScramAuth holds pre-derived SCRAM credentials for a user.
 type ScramAuth struct {
 	Mechanism  string // "SCRAM-SHA-256" or "SCRAM-SHA-512"
 	Iterations int
@@ -34,7 +33,6 @@ type ScramAuth struct {
 	Salt       []byte
 }
 
-// NewScramAuth derives SCRAM credentials from a plaintext password.
 func NewScramAuth(mechanism, password string) ScramAuth {
 	salt := make([]byte, 10)
 	if _, err := rand.Read(salt); err != nil {
@@ -43,7 +41,6 @@ func NewScramAuth(mechanism, password string) ScramAuth {
 	return NewScramAuthWithSalt(mechanism, password, salt, DefaultIterations)
 }
 
-// NewScramAuthWithSalt derives SCRAM credentials with a specific salt and iteration count.
 func NewScramAuthWithSalt(mechanism, password string, salt []byte, iterations int) ScramAuth {
 	var saltedPass []byte
 	switch mechanism {
@@ -73,8 +70,6 @@ func ScramAuthFromPreHashed(mechanism string, iterations int, saltedPass, salt [
 	}
 }
 
-// --- PLAIN parsing ---
-
 // ParsePlain parses SASL PLAIN auth bytes: \0<username>\0<password>
 // or <authzid>\0<username>\0<password>.
 func ParsePlain(auth []byte) (user, pass string, err error) {
@@ -88,9 +83,6 @@ func ParsePlain(auth []byte) (user, pass string, err error) {
 	return parts[1], parts[2], nil
 }
 
-// --- SCRAM server-side protocol ---
-
-// ScramClient0 holds parsed client-first-message data.
 type ScramClient0 struct {
 	User  string
 	Bare  []byte // client-first-message-bare
@@ -99,7 +91,6 @@ type ScramClient0 struct {
 
 var scramUnescaper = strings.NewReplacer("=3D", "=", "=2C", ",")
 
-// ParseScramClient0 parses a client-first-message.
 func ParseScramClient0(client0 []byte) (ScramClient0, error) {
 	m := reClient0.FindSubmatch(client0)
 	if len(m) == 0 {
@@ -124,15 +115,12 @@ func ParseScramClient0(client0 []byte) (ScramClient0, error) {
 	}, nil
 }
 
-// ScramServer0 holds server-side state between SCRAM rounds 1 and 2.
 type ScramServer0 struct {
 	Auth        ScramAuth
 	Client0Bare []byte
 	ServerFirst []byte
 }
 
-// NewScramServerFirst generates the server-first-message and returns
-// the state needed for round 2.
 func NewScramServerFirst(client0 ScramClient0, auth ScramAuth) (ScramServer0, []byte) {
 	serverNonceBytes := make([]byte, 16)
 	if _, err := rand.Read(serverNonceBytes); err != nil {
@@ -153,7 +141,6 @@ func NewScramServerFirst(client0 ScramClient0, auth ScramAuth) (ScramServer0, []
 	}, serverFirst
 }
 
-// ServerFinal validates client-final-message and returns server-final-message.
 func (s *ScramServer0) ServerFinal(clientFinal []byte) ([]byte, error) {
 	m := reClientFinal.FindSubmatch(clientFinal)
 	if len(m) == 0 {
@@ -179,16 +166,9 @@ func (s *ScramServer0) ServerFinal(clientFinal []byte) ([]byte, error) {
 		return nil, fmt.Errorf("client proof length %d != expected %d", len(clientProof), h().Size())
 	}
 
-	// Derive ClientKey via HMAC of salted password
 	clientKey := computeHMAC(h, s.Auth.SaltedPass, []byte("Client Key"))
-
-	// Derive StoredKey by hashing ClientKey
 	storedKey := computeHash(h, clientKey)
-
-	// Build the auth message from the three SCRAM legs
 	authMessage := buildAuthMessage(s.Client0Bare, s.ServerFirst, finalWithoutProof)
-
-	// Derive client signature from stored key and auth message
 	clientSignature := computeHMAC(h, storedKey, authMessage)
 
 	// Verify: XOR(ClientProof, ClientSignature) should give ClientKey,
@@ -203,7 +183,6 @@ func (s *ScramServer0) ServerFinal(clientFinal []byte) ([]byte, error) {
 		return nil, errors.New("invalid password")
 	}
 
-	// Derive server key and signature for the server-final message
 	serverKey := computeHMAC(h, s.Auth.SaltedPass, []byte("Server Key"))
 	serverSignature := computeHMAC(h, serverKey, authMessage)
 
@@ -232,8 +211,6 @@ func buildAuthMessage(c0bare, s0, finalWithoutProof []byte) []byte {
 	msg = append(msg, finalWithoutProof...)
 	return msg
 }
-
-// --- Regex for SCRAM message parsing ---
 
 var reClient0, reClientFinal *regexp.Regexp
 

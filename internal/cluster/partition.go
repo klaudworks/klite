@@ -2,10 +2,8 @@ package cluster
 
 import (
 	"context"
-	"log/slog"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
@@ -13,59 +11,46 @@ import (
 	"github.com/klaudworks/klite/internal/wal"
 )
 
-var fetchAboveHWLogCount atomic.Int64
-
-// ErrCodeOffsetOutOfRange is the Kafka error code for OFFSET_OUT_OF_RANGE.
 const ErrCodeOffsetOutOfRange int16 = 1
 
-// StoredBatch holds raw bytes and metadata extracted from the batch header.
-// Used in ring buffers, WAL reads, and S3 reads.
 type StoredBatch struct {
 	BaseOffset      int64
 	LastOffsetDelta int32
-	RawBytes        []byte // Original RecordBatch bytes from the client
+	RawBytes        []byte
 	MaxTimestamp    int64
 	NumRecords      int32
 }
 
-// S3Fetcher is the interface for reading from S3 in the fetch cascade.
-// Implemented by s3.Reader. Kept as an interface to avoid circular imports.
+// S3Fetcher abstracts S3 reads to avoid circular imports with s3.Reader.
 type S3Fetcher interface {
 	FetchBatches(ctx context.Context, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) ([]S3BatchData, error)
 }
 
-// S3BatchData holds batch data returned from S3.
 type S3BatchData struct {
 	RawBytes        []byte
 	BaseOffset      int64
 	LastOffsetDelta int32
 }
 
-// FetchWaiter represents a Fetch request waiting for new data (long polling).
-// A single FetchWaiter is shared across multiple partitions. Multiple partitions
-// may call CloseOnce concurrently — sync.Once prevents double-close panic.
+// FetchWaiter is shared across partitions for long-poll wake-up.
+// sync.Once prevents double-close when multiple partitions wake the same waiter.
 type FetchWaiter struct {
-	once sync.Once     // ensures ch is closed exactly once
-	ch   chan struct{} // closed when data arrives (wake-up signal only, no data)
+	once sync.Once
+	ch   chan struct{}
 }
 
-// NewFetchWaiter creates a new fetch waiter with a fresh wake channel.
 func NewFetchWaiter() *FetchWaiter {
 	return &FetchWaiter{ch: make(chan struct{})}
 }
 
-// Ch returns the wake-up channel. Select on this to be notified when data arrives.
 func (w *FetchWaiter) Ch() <-chan struct{} {
 	return w.ch
 }
 
-// CloseOnce safely closes the wake channel. Multiple partitions may call this
-// concurrently for the same shared waiter — sync.Once prevents double-close panic.
 func (w *FetchWaiter) CloseOnce() {
 	w.once.Do(func() { close(w.ch) })
 }
 
-// pendingBatch holds a batch waiting for sequential commit ordering.
 type pendingBatch struct {
 	StoredBatch
 }
@@ -80,7 +65,7 @@ type pendingBatch struct {
 //
 // Callers are responsible for holding the appropriate lock before
 // calling methods. Write methods (PushBatch, ReserveOffset, CommitBatch)
-// require mu.Lock(). Read methods (FetchFrom, ListOffsets) require mu.RLock().
+// require mu.Lock(). Read methods (Fetch, ListOffsets) require mu.RLock().
 //
 // Storage: uses chunk pool for recent batches in memory, WAL on disk,
 // and optionally S3 for older data. The produce path uses
@@ -129,19 +114,16 @@ type PartData struct {
 	lastCompacted time.Time // wall clock time of last successful compaction (volatile)
 }
 
-// HW returns the current high watermark (next offset to be assigned).
 // Caller must hold pd.mu.RLock() or pd.mu.Lock().
 func (pd *PartData) HW() int64 {
 	return pd.hw
 }
 
-// CleanedUpTo returns the highest offset that has been compacted.
 // Caller must hold pd.mu.RLock() or pd.mu.Lock().
 func (pd *PartData) CleanedUpTo() int64 {
 	return pd.cleanedUpTo
 }
 
-// SetCleanedUpTo sets the compaction watermark.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) SetCleanedUpTo(offset int64) {
 	if offset > pd.cleanedUpTo {
@@ -149,67 +131,44 @@ func (pd *PartData) SetCleanedUpTo(offset int64) {
 	}
 }
 
-// DirtyObjects returns the number of dirty S3 objects since last compaction.
 func (pd *PartData) DirtyObjects() int32 {
 	pd.mu.RLock()
 	defer pd.mu.RUnlock()
 	return pd.dirtyObjects
 }
 
-// IncrementDirtyObjects atomically increments the dirty object counter.
-// Called after S3 flush. Caller must hold pd.mu.Lock().
+// Caller must hold pd.mu.Lock().
 func (pd *PartData) IncrementDirtyObjects() {
 	pd.dirtyObjects++
 }
 
-// ResetDirtyObjects resets the dirty counter and updates lastCompacted.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) ResetDirtyObjects(now time.Time) {
 	pd.dirtyObjects = 0
 	pd.lastCompacted = now
 }
 
-// SetDirtyObjects sets the dirty object count (used during startup rehydration).
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) SetDirtyObjects(count int32) {
 	pd.dirtyObjects = count
 }
 
-// LastCompacted returns the time of last successful compaction.
 func (pd *PartData) LastCompacted() time.Time {
 	pd.mu.RLock()
 	defer pd.mu.RUnlock()
 	return pd.lastCompacted
 }
 
-// LogStart returns the log start offset.
 // Caller must hold pd.mu.RLock() or pd.mu.Lock().
 func (pd *PartData) LogStart() int64 {
 	return pd.logStart
 }
 
-// Lock acquires the partition write lock.
-func (pd *PartData) Lock() {
-	pd.mu.Lock()
-}
+func (pd *PartData) Lock()    { pd.mu.Lock() }
+func (pd *PartData) Unlock()  { pd.mu.Unlock() }
+func (pd *PartData) RLock()   { pd.mu.RLock() }
+func (pd *PartData) RUnlock() { pd.mu.RUnlock() }
 
-// Unlock releases the partition write lock.
-func (pd *PartData) Unlock() {
-	pd.mu.Unlock()
-}
-
-// RLock acquires the partition read lock.
-func (pd *PartData) RLock() {
-	pd.mu.RLock()
-}
-
-// RUnlock releases the partition read lock.
-func (pd *PartData) RUnlock() {
-	pd.mu.RUnlock()
-}
-
-// InitWAL initializes the WAL-aware fields on this partition.
-// Called when the broker enables WAL persistence.
 func (pd *PartData) InitWAL(pool *chunk.Pool, writer *wal.Writer, idx *wal.Index) {
 	pd.chunkPool = pool
 	pd.walWriter = writer
@@ -218,7 +177,6 @@ func (pd *PartData) InitWAL(pool *chunk.Pool, writer *wal.Writer, idx *wal.Index
 	pd.nextCommit = pd.hw
 }
 
-// SetHW sets the high watermark directly. Used during WAL replay.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) SetHW(hw int64) {
 	pd.hw = hw
@@ -230,13 +188,11 @@ func (pd *PartData) SetHW(hw int64) {
 	}
 }
 
-// S3FlushWatermark returns the highest offset+1 flushed to S3.
 // Caller must hold pd.mu.RLock() or pd.mu.Lock().
 func (pd *PartData) S3FlushWatermark() int64 {
 	return pd.s3FlushWatermark
 }
 
-// SetS3FlushWatermark sets the S3 flush watermark.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) SetS3FlushWatermark(w int64) {
 	if w > pd.s3FlushWatermark {
@@ -244,41 +200,26 @@ func (pd *PartData) SetS3FlushWatermark(w int64) {
 	}
 }
 
-// SetS3Fetcher sets the S3 fetcher for tier 3 reads.
 func (pd *PartData) SetS3Fetcher(f S3Fetcher) {
 	pd.s3Fetch = f
 }
 
-// HasS3 returns whether S3 is configured for this partition.
 func (pd *PartData) HasS3() bool {
 	return pd.s3Fetch != nil
 }
 
-// PushBatch appends a batch, assigns offset. Returns base offset and any
-// unused spare chunk (caller must release it after releasing pd.mu).
-// Caller must hold pd.mu.Lock(). After releasing mu, caller should
-// call pd.NotifyWaiters() to wake long-polling Fetch requests.
-//
-// spare is a pre-acquired chunk from AcquireSpareChunk (may be nil).
-// Callers should acquire the spare before taking pd.mu to avoid blocking
-// under the partition lock.
-//
-// Used by WAL replay and transaction control batches (EndTxn).
-// The normal produce path uses ReserveOffset + appendToChunk + WAL append + CommitBatch.
+// PushBatch assigns an offset and appends a batch. Returns base offset and
+// any unused spare chunk. Caller must hold pd.mu.Lock().
+// Used by WAL replay and EndTxn; normal produce uses ReserveOffset + CommitBatch.
 func (pd *PartData) PushBatch(raw []byte, meta BatchMeta, spare *chunk.Chunk) (int64, *chunk.Chunk) {
 	baseOffset := pd.hw
 
-	// Make a copy of the raw bytes so we own them (the caller's buffer may be reused)
 	stored := make([]byte, len(raw))
 	copy(stored, raw)
 
-	// Assign server-side base offset and PartitionLeaderEpoch
 	AssignOffset(stored, baseOffset)
-
-	// Advance high watermark
 	pd.hw = baseOffset + int64(meta.LastOffsetDelta) + 1
 
-	// Append to chunk pool
 	spare = pd.appendToChunk(stored, chunk.ChunkBatch{
 		BaseOffset:      baseOffset,
 		LastOffsetDelta: meta.LastOffsetDelta,
@@ -295,64 +236,51 @@ func (pd *PartData) PushBatch(raw []byte, meta BatchMeta, spare *chunk.Chunk) (i
 	return baseOffset, spare
 }
 
-// ReserveOffset reserves an offset range for a batch without storing data.
-// Called under pd.mu.Lock(). Returns the assigned base offset.
-// After this call, the caller should write to WAL (without holding the lock),
-// wait for fsync, then call CommitBatch.
+// ReserveOffset reserves an offset range without storing data.
+// Caller must hold pd.mu.Lock().
 func (pd *PartData) ReserveOffset(meta BatchMeta) int64 {
 	base := pd.nextReserve
 	pd.nextReserve = base + int64(meta.LastOffsetDelta) + 1
 	return base
 }
 
-// RollbackReserve undoes offset reservation on WAL submission failure.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) RollbackReserve(baseOffset int64) {
 	pd.nextReserve = baseOffset
 }
 
-// SkipOffsets advances nextCommit past a gap of offsets that will never be
-// committed (e.g., WAL write failure). Drains any pending commits that
-// become unblocked. Caller must hold pd.mu.Lock().
+// SkipOffsets advances past offsets that will never be committed (e.g. WAL failure).
+// Caller must hold pd.mu.Lock().
 func (pd *PartData) SkipOffsets(baseOffset, count int64) {
 	endOffset := baseOffset + count
 	if endOffset <= pd.nextCommit {
 		return // already past this range
 	}
 	if baseOffset == pd.nextCommit {
-		// Gap is exactly at nextCommit — advance past it directly.
 		pd.nextCommit = endOffset
 		pd.hw = endOffset
 		pd.drainPendingCommits()
 	} else {
-		// Gap is ahead of nextCommit (out-of-order skip). Insert a
-		// sentinel into pendingCommits so it drains when we catch up.
-		// LastOffsetDelta = count-1 so that nextCommit advances by count.
+		// Out-of-order skip: insert sentinel so it drains when we catch up.
 		sentinel := StoredBatch{
 			BaseOffset:      baseOffset,
 			LastOffsetDelta: int32(count - 1),
-			RawBytes:        nil, // nil marks this as a skip sentinel
+			RawBytes:        nil,
 		}
 		pd.insertPendingCommit(sentinel)
 	}
 }
 
-// CommitBatch advances HW after WAL fsync completes.
-// The batch data is already in the chunk pool (written during AppendToChunk
-// after WAL fsync). This method only advances HW and nextCommit.
-// Called under pd.mu.Lock().
+// CommitBatch advances HW after WAL fsync. Caller must hold pd.mu.Lock().
 func (pd *PartData) CommitBatch(batch StoredBatch) {
 	if batch.BaseOffset == pd.nextCommit {
 		pd.applyCommit(batch)
 		pd.drainPendingCommits()
 	} else {
-		// Out of order: queue until earlier offsets commit
 		pd.insertPendingCommit(batch)
 	}
 }
 
-// applyCommit advances nextCommit and HW for a single batch. Handles both
-// real batches (RawBytes != nil) and skip sentinels (RawBytes == nil).
 func (pd *PartData) applyCommit(batch StoredBatch) {
 	pd.nextCommit = batch.BaseOffset + int64(batch.LastOffsetDelta) + 1
 	pd.hw = pd.nextCommit
@@ -362,8 +290,6 @@ func (pd *PartData) applyCommit(batch StoredBatch) {
 	}
 }
 
-// drainPendingCommits processes queued commits (and skip sentinels) that
-// are now in order after nextCommit advanced.
 func (pd *PartData) drainPendingCommits() {
 	for len(pd.pendingCommits) > 0 && pd.pendingCommits[0].BaseOffset == pd.nextCommit {
 		next := pd.pendingCommits[0].StoredBatch
@@ -372,7 +298,6 @@ func (pd *PartData) drainPendingCommits() {
 	}
 }
 
-// insertPendingCommit adds a batch to the pending commits queue in sorted order.
 func (pd *PartData) insertPendingCommit(batch StoredBatch) {
 	pb := pendingBatch{StoredBatch: batch}
 	idx := sort.Search(len(pd.pendingCommits), func(i int) bool {
@@ -383,7 +308,6 @@ func (pd *PartData) insertPendingCommit(batch StoredBatch) {
 	pd.pendingCommits[idx] = pb
 }
 
-// updateMaxTimestamp updates max timestamp tracking.
 func (pd *PartData) updateMaxTimestamp(baseOffset int64, lastOffsetDelta int32, maxTimestamp int64) {
 	if !pd.hasMaxTimestamp || maxTimestamp >= pd.maxTimestampVal {
 		pd.hasMaxTimestamp = true
@@ -392,27 +316,18 @@ func (pd *PartData) updateMaxTimestamp(baseOffset int64, lastOffsetDelta int32, 
 	}
 }
 
-// NotifyWaiters wakes all registered fetch waiters.
-// If fm is non-nil, increments the notify counters.
-// Caller must NOT hold pd.mu (takes pd.waiterMu internally).
-func (pd *PartData) NotifyWaiters(fm *FetchMetrics) {
+// Caller must NOT hold pd.mu.
+func (pd *PartData) NotifyWaiters() {
 	pd.waiterMu.Lock()
 	waiters := pd.waiters
 	pd.waiters = nil
 	pd.waiterMu.Unlock()
 
-	if fm != nil {
-		fm.NotifyCalls.Add(1)
-		fm.NotifyWaitersHit.Add(int64(len(waiters)))
-	}
-
 	for _, w := range waiters {
-		w.CloseOnce() // safe even if another partition already closed it
+		w.CloseOnce()
 	}
 }
 
-// RegisterWaiter registers a shared fetch waiter on this partition.
-// The same waiter can be registered on multiple partitions (shared channel).
 // Caller must NOT hold pd.mu.
 func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 	pd.waiterMu.Lock()
@@ -420,19 +335,16 @@ func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 	pd.waiterMu.Unlock()
 }
 
-// FetchResponse is the result of a validated fetch on a single partition.
 type FetchResponse struct {
 	HW       int64
 	LogStart int64
 	LSO      int64
 	Batches  []StoredBatch
-	Err      int16 // non-zero = Kafka error code; batches will be nil
+	Err      int16
 }
 
-// Fetch validates the fetch offset and returns batches in one atomic operation.
-// Offset validation and the chunk-pool read share a single RLock acquisition,
-// so the HW used for validation is the same HW used for the visibility gate.
-// Cold-path reads (WAL, S3) happen after releasing the lock.
+// Fetch validates the offset and returns batches. Hot-path reads (chunks)
+// happen under RLock; cold-path reads (WAL, S3) happen after releasing it.
 // Caller must NOT hold pd.mu.
 func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	pd.mu.RLock()
@@ -441,24 +353,11 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	lso := pd.LSO()
 
 	if fetchOffset < logStart || fetchOffset > hw {
-		if fetchOffset > hw {
-			cnt := fetchAboveHWLogCount.Add(1)
-			if cnt <= 5 || cnt%500 == 0 {
-				slog.Warn("Fetch: offset above HW (under RLock)",
-					"partition", pd.Index,
-					"fetchOffset", fetchOffset,
-					"hw", hw,
-					"nextReserve", pd.nextReserve,
-					"nextCommit", pd.nextCommit,
-					"logStart", logStart)
-			}
-		}
 		pd.mu.RUnlock()
 		return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Err: ErrCodeOffsetOutOfRange}
 	}
 
 	if fetchOffset == hw {
-		// Caught up — no data to return but not an error.
 		pd.mu.RUnlock()
 		return FetchResponse{HW: hw, LogStart: logStart, LSO: lso}
 	}
@@ -472,7 +371,6 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 		}
 	}
 
-	// Capture immutable references needed for cold reads before releasing lock.
 	topicID := pd.TopicID
 	partIdx := pd.Index
 	topic := pd.Topic
@@ -481,74 +379,16 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	s3Fetch := pd.s3Fetch
 	pd.mu.RUnlock()
 
-	// Tier 2 & 3: WAL and S3 reads (no lock held)
 	if coldBatches := fetchFromCold(fetchOffset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch); len(coldBatches) > 0 {
-		// Apply the same HW visibility gate as the chunk path: drop any
-		// batch whose offsets extend beyond the HW we captured under RLock.
 		coldBatches = filterBatchesByHW(coldBatches, hw)
 		if len(coldBatches) > 0 {
 			return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: coldBatches}
 		}
 	}
 
-	// Cold storage has nothing. If chunks had data at a higher offset (gap),
-	// return it so the consumer skips past the gap instead of getting stuck.
 	return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: chunkBatches}
 }
 
-// FetchFrom collects batches starting at offset, up to maxBytes.
-// KIP-74: always includes at least one complete batch even if it exceeds maxBytes.
-// Returns nil if no batches match.
-//
-// This method manages its own locking: it acquires RLock for in-memory reads
-// and releases it before any disk/network I/O (WAL pread, S3 HTTP).
-// Caller must NOT hold pd.mu.
-//
-// Implements the three-tier read cascade:
-// 1. Chunk pool (memory) — under RLock, gated by HW
-// 2. WAL index + pread — no lock held
-// 3. S3 range read (if configured) — no lock held
-func (pd *PartData) FetchFrom(offset int64, maxBytes int32) []StoredBatch {
-	// Tier 1: Chunk pool (fast path, under RLock)
-	pd.mu.RLock()
-	hw := pd.hw
-	if offset >= hw {
-		pd.mu.RUnlock()
-		return nil
-	}
-	chunkBatches := pd.fetchFromChunks(offset, maxBytes, hw)
-	if len(chunkBatches) > 0 {
-		// Only use chunk results if they actually cover the requested offset.
-		// If the first batch starts beyond the requested offset, the earlier
-		// data must be in S3 (or WAL) — fall through to cold storage so the
-		// consumer sees records in order.
-		first := chunkBatches[0]
-		if first.BaseOffset <= offset || first.BaseOffset == pd.logStart {
-			pd.mu.RUnlock()
-			return chunkBatches
-		}
-	}
-	// Capture immutable references needed for cold reads before releasing lock.
-	topicID := pd.TopicID
-	partIdx := pd.Index
-	topic := pd.Topic
-	walIdx := pd.walIndex
-	walW := pd.walWriter
-	s3Fetch := pd.s3Fetch
-	pd.mu.RUnlock()
-
-	// Tier 2 & 3: WAL and S3 reads (no lock held)
-	if coldBatches := fetchFromCold(offset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch); len(coldBatches) > 0 {
-		return coldBatches
-	}
-
-	// Cold storage has nothing for this offset. If the chunk pool had data
-	// at a higher offset (gap), return it so the consumer skips past the gap
-	// instead of getting stuck.
-	return chunkBatches
-}
-
-// readFromWAL reads batches from WAL index entries.
 func readFromWAL(walW *wal.Writer, entries []wal.IndexEntry) []StoredBatch {
 	var result []StoredBatch
 	for _, e := range entries {
@@ -571,7 +411,6 @@ func readFromWAL(walW *wal.Writer, entries []wal.IndexEntry) []StoredBatch {
 	return result
 }
 
-// readFromS3 reads batches from S3.
 func readFromS3(s3Fetch S3Fetcher, topic string, topicID [16]byte, partition int32, offset int64, maxBytes int32) []StoredBatch {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -596,7 +435,6 @@ func readFromS3(s3Fetch S3Fetcher, topic string, topicID [16]byte, partition int
 	return result
 }
 
-// filterBatchesByHW drops batches whose offsets extend beyond hw.
 func filterBatchesByHW(batches []StoredBatch, hw int64) []StoredBatch {
 	n := 0
 	for _, b := range batches {
@@ -608,23 +446,15 @@ func filterBatchesByHW(batches []StoredBatch, hw int64) []StoredBatch {
 	return batches[:n]
 }
 
-// fetchFromCold implements the WAL + S3 tiers of the read cascade.
-// Called without any partition lock held.
 func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32, topic string, walIdx *wal.Index, walW *wal.Writer, s3Fetch S3Fetcher) []StoredBatch {
-	// Look up WAL entries once and reuse for both the primary and fallback paths.
 	var walEntries []wal.IndexEntry
 	if walIdx != nil && walW != nil {
 		tp := wal.TopicPartition{TopicID: topicID, Partition: partIdx}
 		walEntries = walIdx.Lookup(tp, offset, maxBytes)
 	}
 
-	// Try WAL first, then S3, with fallback logic for disaster recovery.
 	walHasOffset := false
 	if len(walEntries) > 0 {
-		// Only use WAL if its entries actually start at or near the
-		// requested offset. If the first entry's BaseOffset is far
-		// beyond the requested offset, the data for the requested
-		// offset is not in the WAL — try S3 first.
 		if walEntries[0].BaseOffset <= offset || s3Fetch == nil {
 			walHasOffset = true
 			if result := readFromWAL(walW, walEntries); len(result) > 0 {
@@ -633,14 +463,12 @@ func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32
 		}
 	}
 
-	// S3 range read
 	if s3Fetch != nil {
 		if result := readFromS3(s3Fetch, topic, topicID, partIdx, offset, maxBytes); len(result) > 0 {
 			return result
 		}
 	}
 
-	// Fallback: if S3 didn't have data but WAL does (for a higher range), use WAL
 	if !walHasOffset && len(walEntries) > 0 {
 		if result := readFromWAL(walW, walEntries); len(result) > 0 {
 			return result
@@ -677,9 +505,7 @@ func (pd *PartData) ListOffsets(timestamp int64, isolationLevel int8) (offset, t
 	}
 }
 
-// listOffsetsChunkTimestamp scans chunks for a timestamp match.
 func (pd *PartData) listOffsetsChunkTimestamp(timestamp int64) (int64, int64) {
-	// Scan sealed chunks first (oldest data), then current chunk
 	for _, c := range pd.chunkSealed {
 		for _, b := range c.Batches {
 			if b.MaxTimestamp >= timestamp {
@@ -698,8 +524,7 @@ func (pd *PartData) listOffsetsChunkTimestamp(timestamp int64) (int64, int64) {
 	return -1, -1
 }
 
-// LSO returns the last stable offset: min(HW, oldest open transaction's first offset).
-// For read_committed consumers. Caller must hold pd.mu.RLock().
+// LSO returns min(HW, oldest open txn first offset). Caller must hold pd.mu.RLock().
 func (pd *PartData) LSO() int64 {
 	if len(pd.openTxnPIDs) == 0 {
 		return pd.hw
@@ -713,7 +538,6 @@ func (pd *PartData) LSO() int64 {
 	return lso
 }
 
-// AddOpenTxn records that a transactional producer has started writing to this partition.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) AddOpenTxn(producerID, firstOffset int64) {
 	if pd.openTxnPIDs == nil {
@@ -724,19 +548,16 @@ func (pd *PartData) AddOpenTxn(producerID, firstOffset int64) {
 	}
 }
 
-// RemoveOpenTxn removes the open transaction tracking for a producer.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) RemoveOpenTxn(producerID int64) {
 	delete(pd.openTxnPIDs, producerID)
 }
 
-// AddAbortedTxn adds an aborted transaction entry to this partition.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) AddAbortedTxn(entry AbortedTxnEntry) {
 	pd.abortedTxns = append(pd.abortedTxns, entry)
 }
 
-// AbortedTxnsInRange returns aborted transactions overlapping the given offset range.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) AbortedTxnsInRange(fetchOffset, lastOffset int64) []AbortedTxnEntry {
 	var result []AbortedTxnEntry
@@ -752,9 +573,6 @@ func (pd *PartData) AbortedTxnsInRange(fetchOffset, lastOffset int64) []AbortedT
 	return result
 }
 
-// BatchCount returns the number of logically visible batches (those not fully
-// below logStart). Chunk-based batches are not physically trimmed until the
-// flusher detaches sealed chunks, so this filters by offset.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) BatchCount() int {
 	n := 0
@@ -775,21 +593,13 @@ func (pd *PartData) BatchCount() int {
 	return n
 }
 
-// TotalBytes returns the total bytes of stored batch data.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) TotalBytes() int64 {
 	return pd.totalBytes
 }
 
-// AdvanceLogStartOffset advances the partition's logStartOffset to newOffset,
-// trims old batches, persists the change to metadata.log, prunes the WAL
-// index, and updates the partition size counter.
-//
-// Called by: retention enforcement, DeleteRecords handler.
-// Caller must NOT hold pd.mu (this method acquires it internally).
-// Caller must hold pd.CompactionMu.
-//
-// If metaLog is nil, the persistence step is skipped (tests only).
+// AdvanceLogStartOffset advances logStartOffset, persists to metadata.log,
+// and prunes the WAL index. Caller must hold pd.CompactionMu, must NOT hold pd.mu.
 func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log) error {
 	pd.mu.Lock()
 	if pd.logStart >= newOffset {
@@ -800,7 +610,6 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 		newOffset = pd.hw
 	}
 
-	// Persist to metadata.log FIRST, while still holding pd.mu.
 	if metaLog != nil {
 		entry := metadata.MarshalLogStartOffset(&metadata.LogStartOffsetEntry{
 			TopicName:      pd.Topic,
@@ -813,17 +622,14 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 		}
 	}
 
-	// Trim all batches below newOffset and set logStart.
 	pd.trimBatchesLocked(newOffset)
 	pd.mu.Unlock()
 
-	// Prune WAL index entries for this partition below newOffset.
 	if pd.walIndex != nil {
 		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
 		pd.walIndex.PruneBefore(tp, newOffset)
 	}
 
-	// Signal the WAL writer to clean up segments that are no longer referenced.
 	if pd.walWriter != nil {
 		pd.walWriter.TryCleanupSegments()
 	}
@@ -831,25 +637,13 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 	return nil
 }
 
-// trimBatchesLocked updates logStart. Chunk-based batches are not trimmed
-// individually — they are released in bulk when the flusher detaches sealed
-// chunks. totalBytes is not adjusted here since chunk data is immutable
-// until flush.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) trimBatchesLocked(newLogStart int64) {
 	pd.logStart = newLogStart
 }
 
-// --- Chunk pool integration ---
-
-// AcquireSpareChunk acquires a chunk from the pool if this partition will
-// need one for the next append of batchSize bytes. This method may block
-// if the pool is exhausted (backpressure), which is safe because the
-// caller must NOT hold pd.mu.
-//
-// Returns a spare chunk if one will be needed, or nil if the current chunk
-// has room. The spare must be passed to AppendToChunk and any unused spare
-// must be released by the caller after releasing pd.mu.
+// AcquireSpareChunk pre-acquires a chunk if needed for the next append.
+// May block on pool exhaustion. Caller must NOT hold pd.mu.
 func (pd *PartData) AcquireSpareChunk(batchSize int) *chunk.Chunk {
 	if pd.chunkPool == nil {
 		return nil
@@ -865,32 +659,22 @@ func (pd *PartData) AcquireSpareChunk(batchSize int) *chunk.Chunk {
 	return nil
 }
 
-// ReleaseSpareChunk returns an unused spare chunk to the pool.
-// Safe to call with nil (no-op).
 func (pd *PartData) ReleaseSpareChunk(spare *chunk.Chunk) {
 	if spare != nil && pd.chunkPool != nil {
 		pd.chunkPool.Release(spare)
 	}
 }
 
-// AppendToChunk appends a batch to the partition's current chunk.
-// Uses the provided spare chunk if a new chunk is needed (current is nil
-// or full), avoiding a blocking Acquire() call while holding pd.mu.
-// Returns the spare chunk if it was not consumed (caller must release it),
-// or nil if it was used.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) AppendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chunk.Chunk) *chunk.Chunk {
 	return pd.appendToChunk(raw, meta, spare)
 }
 
-// appendToChunk is the internal implementation.
 func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chunk.Chunk) *chunk.Chunk {
 	if pd.chunkPool == nil {
 		return spare
 	}
 
-	// Lazy acquisition: first produce after startup or after flush released current chunk.
-	// Uses the pre-acquired spare instead of blocking on Acquire().
 	if pd.chunkCurrent == nil {
 		if spare != nil {
 			pd.chunkCurrent = spare
@@ -903,8 +687,6 @@ func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chun
 		}
 	}
 
-	// Seal if this batch wouldn't fit. Since chunkSize >= max.message.bytes,
-	// a batch always fits in an empty chunk.
 	if pd.chunkCurrent.Used+len(raw) > pd.chunkPool.ChunkSize() {
 		pd.chunkSealed = append(pd.chunkSealed, pd.chunkCurrent)
 		if spare != nil {
@@ -929,9 +711,6 @@ func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chun
 	return spare
 }
 
-// fetchFromChunks scans sealed + current chunks for batches matching
-// the requested offset range. Only returns fully committed batches
-// (BaseOffset + LastOffsetDelta + 1 <= hw).
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) fetchFromChunks(offset int64, maxBytes int32, hw int64) []StoredBatch {
 	var result []StoredBatch
@@ -939,23 +718,20 @@ func (pd *PartData) fetchFromChunks(offset int64, maxBytes int32, hw int64) []St
 
 	collectFromChunk := func(c *chunk.Chunk) bool {
 		for _, b := range c.Batches {
-			// HW visibility gate: only return fully committed batches.
-			// A batch is fully committed when all its offsets are below HW.
 			batchEnd := b.BaseOffset + int64(b.LastOffsetDelta) + 1
 			if batchEnd > hw {
-				return false // stop — this and all subsequent batches extend beyond hw
+				return false
 			}
 			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
 			if lastOffset < offset {
-				continue // batch ends before requested offset
+				continue
 			}
 
 			batchSize := int32(b.Size)
 			if len(result) > 0 && totalBytes+batchSize > maxBytes {
-				return false // respect maxBytes (but first batch is always included)
+				return false
 			}
 
-			// Copy raw bytes from chunk — the chunk may be reused after flush
 			raw := make([]byte, b.Size)
 			copy(raw, c.Data[b.Offset:b.Offset+b.Size])
 
@@ -971,14 +747,12 @@ func (pd *PartData) fetchFromChunks(offset int64, maxBytes int32, hw int64) []St
 		return true
 	}
 
-	// Scan sealed chunks (oldest first)
 	for _, c := range pd.chunkSealed {
 		if !collectFromChunk(c) {
 			return result
 		}
 	}
 
-	// Scan current chunk
 	if pd.chunkCurrent != nil {
 		collectFromChunk(pd.chunkCurrent)
 	}
@@ -986,9 +760,6 @@ func (pd *PartData) fetchFromChunks(offset int64, maxBytes int32, hw int64) []St
 	return result
 }
 
-// DetachSealedChunks removes sealed chunks from the partition and returns them.
-// If includeCurrentIfNonEmpty is true, the current chunk is also sealed and detached.
-// After detaching, the partition holds zero chunks until the next produce.
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) DetachSealedChunks(includeCurrentIfNonEmpty bool) []*chunk.Chunk {
 	if includeCurrentIfNonEmpty && pd.chunkCurrent != nil && pd.chunkCurrent.Used > 0 {
@@ -1001,7 +772,6 @@ func (pd *PartData) DetachSealedChunks(includeCurrentIfNonEmpty bool) []*chunk.C
 	return result
 }
 
-// SealedChunkBytes returns the total bytes in sealed chunks.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) SealedChunkBytes() int64 {
 	var total int64
@@ -1011,12 +781,9 @@ func (pd *PartData) SealedChunkBytes() int64 {
 	return total
 }
 
-// OldestSealedChunkTime returns the creation time of the oldest sealed chunk,
-// or zero time if no sealed chunks exist.
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) OldestSealedChunkTime() time.Time {
 	if len(pd.chunkSealed) == 0 {
-		// Fall back to current chunk's creation time for age-based flush
 		if pd.chunkCurrent != nil && pd.chunkCurrent.Used > 0 {
 			return pd.chunkCurrent.CreatedAt
 		}
@@ -1025,8 +792,6 @@ func (pd *PartData) OldestSealedChunkTime() time.Time {
 	return pd.chunkSealed[0].CreatedAt
 }
 
-// HasChunkData returns whether the partition has any unflushed chunk data
-// (sealed or current).
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) HasChunkData() bool {
 	if len(pd.chunkSealed) > 0 {
@@ -1035,12 +800,10 @@ func (pd *PartData) HasChunkData() bool {
 	return pd.chunkCurrent != nil && pd.chunkCurrent.Used > 0
 }
 
-// ChunkPool returns the chunk pool reference for this partition.
 func (pd *PartData) ChunkPool() *chunk.Pool {
 	return pd.chunkPool
 }
 
-// WalIndex returns the WAL index reference.
 func (pd *PartData) WalIndex() *wal.Index {
 	return pd.walIndex
 }

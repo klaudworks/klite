@@ -7,8 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDescribeTransactions returns the DescribeTransactions handler (API key 65).
-// Supports v0.
 func HandleDescribeTransactions(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DescribeTransactionsRequest)
@@ -33,7 +31,6 @@ func HandleDescribeTransactions(state *cluster.State) server.Handler {
 				ts.State = "Ongoing"
 				ts.StartTimestamp = snap.TxnStartTime.UnixMilli()
 
-				// Build topic-partition list
 				topicParts := make(map[string][]int32)
 				for tp := range snap.TxnPartitions {
 					topicParts[tp.Topic] = append(topicParts[tp.Topic], tp.Partition)

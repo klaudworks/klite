@@ -13,7 +13,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// CompactorConfig holds configuration for the log compactor.
 type CompactorConfig struct {
 	Client *Client
 	Reader *Reader
@@ -42,7 +41,6 @@ type CompactorConfig struct {
 	ReadRateLimit int
 }
 
-// Compactor performs log compaction on S3 objects for a single partition.
 type Compactor struct {
 	cfg         CompactorConfig
 	client      *Client
@@ -52,7 +50,6 @@ type Compactor struct {
 	rateLimiter *rate.Limiter // nil if unlimited
 }
 
-// NewCompactor creates a new compactor.
 func NewCompactor(cfg CompactorConfig) *Compactor {
 	if cfg.WindowBytes == 0 {
 		cfg.WindowBytes = 256 * 1024 * 1024 // 256 MiB
@@ -87,14 +84,11 @@ func NewCompactor(cfg CompactorConfig) *Compactor {
 	}
 }
 
-// SetDeleteRetentionMs updates the delete retention for tombstone removal.
 func (c *Compactor) SetDeleteRetentionMs(ms int64) {
 	c.cfg.DeleteRetentionMs = ms
 }
 
 // CompactPartition compacts all dirty objects for a single partition.
-// cleanedUpTo is the current compaction watermark.
-// minCompactionLagMs is the topic-level min.compaction.lag.ms.
 // Returns the new cleanedUpTo watermark.
 func (c *Compactor) CompactPartition(
 	ctx context.Context,
@@ -108,7 +102,6 @@ func (c *Compactor) CompactPartition(
 ) (int64, error) {
 	prefix := ObjectKeyPrefix(c.client.prefix, topic, topicID, partition)
 
-	// List all S3 objects for this partition
 	objects, err := c.client.ListObjects(ctx, prefix)
 	if err != nil {
 		return cleanedUpTo, fmt.Errorf("list objects: %w", err)
@@ -118,7 +111,6 @@ func (c *Compactor) CompactPartition(
 		return cleanedUpTo, nil
 	}
 
-	// Parse and sort objects by base offset
 	var parsed []windowObj
 	for _, obj := range objects {
 		baseOff := parseBaseOffset(obj.Key, prefix)
@@ -141,7 +133,6 @@ func (c *Compactor) CompactPartition(
 		c.logger.Warn("orphan cleanup failed", "topic", topic, "partition", partition, "err", err)
 	}
 
-	// Re-list after orphan cleanup
 	objects, err = c.client.ListObjects(ctx, prefix)
 	if err != nil {
 		return cleanedUpTo, fmt.Errorf("re-list objects: %w", err)
@@ -168,7 +159,6 @@ func (c *Compactor) CompactPartition(
 		return cleanedUpTo, nil
 	}
 
-	// Find the anchor object (object containing cleanedUpTo)
 	anchorIdx := -1
 	for i, p := range parsed {
 		if p.baseOffset <= cleanedUpTo {
@@ -176,13 +166,11 @@ func (c *Compactor) CompactPartition(
 		}
 	}
 
-	// Form windows
 	windows := c.formWindows(parsed, anchorIdx, minCompactionLagMs)
 	if len(windows) == 0 {
 		return cleanedUpTo, nil
 	}
 
-	// Process each window
 	for _, window := range windows {
 		if ctx.Err() != nil {
 			return cleanedUpTo, ctx.Err()
@@ -210,8 +198,6 @@ func (c *Compactor) CompactPartition(
 	return cleanedUpTo, nil
 }
 
-// compactWindow compacts a single window of objects.
-// Returns the new cleanedUpTo watermark.
 func (c *Compactor) compactWindow(
 	ctx context.Context,
 	topic string,
@@ -220,7 +206,6 @@ func (c *Compactor) compactWindow(
 	window []windowObj,
 	currentCleanedUpTo int64,
 ) (int64, error) {
-	// Phase 1: Read & map — one S3 GET per object
 	type cachedObj struct {
 		key      string
 		rawBytes []byte
@@ -228,7 +213,6 @@ func (c *Compactor) compactWindow(
 	}
 	cached := make([]cachedObj, len(window))
 
-	// Fetch objects with bounded concurrency
 	sem := make(chan struct{}, c.cfg.S3Concurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -284,7 +268,6 @@ func (c *Compactor) compactWindow(
 		return currentCleanedUpTo, fetchErr
 	}
 
-	// Build offset map: key → highest offset across the window
 	offsetMap := make(map[string]int64)
 
 	for _, co := range cached {
@@ -296,7 +279,6 @@ func (c *Compactor) compactWindow(
 		}
 	}
 
-	// Phase 2: Filter & rewrite — no S3 reads, CPU only
 	var outputBatches []BatchData
 	nowMs := c.clock.Now().UnixMilli()
 
@@ -312,7 +294,6 @@ func (c *Compactor) compactWindow(
 	}
 
 	if len(outputBatches) == 0 {
-		// All records were removed. Delete source objects, advance watermark.
 		var lastOffset int64
 		for _, co := range cached {
 			if co.footer != nil {
@@ -329,44 +310,38 @@ func (c *Compactor) compactWindow(
 			}
 		}
 
-		// Best-effort delete of source objects
 		var keys []string
 		for _, co := range cached {
 			keys = append(keys, co.key)
 		}
 		c.client.DeleteObjectsBatch(ctx, keys)
 
-		// Invalidate caches
 		c.reader.InvalidateFooters(topic, topicID, partition)
 
 		return lastOffset, nil
 	}
 
-	// Build compacted output object
 	outputData := BuildObject(outputBatches)
 	baseOffset := outputBatches[0].BaseOffset
 	outputKey := ObjectKey(c.client.prefix, topic, topicID, partition, baseOffset)
 
-	// PUT the compacted output
 	if err := c.client.PutObject(ctx, outputKey, outputData); err != nil {
 		return currentCleanedUpTo, fmt.Errorf("PUT compacted object: %w", err)
 	}
 
-	// Invalidate caches
 	c.reader.InvalidateFooters(topic, topicID, partition)
 
-	// Compute new watermark
 	lastBatch := outputBatches[len(outputBatches)-1]
 	newWatermark := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta)
 
-	// Persist watermark BEFORE deleting source objects
+	// Persist watermark BEFORE deleting source objects — crash between
+	// persist and delete is safe (re-compaction is idempotent).
 	if c.cfg.PersistWatermark != nil {
 		if err := c.cfg.PersistWatermark(topic, partition, newWatermark); err != nil {
 			return currentCleanedUpTo, fmt.Errorf("persist watermark: %w", err)
 		}
 	}
 
-	// Best-effort delete of source objects (skip the output if it matches a source key)
 	var deleteKeys []string
 	for _, co := range cached {
 		if co.key != outputKey {
@@ -380,7 +355,6 @@ func (c *Compactor) compactWindow(
 	return newWatermark, nil
 }
 
-// buildOffsetMap scans an object and updates the offset map with latest offset per key.
 func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap map[string]int64) error {
 	for _, entry := range footer.Entries {
 		if int(entry.BytePosition)+int(entry.BatchLength) > len(rawBytes) {
@@ -394,7 +368,6 @@ func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap ma
 			continue
 		}
 
-		// Skip control batches
 		if header.IsControlBatch() {
 			continue
 		}
@@ -409,7 +382,7 @@ func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap ma
 
 		err = IterateRecords(decompressed, func(rec Record) bool {
 			if rec.Key == nil {
-				return true // null keys are always retained, not in offset map
+				return true // null keys are always retained
 			}
 			absOffset := header.BaseOffset + int64(rec.OffsetDelta)
 			key := string(rec.Key)
@@ -425,8 +398,6 @@ func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap ma
 	return nil
 }
 
-// filterBatches filters records from an object based on the offset map.
-// Returns the surviving batches as BatchData suitable for BuildObject.
 func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map[string]int64, nowMs int64) ([]BatchData, error) {
 	var result []BatchData
 
@@ -469,12 +440,10 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 			continue
 		}
 
-		// Filter records
 		var retained []Record
 		err = IterateRecords(decompressed, func(rec Record) bool {
 			absOffset := header.BaseOffset + int64(rec.OffsetDelta)
 
-			// Null keys: always retained
 			if rec.Key == nil {
 				retained = append(retained, rec)
 				return true
@@ -482,9 +451,7 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 
 			latestOffset, inMap := offsetMap[string(rec.Key)]
 
-			// Keep if this is the latest offset for this key
 			if !inMap || absOffset >= latestOffset {
-				// Check if tombstone past delete.retention.ms
 				if rec.Value == nil && c.cfg.DeleteRetentionMs > 0 {
 					var recordTs int64
 					if header.TimestampType() == 1 {
@@ -495,7 +462,6 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 						recordTs = header.BaseTimestamp + rec.TimestampDelta
 					}
 					if recordTs > 0 && nowMs-recordTs > c.cfg.DeleteRetentionMs {
-						// Tombstone past retention — remove
 						return true
 					}
 				}
@@ -503,7 +469,6 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 				return true
 			}
 
-			// Not the latest offset — superseded, remove
 			return true
 		})
 		if err != nil {
@@ -511,12 +476,11 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 			continue
 		}
 
-		// Skip batch if no records retained (don't emit empty batches)
 		if len(retained) == 0 {
 			continue
 		}
 
-		// If all records survived, keep the original batch (no re-encoding needed)
+		// All records survived — keep original bytes to avoid re-encoding
 		if int32(len(retained)) == header.NumRecords {
 			bd := BatchData{
 				RawBytes:        make([]byte, len(batchRaw)),
@@ -528,7 +492,6 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 			continue
 		}
 
-		// Build a new batch from retained records
 		newBatchBytes, err := BuildRecordBatch(header, retained, codec)
 		if err != nil {
 			c.logger.Warn("failed to build compacted batch, keeping original", "err", err)
@@ -553,7 +516,6 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 	return result, nil
 }
 
-// windowObj holds info about an S3 object for window formation.
 type windowObj struct {
 	key          string
 	size         int64
@@ -565,7 +527,6 @@ type windowObj struct {
 // Objects newer than minCompactionLagMs (based on LastModified) are excluded,
 // except for the anchor object which is always included.
 func (c *Compactor) formWindows(parsed []windowObj, anchorIdx int, minCompactionLagMs int64) [][]windowObj {
-	// Start from anchor (or 0 if no anchor)
 	startIdx := 0
 	if anchorIdx >= 0 {
 		startIdx = anchorIdx
@@ -610,7 +571,6 @@ func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error
 		return nil
 	}
 
-	// Load footers to check offset ranges
 	type objRange struct {
 		key       string
 		baseOff   int64
@@ -626,7 +586,6 @@ func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error
 			lastOff: p.baseOffset, // minimum
 		}
 
-		// Try to read the footer to get the actual last offset
 		data, err := c.client.GetObject(ctx, p.key)
 		if err != nil {
 			ranges[i].footerErr = true
@@ -672,8 +631,6 @@ func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error
 	return nil
 }
 
-// parseBaseOffset extracts the base offset from an S3 object key.
-// Key format: prefix/topic/partition/00000000000000000123.obj
 func parseBaseOffset(key, prefix string) int64 {
 	rel := strings.TrimPrefix(key, prefix)
 	if !strings.HasSuffix(rel, ".obj") {
@@ -687,7 +644,6 @@ func parseBaseOffset(key, prefix string) int64 {
 	return offset
 }
 
-// CompactionEligibility holds the result of checking if a partition needs compaction.
 type CompactionEligibility struct {
 	Eligible     bool
 	DirtyObjects int32
@@ -695,7 +651,6 @@ type CompactionEligibility struct {
 	Partition    int32
 }
 
-// DirtyPartitionInfo holds in-memory compaction state for a partition.
 type DirtyPartitionInfo struct {
 	DirtyObjects  int32
 	LastCompacted time.Time

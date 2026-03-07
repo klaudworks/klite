@@ -10,7 +10,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDeleteTopics returns the DeleteTopics handler (API key 20).
 func HandleDeleteTopics(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DeleteTopicsRequest)
@@ -35,7 +34,6 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 			if rt.Topic != nil {
 				topicName = *rt.Topic
 			} else {
-				// Look up by topic ID
 				td := state.GetTopicByID(rt.TopicID)
 				if td == nil {
 					st.ErrorCode = kerr.UnknownTopicID.Code
@@ -62,7 +60,6 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 				if !state.DeleteTopic(topicName) {
 					st.ErrorCode = kerr.UnknownTopicOrPartition.Code
 				} else {
-					// Persist to metadata.log
 					if ml := state.MetadataLog(); ml != nil {
 						entry := metadata.MarshalDeleteTopic(&metadata.DeleteTopicEntry{
 							TopicName: topicName,

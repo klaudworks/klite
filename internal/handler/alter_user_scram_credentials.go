@@ -10,7 +10,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleAlterUserScramCredentials returns the handler for key 51.
 func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.AlterUserSCRAMCredentialsRequest)
@@ -21,8 +20,7 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 			return resp, nil
 		}
 
-		// Validate all operations up front
-		users := make(map[string]int16) // track validation results
+		users := make(map[string]int16)
 
 		for _, d := range r.Deletions {
 			if d.Name == "" {
@@ -51,7 +49,6 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 			users[u.Name] = 0
 		}
 
-		// Add validation failures to response
 		for u, code := range users {
 			if code != 0 {
 				sr := kmsg.NewAlterUserSCRAMCredentialsResponseResult()
@@ -61,7 +58,6 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 			}
 		}
 
-		// Process deletions
 		for _, d := range r.Deletions {
 			if users[d.Name] != 0 {
 				continue
@@ -94,7 +90,6 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 			resp.Results = append(resp.Results, sr)
 		}
 
-		// Process upsertions
 		for _, u := range r.Upsertions {
 			if users[u.Name] != 0 {
 				continue

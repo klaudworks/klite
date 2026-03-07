@@ -11,7 +11,6 @@ import (
 	s3store "github.com/klaudworks/klite/internal/s3"
 )
 
-// retentionLoop runs the retention enforcement goroutine.
 func (b *Broker) retentionLoop(ctx context.Context) {
 	interval := b.cfg.RetentionCheckInterval
 	if interval == 0 {
@@ -29,8 +28,6 @@ func (b *Broker) retentionLoop(ctx context.Context) {
 	}
 }
 
-// enforceRetention deletes expired S3 objects based on time and size retention.
-// Only operates when S3 is enabled; in-memory data is bounded by the ring buffer.
 func (b *Broker) enforceRetention(ctx context.Context) {
 	if b.s3Client == nil {
 		return
@@ -71,7 +68,6 @@ func (b *Broker) enforceRetention(ctx context.Context) {
 	}
 }
 
-// enforcePartitionRetention enforces retention on a single partition's S3 objects.
 func (b *Broker) enforcePartitionRetention(
 	ctx context.Context,
 	topic string,
@@ -92,7 +88,6 @@ func (b *Broker) enforcePartitionRetention(
 		return
 	}
 
-	// Load footers for all objects (usually cached by the reader)
 	type objInfo struct {
 		key      string
 		dataSize int64 // logical data bytes (sum of batch lengths, no footer overhead)
@@ -112,14 +107,8 @@ func (b *Broker) enforcePartitionRetention(
 		return
 	}
 
-	// Determine which objects to delete.
-	// Time-based: delete objects where MaxTimestamp < cutoff (entire object expired).
-	// Size-based: sum sizes from newest to oldest, delete oldest that exceed budget.
-	// Take the union: an object is deleted if EITHER policy says so.
+	timeCutoff := nowMs - retentionMs
 
-	timeCutoff := nowMs - retentionMs // only meaningful if retentionMs >= 0
-
-	// Mark objects expired by time
 	expiredByTime := make([]bool, len(infos))
 	if retentionMs >= 0 {
 		for i, info := range infos {
@@ -129,7 +118,6 @@ func (b *Broker) enforcePartitionRetention(
 		}
 	}
 
-	// Mark objects expired by size (delete oldest objects that push total over budget).
 	// Uses logical data size (sum of batch lengths) to match Kafka's retention.bytes
 	// semantics, which refers to log segment data, not on-disk overhead.
 	expiredBySize := make([]bool, len(infos))
@@ -138,9 +126,7 @@ func (b *Broker) enforcePartitionRetention(
 		for _, info := range infos {
 			totalSize += info.dataSize
 		}
-		// Walk from oldest to newest, marking objects for deletion until within budget
 		for i := 0; i < len(infos) && totalSize > retentionBytes; i++ {
-			// Never delete the last remaining object
 			if i == len(infos)-1 {
 				break
 			}
@@ -149,13 +135,11 @@ func (b *Broker) enforcePartitionRetention(
 		}
 	}
 
-	// Collect objects to delete (expired by either policy).
-	// Never delete the last remaining object for a partition.
 	var deleteKeys []string
 	for i, info := range infos {
 		if expiredByTime[i] || expiredBySize[i] {
 			if len(deleteKeys)+1 >= len(infos) {
-				break // never delete the last remaining object
+				break
 			}
 			deleteKeys = append(deleteKeys, info.key)
 		}
@@ -183,9 +167,6 @@ func (b *Broker) enforcePartitionRetention(
 		return
 	}
 
-	// Recalculate newLogStart based on what was actually deleted.
-	// deleteKeys and infos are ordered oldest-first, so we find the
-	// highest LastOffset among the first `deleted` expired objects.
 	var actualLogStart int64
 	deletedSet := make(map[string]bool, deleted)
 	for i := 0; i < deleted; i++ {
@@ -218,10 +199,7 @@ func (b *Broker) enforcePartitionRetention(
 		"objects_deleted", deleted, "new_log_start", actualLogStart)
 }
 
-// s3GCLoop runs a background goroutine that deletes S3 objects for deleted topics.
 func (b *Broker) s3GCLoop(ctx context.Context) {
-	// First tick: scan for orphans left by prior crashes, then GC them
-	// together with any topics deleted during startup replay.
 	orphans := b.scanOrphanedS3Topics()
 	pending := b.state.DrainDeletedTopics()
 	b.deleteTopicObjects(ctx, append(pending, orphans...))
@@ -241,7 +219,6 @@ func (b *Broker) s3GCLoop(ctx context.Context) {
 	}
 }
 
-// deleteTopicObjects deletes all S3 objects for the given deleted topics.
 func (b *Broker) deleteTopicObjects(ctx context.Context, topics []cluster.DeletedTopic) {
 	for _, dt := range topics {
 		if ctx.Err() != nil {
@@ -251,7 +228,6 @@ func (b *Broker) deleteTopicObjects(ctx context.Context, topics []cluster.Delete
 	}
 }
 
-// gcDeletedTopic deletes all S3 objects for a single deleted topic.
 func (b *Broker) gcDeletedTopic(ctx context.Context, dt cluster.DeletedTopic) {
 	topicDir := s3store.TopicDir(dt.Name, dt.TopicID)
 	prefix := b.s3Client.Prefix() + "/" + topicDir + "/"
@@ -293,14 +269,11 @@ func (b *Broker) scanOrphanedS3Topics() []cluster.DeletedTopic {
 		return nil
 	}
 
-	// Build set of live topic dirs: "topicName-topicID"
 	liveDirs := make(map[string]bool)
 	for _, td := range b.state.GetAllTopics() {
 		liveDirs[s3store.TopicDir(td.Name, td.ID)] = true
 	}
 
-	// Extract unique topic dirs from S3 keys.
-	// The only non-topic object is the metadata.log backup at prefix level.
 	orphanDirs := make(map[string]bool)
 	metaKey := b.s3Client.Prefix() + "/metadata.log"
 	for _, obj := range objects {

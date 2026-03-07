@@ -7,8 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleAddPartitionsToTxn returns the AddPartitionsToTxn handler (API key 24).
-// Supports v0-v4.
 func HandleAddPartitionsToTxn(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.AddPartitionsToTxnRequest)
@@ -19,7 +17,6 @@ func HandleAddPartitionsToTxn(state *cluster.State) server.Handler {
 			return resp, nil
 		}
 
-		// Validate all partitions exist first
 		var validPartitions []cluster.TopicPartition
 		for _, rt := range r.Topics {
 			td := state.GetTopic(rt.Topic)
@@ -33,10 +30,8 @@ func HandleAddPartitionsToTxn(state *cluster.State) server.Handler {
 			}
 		}
 
-		// Register partitions with the PID manager
 		errCode := state.PIDManager().AddPartitionsToTxn(r.ProducerID, r.ProducerEpoch, validPartitions)
 
-		// Build response
 		for _, rt := range r.Topics {
 			st := kmsg.NewAddPartitionsToTxnResponseTopic()
 			st.Topic = rt.Topic

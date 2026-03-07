@@ -11,7 +11,6 @@ import (
 	"github.com/klaudworks/klite/internal/clock"
 )
 
-// Config holds all broker configuration.
 type Config struct {
 	Listen            string
 	AdvertisedAddr    string
@@ -74,7 +73,6 @@ type Config struct {
 	HealthListener net.Listener
 }
 
-// DefaultConfig returns a Config with production defaults.
 func DefaultConfig() Config {
 	return Config{
 		Listen:             ":9092",
@@ -88,7 +86,6 @@ func DefaultConfig() Config {
 	}
 }
 
-// nodeIDValue implements flag.Value for int32.
 type nodeIDValue struct {
 	target *int32
 }
@@ -110,7 +107,6 @@ func (v *nodeIDValue) Set(s string) error {
 	return nil
 }
 
-// RegisterFlags registers CLI flags into the given FlagSet, writing into cfg.
 func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "Listen address (host:port)")
 	fs.StringVar(&cfg.AdvertisedAddr, "advertised-addr", cfg.AdvertisedAddr, "Address clients use to connect (default: derived from --listen)")
@@ -122,7 +118,6 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error")
 	fs.StringVar(&cfg.HealthAddr, "health-addr", cfg.HealthAddr, "HTTP health endpoint address (empty = disabled, e.g. :8080)")
 
-	// S3 flags
 	fs.StringVar(&cfg.S3Bucket, "s3-bucket", cfg.S3Bucket, "S3 bucket name (empty = S3 disabled)")
 	fs.StringVar(&cfg.S3Region, "s3-region", cfg.S3Region, "S3 region (default: us-east-1)")
 	fs.StringVar(&cfg.S3Endpoint, "s3-endpoint", cfg.S3Endpoint, "Custom S3 endpoint (for LocalStack/MinIO)")
@@ -131,21 +126,17 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.Int64Var(&cfg.S3TargetObjectSize, "s3-target-object-size", cfg.S3TargetObjectSize, "Flush partition when unflushed bytes reach this size in bytes (default: 67108864 = 64 MiB)")
 	fs.DurationVar(&cfg.S3FlushCheckInterval, "s3-flush-check-interval", cfg.S3FlushCheckInterval, "How often the flusher scans partitions for flush eligibility (default: 1s)")
 
-	// WAL flags
 	fs.IntVar(&cfg.WALSyncIntervalMs, "wal-sync-interval", cfg.WALSyncIntervalMs, "WAL fsync batch window in milliseconds (default: 2)")
 	fs.Int64Var(&cfg.WALSegmentMaxBytes, "wal-segment-max-bytes", cfg.WALSegmentMaxBytes, "Max WAL segment size before rotation in bytes (default: 67108864 = 64 MiB)")
 	fs.Int64Var(&cfg.WALMaxDiskSize, "wal-max-disk-size", cfg.WALMaxDiskSize, "Max total WAL on disk in bytes (default: 4 GiB)")
 	fs.Int64Var(&cfg.ChunkPoolMemory, "chunk-pool-memory", cfg.ChunkPoolMemory, "Global memory budget for chunk pool in bytes (default: 536870912 = 512 MiB)")
 
-	// Retention flags
 	fs.DurationVar(&cfg.RetentionCheckInterval, "retention-check-interval", cfg.RetentionCheckInterval, "How often the retention goroutine runs (default: 1h)")
 
-	// Compaction flags
 	fs.DurationVar(&cfg.CompactionCheckInterval, "compaction-check-interval", cfg.CompactionCheckInterval, "How often to scan dirty counters for eligible partitions (default: 30s)")
 	fs.IntVar(&cfg.CompactionMinDirtyObjects, "compaction-min-dirty-objects", cfg.CompactionMinDirtyObjects, "Min dirty S3 objects before compaction triggers (default: 4)")
 	fs.IntVar(&cfg.CompactionReadRate, "compaction-read-rate", cfg.CompactionReadRate, "Max S3 read bytes/sec for compaction (default: 52428800 = 50 MiB/s, 0 = unlimited)")
 
-	// SASL flags
 	fs.BoolVar(&cfg.SASLEnabled, "sasl-enabled", cfg.SASLEnabled, "Enable SASL authentication")
 	fs.StringVar(&cfg.SASLMechanism, "sasl-mechanism", cfg.SASLMechanism, "Mechanism for CLI-specified user: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512")
 	fs.StringVar(&cfg.SASLUser, "sasl-user", cfg.SASLUser, "Username for CLI-specified bootstrap user")
@@ -195,8 +186,6 @@ func (cfg *Config) ApplyEnvOverrides() {
 	}
 }
 
-// ResolveAdvertisedAddr determines the advertised address from config.
-// Returns the address and whether a warning should be logged.
 func (cfg *Config) ResolveAdvertisedAddr() (addr string, warn bool) {
 	if cfg.AdvertisedAddr != "" {
 		return cfg.AdvertisedAddr, false

@@ -6,7 +6,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDescribeLogDirs returns the DescribeLogDirs handler (API key 35).
 func HandleDescribeLogDirs(state *cluster.State, dataDir string) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DescribeLogDirsRequest)
@@ -18,7 +17,6 @@ func HandleDescribeLogDirs(state *cluster.State, dataDir string) server.Handler 
 		rd.UsableBytes = -1 // TODO: report actual WAL disk available
 
 		if r.Topics == nil {
-			// Return all partitions
 			for _, td := range state.GetAllTopics() {
 				rt := kmsg.NewDescribeLogDirsResponseDirTopic()
 				rt.Topic = td.Name
@@ -33,7 +31,6 @@ func HandleDescribeLogDirs(state *cluster.State, dataDir string) server.Handler 
 				rd.Topics = append(rd.Topics, rt)
 			}
 		} else {
-			// Return only requested topic-partitions
 			for _, reqTopic := range r.Topics {
 				td := state.GetTopic(reqTopic.Topic)
 				if td == nil {

@@ -8,10 +8,8 @@ import (
 	"github.com/klaudworks/klite/internal/chunk"
 )
 
-// testPool is a shared chunk pool for tests. 64 MiB budget with default chunk size.
 var testPool = chunk.NewPool(64*1024*1024, DefaultMaxMessageBytes)
 
-// newTestPartition creates a PartData with a chunk pool for testing.
 func newTestPartition() *PartData {
 	return &PartData{
 		Topic:     "test-topic",
@@ -20,8 +18,6 @@ func newTestPartition() *PartData {
 	}
 }
 
-// pushTestBatch is a helper that creates a batch with the given parameters,
-// parses it, and pushes it to the partition.
 func pushTestBatch(t *testing.T, pd *PartData, numRecords int32, maxTimestamp int64) int64 {
 	t.Helper()
 	raw := makeSimpleBatch(numRecords, maxTimestamp)
@@ -118,31 +114,29 @@ func TestPushBatch(t *testing.T) {
 		pd.PushBatch(raw, meta, nil)
 		pd.Unlock()
 
-		// Mutate the original raw bytes
 		raw[0] = 0xFF
 
-		// The stored bytes should not be affected
-		fetched := pd.FetchFrom(0, 1024*1024)
-		if len(fetched) == 0 {
+		fr := pd.Fetch(0, 1024*1024)
+		if len(fr.Batches) == 0 {
 			t.Fatal("expected at least one batch")
 		}
-		if fetched[0].RawBytes[0] == 0xFF {
+		if fr.Batches[0].RawBytes[0] == 0xFF {
 			t.Error("raw bytes were not copied - mutation affected stored batch")
 		}
 	})
 }
 
-func TestFetchFrom(t *testing.T) {
+func TestFetch(t *testing.T) {
 	t.Parallel()
 
 	t.Run("empty partition", func(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
-		result := pd.FetchFrom(0, 1024*1024)
+		fr := pd.Fetch(0, 1024*1024)
 
-		if result != nil {
-			t.Errorf("expected nil for empty partition, got %d batches", len(result))
+		if len(fr.Batches) != 0 {
+			t.Errorf("expected no batches for empty partition, got %d", len(fr.Batches))
 		}
 	})
 
@@ -155,16 +149,16 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 2, 2000)
 		pd.Unlock()
 
-		result := pd.FetchFrom(0, 1024*1024)
+		fr := pd.Fetch(0, 1024*1024)
 
-		if len(result) != 2 {
-			t.Fatalf("expected 2 batches, got %d", len(result))
+		if len(fr.Batches) != 2 {
+			t.Fatalf("expected 2 batches, got %d", len(fr.Batches))
 		}
-		if result[0].BaseOffset != 0 {
-			t.Errorf("batch 0 base: got %d, want 0", result[0].BaseOffset)
+		if fr.Batches[0].BaseOffset != 0 {
+			t.Errorf("batch 0 base: got %d, want 0", fr.Batches[0].BaseOffset)
 		}
-		if result[1].BaseOffset != 3 {
-			t.Errorf("batch 1 base: got %d, want 3", result[1].BaseOffset)
+		if fr.Batches[1].BaseOffset != 3 {
+			t.Errorf("batch 1 base: got %d, want 3", fr.Batches[1].BaseOffset)
 		}
 	})
 
@@ -178,13 +172,13 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 1, 3000) // offset 5
 		pd.Unlock()
 
-		result := pd.FetchFrom(3, 1024*1024)
+		fr := pd.Fetch(3, 1024*1024)
 
-		if len(result) != 2 {
-			t.Fatalf("expected 2 batches, got %d", len(result))
+		if len(fr.Batches) != 2 {
+			t.Fatalf("expected 2 batches, got %d", len(fr.Batches))
 		}
-		if result[0].BaseOffset != 3 {
-			t.Errorf("first batch base: got %d, want 3", result[0].BaseOffset)
+		if fr.Batches[0].BaseOffset != 3 {
+			t.Errorf("first batch base: got %d, want 3", fr.Batches[0].BaseOffset)
 		}
 	})
 
@@ -193,17 +187,17 @@ func TestFetchFrom(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 5, 1000) // offsets 0-4
-		pushTestBatch(t, pd, 3, 2000) // offsets 5-7
+		pushTestBatch(t, pd, 5, 1000)
+		pushTestBatch(t, pd, 3, 2000)
 		pd.Unlock()
 
-		result := pd.FetchFrom(2, 1024*1024) // mid-batch
+		fr := pd.Fetch(2, 1024*1024)
 
-		if len(result) != 2 {
-			t.Fatalf("expected 2 batches, got %d", len(result))
+		if len(fr.Batches) != 2 {
+			t.Fatalf("expected 2 batches, got %d", len(fr.Batches))
 		}
-		if result[0].BaseOffset != 0 {
-			t.Errorf("first batch: got base %d, want 0 (batch containing offset 2)", result[0].BaseOffset)
+		if fr.Batches[0].BaseOffset != 0 {
+			t.Errorf("first batch: got base %d, want 0", fr.Batches[0].BaseOffset)
 		}
 	})
 
@@ -212,17 +206,17 @@ func TestFetchFrom(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 3, 1000) // 61-byte batch
-		pushTestBatch(t, pd, 2, 2000) // 61-byte batch
+		pushTestBatch(t, pd, 3, 1000)
+		pushTestBatch(t, pd, 2, 2000)
 		pd.Unlock()
 
-		result := pd.FetchFrom(0, 1) // maxBytes=1, way smaller than any batch
+		fr := pd.Fetch(0, 1)
 
-		if len(result) != 1 {
-			t.Fatalf("KIP-74: expected at least 1 batch, got %d", len(result))
+		if len(fr.Batches) != 1 {
+			t.Fatalf("KIP-74: expected at least 1 batch, got %d", len(fr.Batches))
 		}
-		if result[0].BaseOffset != 0 {
-			t.Errorf("first batch base: got %d, want 0", result[0].BaseOffset)
+		if fr.Batches[0].BaseOffset != 0 {
+			t.Errorf("first batch base: got %d, want 0", fr.Batches[0].BaseOffset)
 		}
 	})
 
@@ -231,35 +225,19 @@ func TestFetchFrom(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 1, 1000) // 61 bytes
-		pushTestBatch(t, pd, 1, 2000) // 61 bytes
-		pushTestBatch(t, pd, 1, 3000) // 61 bytes
+		pushTestBatch(t, pd, 1, 1000)
+		pushTestBatch(t, pd, 1, 2000)
+		pushTestBatch(t, pd, 1, 3000)
 		pd.Unlock()
 
-		result := pd.FetchFrom(0, 62) // room for 1 batch (61 bytes) + 1 byte
+		fr := pd.Fetch(0, 62)
 
-		// Should get 1 batch (61 bytes), second batch (61+61=122) exceeds 62
-		if len(result) != 1 {
-			t.Fatalf("expected 1 batch with maxBytes=62, got %d", len(result))
+		if len(fr.Batches) != 1 {
+			t.Fatalf("expected 1 batch with maxBytes=62, got %d", len(fr.Batches))
 		}
 	})
 
-	t.Run("fetch at HW returns nil", func(t *testing.T) {
-		t.Parallel()
-		pd := newTestPartition()
-
-		pd.Lock()
-		pushTestBatch(t, pd, 3, 1000) // HW=3
-		pd.Unlock()
-
-		result := pd.FetchFrom(3, 1024*1024)
-
-		if result != nil {
-			t.Errorf("expected nil for fetch at HW, got %d batches", len(result))
-		}
-	})
-
-	t.Run("fetch past HW returns nil", func(t *testing.T) {
+	t.Run("fetch at HW returns no batches", func(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
@@ -267,10 +245,28 @@ func TestFetchFrom(t *testing.T) {
 		pushTestBatch(t, pd, 3, 1000)
 		pd.Unlock()
 
-		result := pd.FetchFrom(100, 1024*1024)
+		fr := pd.Fetch(3, 1024*1024)
 
-		if result != nil {
-			t.Errorf("expected nil for fetch past HW, got %d batches", len(result))
+		if fr.Err != 0 {
+			t.Errorf("fetch at HW should not error, got err=%d", fr.Err)
+		}
+		if len(fr.Batches) != 0 {
+			t.Errorf("expected no batches for fetch at HW, got %d", len(fr.Batches))
+		}
+	})
+
+	t.Run("fetch past HW returns error", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		pd.Lock()
+		pushTestBatch(t, pd, 3, 1000)
+		pd.Unlock()
+
+		fr := pd.Fetch(100, 1024*1024)
+
+		if fr.Err != ErrCodeOffsetOutOfRange {
+			t.Errorf("fetch past HW: want err=%d, got err=%d", ErrCodeOffsetOutOfRange, fr.Err)
 		}
 	})
 }
@@ -285,19 +281,16 @@ func TestListOffsets(t *testing.T) {
 		pd.RLock()
 		defer pd.RUnlock()
 
-		// Latest (-1)
 		off, ts := pd.ListOffsets(-1, 0)
 		if off != 0 || ts != -1 {
 			t.Errorf("Latest on empty: got (%d, %d), want (0, -1)", off, ts)
 		}
 
-		// Earliest (-2)
 		off, ts = pd.ListOffsets(-2, 0)
 		if off != 0 || ts != -1 {
 			t.Errorf("Earliest on empty: got (%d, %d), want (0, -1)", off, ts)
 		}
 
-		// MaxTimestamp (-3) — empty partition returns (-1, -1) per kfake/Kafka behavior
 		off, ts = pd.ListOffsets(-3, 0)
 		if off != -1 || ts != -1 {
 			t.Errorf("MaxTimestamp on empty: got (%d, %d), want (-1, -1)", off, ts)
@@ -350,16 +343,15 @@ func TestListOffsets(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 3, 1000) // batch 0: offsets 0-2, ts=1000
-		pushTestBatch(t, pd, 2, 5000) // batch 1: offsets 3-4, ts=5000
-		pushTestBatch(t, pd, 1, 3000) // batch 2: offset 5, ts=3000
+		pushTestBatch(t, pd, 3, 1000)
+		pushTestBatch(t, pd, 2, 5000)
+		pushTestBatch(t, pd, 1, 3000)
 		pd.Unlock()
 
 		pd.RLock()
 		off, ts := pd.ListOffsets(-3, 0)
 		pd.RUnlock()
 
-		// Max timestamp is in batch 1 (ts=5000), last offset in that batch = 3+1 = 4
 		if off != 4 {
 			t.Errorf("MaxTimestamp: got offset %d, want 4", off)
 		}
@@ -373,15 +365,14 @@ func TestListOffsets(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 2, 1000) // batch 0: offsets 0-1, maxTS=1000
-		pushTestBatch(t, pd, 2, 2000) // batch 1: offsets 2-3, maxTS=2000
-		pushTestBatch(t, pd, 2, 3000) // batch 2: offsets 4-5, maxTS=3000
+		pushTestBatch(t, pd, 2, 1000)
+		pushTestBatch(t, pd, 2, 2000)
+		pushTestBatch(t, pd, 2, 3000)
 		pd.Unlock()
 
 		pd.RLock()
 		defer pd.RUnlock()
 
-		// Find first batch with maxTS >= 1500 -> batch 1 (maxTS=2000)
 		off, ts := pd.ListOffsets(1500, 0)
 		if off != 2 {
 			t.Errorf("Timestamp 1500: got offset %d, want 2", off)
@@ -422,10 +413,9 @@ func TestListOffsets(t *testing.T) {
 		pd.Unlock()
 
 		pd.RLock()
-		off, ts := pd.ListOffsets(3000, 0) // beyond all batches
+		off, ts := pd.ListOffsets(3000, 0)
 		pd.RUnlock()
 
-		// No match returns (-1, -1) per Kafka/kfake behavior
 		if off != -1 {
 			t.Errorf("Timestamp 3000: got offset %d, want -1", off)
 		}
@@ -459,16 +449,14 @@ func TestListOffsets(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 3, 1000) // HW=3
-		pushTestBatch(t, pd, 2, 2000) // HW=5
-		// Simulate an open transaction starting at offset 2
+		pushTestBatch(t, pd, 3, 1000)
+		pushTestBatch(t, pd, 2, 2000)
 		pd.AddOpenTxn(42, 2)
 		pd.Unlock()
 
 		pd.RLock()
 		defer pd.RUnlock()
 
-		// read_uncommitted: should return HW (5)
 		off, ts := pd.ListOffsets(-1, 0)
 		if off != 5 {
 			t.Errorf("read_uncommitted Latest: got offset %d, want 5", off)
@@ -477,7 +465,7 @@ func TestListOffsets(t *testing.T) {
 			t.Errorf("read_uncommitted Latest: got ts %d, want -1", ts)
 		}
 
-		// read_committed: should return LSO = min(HW, oldest open txn) = 2
+		// LSO = min(HW, oldest open txn) = 2
 		off, ts = pd.ListOffsets(-1, 1)
 		if off != 2 {
 			t.Errorf("read_committed Latest: got offset %d, want 2 (LSO)", off)
@@ -498,12 +486,10 @@ func TestNotifyWaiters(t *testing.T) {
 		w := NewFetchWaiter()
 		pd.RegisterWaiter(w)
 
-		// NotifyWaiters should close the channel
-		pd.NotifyWaiters(nil)
+		pd.NotifyWaiters()
 
 		select {
 		case <-w.Ch():
-			// OK - channel was closed
 		default:
 			t.Error("waiter channel was not closed")
 		}
@@ -520,12 +506,11 @@ func TestNotifyWaiters(t *testing.T) {
 		pd.RegisterWaiter(w2)
 		pd.RegisterWaiter(w3)
 
-		pd.NotifyWaiters(nil)
+		pd.NotifyWaiters()
 
 		for i, w := range []*FetchWaiter{w1, w2, w3} {
 			select {
 			case <-w.Ch():
-				// OK
 			default:
 				t.Errorf("waiter %d channel was not closed", i)
 			}
@@ -535,15 +520,14 @@ func TestNotifyWaiters(t *testing.T) {
 	t.Run("notify with no waiters is safe", func(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
-		// Should not panic
-		pd.NotifyWaiters(nil)
+		pd.NotifyWaiters()
 	})
 
 	t.Run("new waiter after notify not woken", func(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
-		pd.NotifyWaiters(nil) // notify with no waiters
+		pd.NotifyWaiters()
 
 		w := NewFetchWaiter()
 		pd.RegisterWaiter(w)
@@ -552,7 +536,6 @@ func TestNotifyWaiters(t *testing.T) {
 		case <-w.Ch():
 			t.Error("new waiter should not be immediately woken")
 		default:
-			// OK - channel is still open
 		}
 	})
 
@@ -561,22 +544,18 @@ func TestNotifyWaiters(t *testing.T) {
 		pd1 := newTestPartition()
 		pd2 := newTestPartition()
 
-		// Register the same waiter on two partitions
 		w := NewFetchWaiter()
 		pd1.RegisterWaiter(w)
 		pd2.RegisterWaiter(w)
 
-		// Notifying one partition should wake the shared waiter
-		pd1.NotifyWaiters(nil)
+		pd1.NotifyWaiters()
 		select {
 		case <-w.Ch():
-			// OK
 		default:
 			t.Error("shared waiter should be woken by first partition")
 		}
 
-		// Notifying the second partition should not panic (sync.Once protects double-close)
-		pd2.NotifyWaiters(nil)
+		pd2.NotifyWaiters() // double-close safe via sync.Once
 	})
 }
 
@@ -588,7 +567,7 @@ func TestMaxTimestampTracking(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 1, 5000) // 1 record: offsets 0-0
+		pushTestBatch(t, pd, 1, 5000)
 		pd.Unlock()
 
 		pd.RLock()
@@ -598,7 +577,6 @@ func TestMaxTimestampTracking(t *testing.T) {
 		if ts != 5000 {
 			t.Errorf("MaxTimestamp: got %d, want 5000", ts)
 		}
-		// Last offset in batch = BaseOffset(0) + LastOffsetDelta(0) = 0
 		if off != 0 {
 			t.Errorf("offset: got %d, want 0", off)
 		}
@@ -628,8 +606,8 @@ func TestMaxTimestampTracking(t *testing.T) {
 		pd := newTestPartition()
 
 		pd.Lock()
-		pushTestBatch(t, pd, 1, 1000) // batch 0: offset 0
-		pushTestBatch(t, pd, 1, 1000) // batch 1: offset 1 (same ts)
+		pushTestBatch(t, pd, 1, 1000)
+		pushTestBatch(t, pd, 1, 1000)
 		pd.Unlock()
 
 		pd.RLock()
@@ -639,14 +617,11 @@ func TestMaxTimestampTracking(t *testing.T) {
 		if ts != 1000 {
 			t.Errorf("MaxTimestamp: got %d, want 1000", ts)
 		}
-		// Should point to the second batch (index 1), last offset = 1+0 = 1
 		if off != 1 {
 			t.Errorf("offset: got %d, want 1", off)
 		}
 	})
 }
-
-// --- Phase 3 tests: ChunkPool, ReserveOffset, CommitBatch ---
 
 func newTestPartitionWithChunks() *PartData {
 	pd := &PartData{
@@ -664,9 +639,7 @@ func TestReserveOffset(t *testing.T) {
 	pd := newTestPartitionWithChunks()
 
 	pd.Lock()
-	// Reserve 3 records: offsets 0, 1, 2
 	base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2})
-	// Reserve 2 records: offsets 3, 4
 	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1})
 	pd.Unlock()
 
@@ -691,7 +664,6 @@ func TestCommitBatchInOrder(t *testing.T) {
 	base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1})
 	pd.Unlock()
 
-	// Commit in order
 	pd.Lock()
 	pd.CommitBatch(StoredBatch{
 		BaseOffset: base0, LastOffsetDelta: 2,
@@ -730,7 +702,6 @@ func TestCommitBatchOutOfOrder(t *testing.T) {
 	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 5
 	pd.Unlock()
 
-	// Commit OUT of order: 2, 0, 1
 	pd.Lock()
 	pd.CommitBatch(StoredBatch{
 		BaseOffset: base2, LastOffsetDelta: 0,
@@ -739,7 +710,6 @@ func TestCommitBatchOutOfOrder(t *testing.T) {
 	pd.Unlock()
 
 	pd.RLock()
-	// HW should still be 0 (waiting for base0)
 	if pd.HW() != 0 {
 		t.Errorf("HW after out-of-order commit: got %d, want 0", pd.HW())
 	}
@@ -753,7 +723,6 @@ func TestCommitBatchOutOfOrder(t *testing.T) {
 	pd.Unlock()
 
 	pd.RLock()
-	// HW should be 3 (base0 committed, but base1 still missing)
 	if pd.HW() != 3 {
 		t.Errorf("HW after base0 commit: got %d, want 3", pd.HW())
 	}
@@ -767,7 +736,6 @@ func TestCommitBatchOutOfOrder(t *testing.T) {
 	pd.Unlock()
 
 	pd.RLock()
-	// Now all 3 are committed, HW should be 6
 	if pd.HW() != 6 {
 		t.Errorf("HW after all commits: got %d, want 6", pd.HW())
 	}
@@ -783,22 +751,21 @@ func TestReadCascadeRingBuffer(t *testing.T) {
 
 	pd := newTestPartitionWithChunks()
 
-	// Push some batches
 	pd.Lock()
 	pd.PushBatch(makeSimpleBatch(3, 1000), BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3}, nil)
 	pd.PushBatch(makeSimpleBatch(2, 2000), BatchMeta{LastOffsetDelta: 1, MaxTimestamp: 2000, NumRecords: 2}, nil)
 	pd.Unlock()
 
-	result := pd.FetchFrom(0, 1024*1024)
+	fr := pd.Fetch(0, 1024*1024)
 
-	if len(result) != 2 {
-		t.Fatalf("expected 2 batches, got %d", len(result))
+	if len(fr.Batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(fr.Batches))
 	}
-	if result[0].BaseOffset != 0 {
-		t.Errorf("batch 0 base: got %d, want 0", result[0].BaseOffset)
+	if fr.Batches[0].BaseOffset != 0 {
+		t.Errorf("batch 0 base: got %d, want 0", fr.Batches[0].BaseOffset)
 	}
-	if result[1].BaseOffset != 3 {
-		t.Errorf("batch 1 base: got %d, want 3", result[1].BaseOffset)
+	if fr.Batches[1].BaseOffset != 3 {
+		t.Errorf("batch 1 base: got %d, want 3", fr.Batches[1].BaseOffset)
 	}
 }
 
@@ -813,17 +780,15 @@ func TestReadCascadeFetchFromMiddle(t *testing.T) {
 	pd.PushBatch(makeSimpleBatch(1, 3000), BatchMeta{LastOffsetDelta: 0, MaxTimestamp: 3000, NumRecords: 1}, nil)
 	pd.Unlock()
 
-	result := pd.FetchFrom(3, 1024*1024) // Start at offset 3
+	fr := pd.Fetch(3, 1024*1024)
 
-	if len(result) != 2 {
-		t.Fatalf("expected 2 batches, got %d", len(result))
+	if len(fr.Batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(fr.Batches))
 	}
-	if result[0].BaseOffset != 3 {
-		t.Errorf("first batch base: got %d, want 3", result[0].BaseOffset)
+	if fr.Batches[0].BaseOffset != 3 {
+		t.Errorf("first batch base: got %d, want 3", fr.Batches[0].BaseOffset)
 	}
 }
-
-// --- Phase 6 tests: Retention ---
 
 func TestAdvanceLogStartOffset(t *testing.T) {
 	t.Parallel()
@@ -836,7 +801,6 @@ func TestAdvanceLogStartOffset(t *testing.T) {
 	pushTestBatch(t, pd, 1, 3000) // offset 2
 	pd.Unlock()
 
-	// Advance without metadata.log (pass nil)
 	pd.CompactionMu.Lock()
 	err := pd.AdvanceLogStartOffset(2, nil)
 	pd.CompactionMu.Unlock()
@@ -853,9 +817,8 @@ func TestAdvanceLogStartOffset(t *testing.T) {
 	}
 	pd.RUnlock()
 
-	// Remaining batch should be offset 2
-	fetched := pd.FetchFrom(2, 1024*1024)
-	if len(fetched) == 0 || fetched[0].BaseOffset != 2 {
+	fr := pd.Fetch(2, 1024*1024)
+	if len(fr.Batches) == 0 || fr.Batches[0].BaseOffset != 2 {
 		t.Errorf("remaining batch base: expected 2")
 	}
 }
@@ -870,7 +833,6 @@ func TestAdvanceLogStartOffsetStraddlingBatch(t *testing.T) {
 	pushTestBatch(t, pd, 3, 2000) // offsets 3,4,5
 	pd.Unlock()
 
-	// Advance to middle of first batch (offset 1)
 	pd.CompactionMu.Lock()
 	err := pd.AdvanceLogStartOffset(1, nil)
 	pd.CompactionMu.Unlock()
@@ -879,11 +841,9 @@ func TestAdvanceLogStartOffsetStraddlingBatch(t *testing.T) {
 	}
 
 	pd.RLock()
-	// logStart should be exactly 1, not rounded to batch boundary
 	if pd.LogStart() != 1 {
 		t.Errorf("logStart: got %d, want 1", pd.LogStart())
 	}
-	// Both batches should still be present (first batch straddles logStart)
 	if pd.BatchCount() != 2 {
 		t.Errorf("batch count: got %d, want 2", pd.BatchCount())
 	}
@@ -901,7 +861,6 @@ func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
 	}
 	pd.Unlock()
 
-	// Two goroutines concurrently advancing logStartOffset
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -922,27 +881,18 @@ func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
 	wg.Wait()
 
 	pd.RLock()
-	// logStart should end up at 7 (the higher value)
 	if pd.LogStart() != 7 {
 		t.Errorf("logStart: got %d, want 7", pd.LogStart())
 	}
-	// Should have 3 remaining batches (offsets 7, 8, 9)
 	if pd.BatchCount() != 3 {
 		t.Errorf("batch count: got %d, want 3", pd.BatchCount())
 	}
 	pd.RUnlock()
 }
 
-// --- WAL error recovery tests: SkipOffsets and FetchFrom gap ---
-
-// TestSkipOffsetsUnblocksPendingCommits verifies that SkipOffsets advances
-// nextCommit past a gap, allowing subsequent out-of-order commits that were
-// queued behind the gap to drain and advance HW.
-//
-// Scenario: Reserve offsets for batches A(0-2), B(3-4), C(5). Commit C first
-// (out of order — queued). Skip B (WAL error). Commit A. After A commits,
-// SkipOffsets(B) should drain the gap and then C should also drain, advancing
-// HW to 6.
+// TestSkipOffsetsUnblocksPendingCommits verifies that SkipOffsets drains
+// pending commits queued behind a gap. Scenario: A(0-2), B(3-4), C(5).
+// Commit C, skip B, commit A => HW should reach 6.
 func TestSkipOffsetsUnblocksPendingCommits(t *testing.T) {
 	t.Parallel()
 
@@ -956,7 +906,6 @@ func TestSkipOffsetsUnblocksPendingCommits(t *testing.T) {
 
 	_ = base1
 
-	// Commit C (out of order) — queued as pending
 	pd.Lock()
 	pd.CommitBatch(StoredBatch{
 		BaseOffset: base2, LastOffsetDelta: 0,
@@ -970,7 +919,6 @@ func TestSkipOffsetsUnblocksPendingCommits(t *testing.T) {
 	}
 	pd.RUnlock()
 
-	// Commit A (in order) — HW should advance to 3
 	pd.Lock()
 	pd.CommitBatch(StoredBatch{
 		BaseOffset: base0, LastOffsetDelta: 2,
@@ -984,11 +932,8 @@ func TestSkipOffsetsUnblocksPendingCommits(t *testing.T) {
 	}
 	pd.RUnlock()
 
-	// Skip B (offsets 3-4) — simulates WAL write failure for batch B.
-	// After skip, nextCommit should jump past 3-4, then drain C from
-	// pendingCommits, advancing HW to 6.
 	pd.Lock()
-	pd.SkipOffsets(base1, 2) // skip 2 offsets starting at base1=3
+	pd.SkipOffsets(base1, 2)
 	pd.Unlock()
 
 	pd.RLock()
@@ -1000,8 +945,6 @@ func TestSkipOffsetsUnblocksPendingCommits(t *testing.T) {
 	}
 }
 
-// TestSkipOffsetsOutOfOrder verifies that SkipOffsets works when the skip
-// arrives before the preceding batch has committed (out-of-order skip).
 func TestSkipOffsetsOutOfOrder(t *testing.T) {
 	t.Parallel()
 
@@ -1013,19 +956,16 @@ func TestSkipOffsetsOutOfOrder(t *testing.T) {
 	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 5
 	pd.Unlock()
 
-	// Skip B FIRST (before A commits) — out-of-order skip
 	pd.Lock()
 	pd.SkipOffsets(base1, 2)
 	pd.Unlock()
 
-	// HW should still be 0 — A hasn't committed yet
 	pd.RLock()
 	if pd.HW() != 0 {
 		t.Errorf("HW after out-of-order skip: got %d, want 0", pd.HW())
 	}
 	pd.RUnlock()
 
-	// Commit C (out of order)
 	pd.Lock()
 	pd.CommitBatch(StoredBatch{
 		BaseOffset: base2, LastOffsetDelta: 0,
@@ -1033,14 +973,13 @@ func TestSkipOffsetsOutOfOrder(t *testing.T) {
 	})
 	pd.Unlock()
 
-	// HW still 0 — waiting for A
 	pd.RLock()
 	if pd.HW() != 0 {
 		t.Errorf("HW after out-of-order C commit: got %d, want 0", pd.HW())
 	}
 	pd.RUnlock()
 
-	// Commit A — should drain: A(0-2) → skip B(3-4) → C(5) → HW=6
+	// Commit A drains: A(0-2) -> skip B(3-4) -> C(5) -> HW=6
 	pd.Lock()
 	pd.CommitBatch(StoredBatch{
 		BaseOffset: base0, LastOffsetDelta: 2,
@@ -1057,64 +996,43 @@ func TestSkipOffsetsOutOfOrder(t *testing.T) {
 	}
 }
 
-// TestFetchFromGapReturnsNextAvailableBatch verifies that when the chunk pool
-// has no data at the requested offset but has data at a higher offset, and
-// cold storage (WAL/S3) also has nothing, FetchFrom returns the higher chunk
-// data instead of nil. This prevents consumers from getting stuck on offset
-// gaps caused by WAL write failures.
-//
-// This test uses SetHW to directly set the high watermark, bypassing
-// SkipOffsets/CommitBatch, so it isolates the FetchFrom behavior.
-func TestFetchFromGapReturnsNextAvailableBatch(t *testing.T) {
+// TestFetchGapReturnsNextAvailableBatch verifies that Fetch skips past offset
+// gaps (from WAL failures) by returning the next available chunk data.
+func TestFetchGapReturnsNextAvailableBatch(t *testing.T) {
 	t.Parallel()
 
 	pd := newTestPartitionWithChunks()
 
-	// Simulate a gap: push batch at offsets 0-2, then push batch at offsets
-	// 5-7 (skipping 3-4). Use PushBatch for 0-2, then manually place
-	// batch 5-7 at the right offset in the chunk pool.
 	raw0 := makeSimpleBatch(3, 1000)
 	raw1 := makeSimpleBatch(3, 2000)
 
 	pd.Lock()
-	// Batch 0: offsets 0-2
 	pd.PushBatch(raw0, BatchMeta{LastOffsetDelta: 2, MaxTimestamp: 1000, NumRecords: 3}, nil)
-
-	// Reserve and skip offsets 3-4 (just advance nextOffset without data)
-	pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1})
-
-	// Batch 2: offsets 5-7 — assign offset and push to chunk
+	pd.ReserveOffset(BatchMeta{LastOffsetDelta: 1}) // gap: offsets 3-4
 	base2 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2})
 	AssignOffset(raw1, base2)
 	pd.AppendToChunk(raw1, chunk.ChunkBatch{
 		BaseOffset: base2, LastOffsetDelta: 2, MaxTimestamp: 2000, NumRecords: 3,
 	}, nil)
 
-	// Directly set HW past the gap. In real code this would be done via
-	// CommitBatch + SkipOffsets, but we're isolating the FetchFrom test.
 	pd.SetHW(8)
 	pd.Unlock()
 
-	// Fetch from offset 3 (in the gap). No WAL or S3 configured, so cold
-	// storage returns nothing. Should return batch at offset 5 instead of nil.
-	result := pd.FetchFrom(3, 1024*1024)
+	fr := pd.Fetch(3, 1024*1024)
 
-	if len(result) == 0 {
-		t.Fatal("FetchFrom(3) returned no batches; expected batch at offset 5 (skip gap)")
+	if len(fr.Batches) == 0 {
+		t.Fatal("Fetch(3) returned no batches; expected batch at offset 5 (skip gap)")
 	}
-	if result[0].BaseOffset != 5 {
-		t.Errorf("FetchFrom(3) first batch base: got %d, want 5", result[0].BaseOffset)
+	if fr.Batches[0].BaseOffset != 5 {
+		t.Errorf("Fetch(3) first batch base: got %d, want 5", fr.Batches[0].BaseOffset)
 	}
 }
 
-// TestAcquireSpareChunkDoesNotHoldPartitionLock verifies that when
-// AcquireSpareChunk blocks on an exhausted pool, pd.mu is NOT held.
-// This is the core invariant that prevents deadlock between the produce
-// path and the S3 flusher (which needs pd.mu to detach chunks).
+// TestAcquireSpareChunkDoesNotHoldPartitionLock verifies that AcquireSpareChunk
+// does not hold pd.mu while blocking on an exhausted pool (deadlock prevention).
 func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
 	t.Parallel()
 
-	// Small pool: 2 chunks with tiny chunk size so we can fill them easily.
 	chunkSize := 128
 	pool := chunk.NewPool(int64(2*chunkSize), chunkSize)
 	pd := &PartData{
@@ -1123,7 +1041,6 @@ func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
 		chunkPool: pool,
 	}
 
-	// Push a batch into the partition so chunkCurrent is non-nil.
 	batchSize := 61
 	spare := pd.AcquireSpareChunk(batchSize)
 	pd.Lock()
@@ -1131,22 +1048,16 @@ func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
 		LastOffsetDelta: 0, MaxTimestamp: 1000, NumRecords: 1,
 	}, spare)
 	pd.Unlock()
-	// chunkCurrent now has 61 bytes used out of 128.
-	// A second 61-byte batch won't fit (61+61=122 > 128... actually it fits).
-	// Push another to ensure the chunk is nearly full.
 	spare = pd.AcquireSpareChunk(batchSize)
 	pd.Lock()
 	pd.PushBatch(makeSimpleBatch(1, 2000), BatchMeta{
 		LastOffsetDelta: 0, MaxTimestamp: 2000, NumRecords: 1,
 	}, spare)
 	pd.Unlock()
-	// chunkCurrent now has 122 bytes used. Next 61-byte batch won't fit (122+61=183 > 128).
-	// AcquireSpareChunk will see needsNew=true.
 
-	// Exhaust the pool: one chunk is in chunkCurrent, grab the other.
+	// Exhaust the pool
 	held := pool.Acquire()
 
-	// Pool is now empty. AcquireSpareChunk should block.
 	blocked := make(chan struct{})
 	acquired := make(chan *chunk.Chunk, 1)
 	go func() {
@@ -1156,27 +1067,23 @@ func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
 	}()
 
 	<-blocked
-	time.Sleep(20 * time.Millisecond) // give goroutine time to enter Acquire()
+	time.Sleep(20 * time.Millisecond)
 
-	// The key assertion: pd.Lock() must succeed immediately, proving the
-	// blocked goroutine is NOT holding the partition lock.
+	// pd.Lock() must succeed, proving blocked goroutine doesn't hold pd.mu
 	lockAcquired := make(chan struct{})
 	go func() {
 		pd.Lock()
 		close(lockAcquired)
-		// Simulate flusher: detach sealed chunks
 		pd.DetachSealedChunks(false)
 		pd.Unlock()
 	}()
 
 	select {
 	case <-lockAcquired:
-		// pd.mu was free — no deadlock.
 	case <-time.After(time.Second):
 		t.Fatal("pd.Lock() blocked — AcquireSpareChunk is holding the partition lock (deadlock)")
 	}
 
-	// Release the held chunk to unblock the AcquireSpareChunk goroutine.
 	pool.Release(held)
 
 	select {
@@ -1191,10 +1098,8 @@ func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
 	}
 }
 
-// TestFetchHWConsistency verifies that Fetch() never returns batches whose
-// offsets extend beyond the HW reported in the same response. This guards
-// against the TOCTOU race where a producer commits between the HW read and
-// the chunk scan, causing the consumer to advance past the advertised HW.
+// TestFetchHWConsistency verifies that Fetch never returns batches whose
+// offsets extend beyond the HW reported in the same response.
 func TestFetchHWConsistency(t *testing.T) {
 	t.Parallel()
 
@@ -1203,7 +1108,6 @@ func TestFetchHWConsistency(t *testing.T) {
 	const batches = 5000
 	var wg sync.WaitGroup
 
-	// Writer goroutine: push batches as fast as possible.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1221,7 +1125,6 @@ func TestFetchHWConsistency(t *testing.T) {
 		}
 	}()
 
-	// Reader goroutine: call Fetch() repeatedly and check the invariant.
 	wg.Add(1)
 	var violations int
 	go func() {
@@ -1230,8 +1133,6 @@ func TestFetchHWConsistency(t *testing.T) {
 		for fetchOffset < batches*10 {
 			fr := pd.Fetch(fetchOffset, 1024*1024)
 			if fr.Err != 0 {
-				// OffsetOutOfRange is a hard failure in this test —
-				// the writer only advances HW, never moves logStart.
 				if fr.Err == ErrCodeOffsetOutOfRange {
 					t.Errorf("unexpected OffsetOutOfRange at fetchOffset=%d hw=%d logStart=%d",
 						fetchOffset, fr.HW, fr.LogStart)
@@ -1264,10 +1165,9 @@ func TestFetchHWConsistency(t *testing.T) {
 	}
 }
 
-// TestFetchHWConsistencyTwoPhase verifies the invariant under the two-phase
-// produce path used in production (ReserveOffset → AppendToChunk → CommitBatch).
-// Between AppendToChunk and CommitBatch, the batch data is visible in the chunk
-// pool but HW has not advanced. Fetch must not return these uncommitted batches.
+// TestFetchHWConsistencyTwoPhase verifies the HW invariant under the two-phase
+// produce path (ReserveOffset -> AppendToChunk -> CommitBatch). Batch data is
+// visible in the chunk pool before HW advances; Fetch must not return it.
 func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 	t.Parallel()
 
@@ -1276,7 +1176,6 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 	const iterations = 5000
 	var wg sync.WaitGroup
 
-	// Writer goroutine: two-phase produce with a deliberate gap.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1291,7 +1190,6 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 
 			spare := pd.AcquireSpareChunk(len(stored))
 
-			// Phase 1: reserve offset and append to chunk (data visible, HW not advanced)
 			pd.Lock()
 			baseOffset := pd.ReserveOffset(meta)
 			AssignOffset(stored, baseOffset)
@@ -1304,10 +1202,6 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 			pd.Unlock()
 			pd.ReleaseSpareChunk(spare)
 
-			// Simulate WAL fsync delay — this is where the race window exists.
-			// The batch is in the chunk pool but HW has not advanced.
-
-			// Phase 2: commit (advance HW)
 			pd.Lock()
 			pd.CommitBatch(StoredBatch{
 				BaseOffset:      baseOffset,
@@ -1317,11 +1211,10 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 				NumRecords:      meta.NumRecords,
 			})
 			pd.Unlock()
-			pd.NotifyWaiters(nil)
+			pd.NotifyWaiters()
 		}
 	}()
 
-	// Reader goroutine: Fetch must never return uncommitted data.
 	wg.Add(1)
 	var violations int
 	go func() {
@@ -1362,8 +1255,6 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 	}
 }
 
-// TestFetchCaughtUp verifies that Fetch at fetchOffset==HW returns no error
-// and no data (the "caught up" case).
 func TestFetchCaughtUp(t *testing.T) {
 	t.Parallel()
 	pd := newTestPartition()
@@ -1384,35 +1275,357 @@ func TestFetchCaughtUp(t *testing.T) {
 	}
 }
 
-// TestFetchOutOfRangeBounds verifies that Fetch returns OffsetOutOfRange
-// for offsets below logStart and above HW.
 func TestFetchOutOfRangeBounds(t *testing.T) {
 	t.Parallel()
 	pd := newTestPartition()
 
 	pd.Lock()
-	pushTestBatch(t, pd, 5, 1000) // offsets 0-4, HW=5
+	pushTestBatch(t, pd, 5, 1000)
 	pd.Unlock()
 
 	pd.CompactionMu.Lock()
-	_ = pd.AdvanceLogStartOffset(2, nil) // logStart=2
+	_ = pd.AdvanceLogStartOffset(2, nil)
 	pd.CompactionMu.Unlock()
 
-	// Below logStart
 	fr := pd.Fetch(1, 1024*1024)
 	if fr.Err != ErrCodeOffsetOutOfRange {
 		t.Errorf("fetch below logStart: want err=%d, got err=%d", ErrCodeOffsetOutOfRange, fr.Err)
 	}
 
-	// Above HW
 	fr = pd.Fetch(6, 1024*1024)
 	if fr.Err != ErrCodeOffsetOutOfRange {
 		t.Errorf("fetch above HW: want err=%d, got err=%d", ErrCodeOffsetOutOfRange, fr.Err)
 	}
 
-	// At logStart (valid)
 	fr = pd.Fetch(2, 1024*1024)
 	if fr.Err != 0 {
 		t.Errorf("fetch at logStart: want err=0, got err=%d", fr.Err)
+	}
+}
+
+func TestFilterBatchesByHW(t *testing.T) {
+	t.Parallel()
+
+	t.Run("all below HW", func(t *testing.T) {
+		t.Parallel()
+		batches := []StoredBatch{
+			{BaseOffset: 0, LastOffsetDelta: 2}, // offsets 0-2
+			{BaseOffset: 3, LastOffsetDelta: 1}, // offsets 3-4
+		}
+		result := filterBatchesByHW(batches, 10)
+		if len(result) != 2 {
+			t.Errorf("expected 2 batches, got %d", len(result))
+		}
+	})
+
+	t.Run("last batch straddles HW", func(t *testing.T) {
+		t.Parallel()
+		batches := []StoredBatch{
+			{BaseOffset: 0, LastOffsetDelta: 2}, // offsets 0-2, end=3 (ok if hw>=3)
+			{BaseOffset: 3, LastOffsetDelta: 4}, // offsets 3-7, end=8 (dropped if hw<8)
+		}
+		result := filterBatchesByHW(batches, 5)
+		if len(result) != 1 {
+			t.Errorf("expected 1 batch (second should be filtered), got %d", len(result))
+		}
+	})
+
+	t.Run("all above HW", func(t *testing.T) {
+		t.Parallel()
+		batches := []StoredBatch{
+			{BaseOffset: 10, LastOffsetDelta: 2}, // offsets 10-12, end=13
+		}
+		result := filterBatchesByHW(batches, 5)
+		if len(result) != 0 {
+			t.Errorf("expected 0 batches, got %d", len(result))
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		t.Parallel()
+		result := filterBatchesByHW(nil, 10)
+		if len(result) != 0 {
+			t.Errorf("expected 0 batches, got %d", len(result))
+		}
+	})
+
+	t.Run("exact HW boundary", func(t *testing.T) {
+		t.Parallel()
+		batches := []StoredBatch{
+			{BaseOffset: 0, LastOffsetDelta: 4}, // offsets 0-4, end=5
+		}
+		// HW=5 means offsets 0-4 are committed, so end(5) <= hw(5) is ok
+		result := filterBatchesByHW(batches, 5)
+		if len(result) != 1 {
+			t.Errorf("batch ending exactly at HW should be included, got %d", len(result))
+		}
+		// HW=4 means offsets 0-3 are committed, end(5) > hw(4)
+		result = filterBatchesByHW(batches, 4)
+		if len(result) != 0 {
+			t.Errorf("batch ending past HW should be excluded, got %d", len(result))
+		}
+	})
+}
+
+// TestAdvanceLogStartOffsetBeyondHWCapsAtHW verifies that AdvanceLogStartOffset
+// caps the new logStart at HW to prevent the logStart > HW invariant violation.
+func TestAdvanceLogStartOffsetBeyondHWCapsAtHW(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 3, 1000) // offsets 0-2, HW=3
+	pd.Unlock()
+
+	// Try to advance logStart past HW
+	pd.CompactionMu.Lock()
+	err := pd.AdvanceLogStartOffset(100, nil)
+	pd.CompactionMu.Unlock()
+	if err != nil {
+		t.Fatalf("AdvanceLogStartOffset failed: %v", err)
+	}
+
+	pd.RLock()
+	logStart := pd.LogStart()
+	hw := pd.HW()
+	pd.RUnlock()
+
+	if logStart != hw {
+		t.Errorf("logStart should be capped at HW: got logStart=%d, hw=%d", logStart, hw)
+	}
+	if logStart != 3 {
+		t.Errorf("logStart: got %d, want 3", logStart)
+	}
+}
+
+// TestConcurrentProduceAndRetention verifies that concurrent produce and
+// AdvanceLogStartOffset don't corrupt state. This tests the lock ordering
+// (CompactionMu -> pd.mu).
+func TestConcurrentProduceAndRetention(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	const iterations = 1000
+	var wg sync.WaitGroup
+
+	// Writer goroutine: push batches continuously
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			raw := makeSimpleBatch(1, int64(i))
+			meta, err := ParseBatchHeader(raw)
+			if err != nil {
+				return
+			}
+			spare := pd.AcquireSpareChunk(len(raw))
+			pd.Lock()
+			_, spare = pd.PushBatch(raw, meta, spare)
+			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
+		}
+	}()
+
+	// Retention goroutine: advance logStart periodically
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			pd.RLock()
+			hw := pd.HW()
+			pd.RUnlock()
+
+			if hw > 2 {
+				pd.CompactionMu.Lock()
+				_ = pd.AdvanceLogStartOffset(hw-1, nil)
+				pd.CompactionMu.Unlock()
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	pd.RLock()
+	hw := pd.HW()
+	logStart := pd.LogStart()
+	pd.RUnlock()
+
+	if logStart > hw {
+		t.Errorf("invariant violated: logStart(%d) > hw(%d)", logStart, hw)
+	}
+}
+
+// TestSkipOffsetsEdgeCases verifies edge cases for SkipOffsets.
+func TestSkipOffsetsEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	t.Run("skip count=1", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartitionWithChunks()
+
+		pd.Lock()
+		base0 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 0
+		base1 := pd.ReserveOffset(BatchMeta{LastOffsetDelta: 0}) // offset 1
+		pd.Unlock()
+
+		// Commit first, skip second (single offset)
+		pd.Lock()
+		pd.CommitBatch(StoredBatch{
+			BaseOffset: base0, LastOffsetDelta: 0,
+			RawBytes: makeSimpleBatch(1, 1000), MaxTimestamp: 1000, NumRecords: 1,
+		})
+		pd.Unlock()
+
+		pd.RLock()
+		if pd.HW() != 1 {
+			t.Errorf("HW after commit: got %d, want 1", pd.HW())
+		}
+		pd.RUnlock()
+
+		pd.Lock()
+		pd.SkipOffsets(base1, 1) // skip single offset
+		pd.Unlock()
+
+		pd.RLock()
+		hw := pd.HW()
+		pd.RUnlock()
+		if hw != 2 {
+			t.Errorf("HW after skip(count=1): got %d, want 2", hw)
+		}
+	})
+
+	t.Run("skip already-past range is no-op", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartitionWithChunks()
+
+		pd.Lock()
+		pd.ReserveOffset(BatchMeta{LastOffsetDelta: 2}) // offsets 0-2
+		pd.CommitBatch(StoredBatch{
+			BaseOffset: 0, LastOffsetDelta: 2,
+			RawBytes: makeSimpleBatch(3, 1000), MaxTimestamp: 1000, NumRecords: 3,
+		})
+		pd.Unlock()
+
+		pd.RLock()
+		if pd.HW() != 3 {
+			t.Errorf("HW after commit: got %d, want 3", pd.HW())
+		}
+		pd.RUnlock()
+
+		// Skip range 0-1 which is already past nextCommit (3)
+		pd.Lock()
+		pd.SkipOffsets(0, 2)
+		pd.Unlock()
+
+		pd.RLock()
+		hw := pd.HW()
+		pd.RUnlock()
+		if hw != 3 {
+			t.Errorf("HW after no-op skip: got %d, want 3 (unchanged)", hw)
+		}
+	})
+}
+
+// TestConcurrentDetachSealedChunksAndFetch verifies that Fetch reads are
+// safe when DetachSealedChunks runs concurrently (simulating the S3 flusher).
+func TestConcurrentDetachSealedChunksAndFetch(t *testing.T) {
+	t.Parallel()
+
+	chunkSize := 256
+	pool := chunk.NewPool(int64(8*chunkSize), chunkSize)
+	pd := &PartData{
+		Topic:     "test-topic",
+		Index:     0,
+		chunkPool: pool,
+	}
+
+	const batches = 200
+	var wg sync.WaitGroup
+
+	// Writer goroutine: produce batches
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < batches; i++ {
+			raw := makeSimpleBatch(1, int64(i))
+			meta, err := ParseBatchHeader(raw)
+			if err != nil {
+				return
+			}
+			spare := pd.AcquireSpareChunk(len(raw))
+			pd.Lock()
+			_, spare = pd.PushBatch(raw, meta, spare)
+			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
+		}
+	}()
+
+	// Flusher goroutine: detach sealed chunks and release them
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < batches; i++ {
+			pd.Lock()
+			chunks := pd.DetachSealedChunks(false)
+			pd.Unlock()
+			for _, c := range chunks {
+				pool.Release(c)
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+
+	// Reader goroutine: Fetch repeatedly
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < batches*2; i++ {
+			pd.RLock()
+			hw := pd.HW()
+			pd.RUnlock()
+			if hw > 0 {
+				fr := pd.Fetch(0, 1024*1024)
+				// We just verify no panic; data may or may not be in chunks
+				_ = fr
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestFetchAtLogStartBoundary verifies Fetch at exactly logStart when
+// chunk data starts at a higher offset (requiring cold-path fallthrough).
+func TestFetchAtLogStartBoundary(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 3, 1000) // offsets 0-2
+	pushTestBatch(t, pd, 3, 2000) // offsets 3-5
+	pushTestBatch(t, pd, 3, 3000) // offsets 6-8
+	pd.Unlock()
+
+	// Advance logStart to 3 (first batch is below logStart)
+	pd.CompactionMu.Lock()
+	_ = pd.AdvanceLogStartOffset(3, nil)
+	pd.CompactionMu.Unlock()
+
+	// Fetch at exactly logStart
+	fr := pd.Fetch(3, 1024*1024)
+	if fr.Err != 0 {
+		t.Errorf("Fetch at logStart: got err=%d, want 0", fr.Err)
+	}
+	if len(fr.Batches) == 0 {
+		t.Fatal("Fetch at logStart should return data")
+	}
+	if fr.Batches[0].BaseOffset != 3 {
+		t.Errorf("first batch base: got %d, want 3", fr.Batches[0].BaseOffset)
+	}
+	if fr.LogStart != 3 {
+		t.Errorf("LogStart in response: got %d, want 3", fr.LogStart)
 	}
 }

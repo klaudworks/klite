@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleOffsetCommit returns the OffsetCommit handler (API key 8).
 func HandleOffsetCommit(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.OffsetCommitRequest)
@@ -31,7 +30,6 @@ func HandleOffsetCommit(state *cluster.State) server.Handler {
 	}
 }
 
-// fillOffsetCommitError fills all partitions in the response with the given error code.
 func fillOffsetCommitError(req *kmsg.OffsetCommitRequest, resp *kmsg.OffsetCommitResponse, code int16) {
 	for _, rt := range req.Topics {
 		rtResp := kmsg.NewOffsetCommitResponseTopic()

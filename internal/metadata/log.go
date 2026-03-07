@@ -55,14 +55,11 @@ type Log struct {
 	snapshotFn func() [][]byte
 }
 
-// LogConfig holds configuration for the metadata log.
 type LogConfig struct {
 	DataDir string
 	Logger  *slog.Logger
 }
 
-// NewLog creates or opens a metadata.log file. Call Replay() to read existing
-// entries, then use Append/AppendSync for new entries.
 func NewLog(cfg LogConfig) (*Log, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -94,43 +91,32 @@ func NewLog(cfg LogConfig) (*Log, error) {
 	}, nil
 }
 
-// SetSnapshotFn sets the function used during compaction to generate a fresh
-// snapshot of all live state as serialized entries.
 func (l *Log) SetSnapshotFn(fn func() [][]byte) {
 	l.snapshotFn = fn
 }
 
-// Append writes a serialized entry to the metadata.log (buffered, no fsync).
-// Used for frequent entries like OFFSET_COMMIT.
+// Append writes a serialized entry (buffered, no fsync).
 func (l *Log) Append(entryPayload []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.appendLocked(entryPayload, false)
 }
 
-// AppendSync writes a serialized entry to the metadata.log and fsyncs.
-// Used for infrequent but critical entries like CREATE_TOPIC, LOG_START_OFFSET.
+// AppendSync writes a serialized entry and fsyncs.
 func (l *Log) AppendSync(entryPayload []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.appendLocked(entryPayload, true)
 }
 
-// appendLocked writes a framed entry. Caller must hold l.mu.
-// Framing: [4 bytes length][4 bytes CRC32c][payload]
+// Caller must hold l.mu.
+// Frame: [4B length][4B CRC32c][payload]
 func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
-	// Frame: length(4) + crc(4) + payload
 	frameSize := 4 + 4 + len(entryPayload)
 	frame := make([]byte, frameSize)
 
-	// Length covers CRC (4 bytes) plus payload
 	binary.BigEndian.PutUint32(frame[0:4], uint32(4+len(entryPayload)))
-
-	// CRC over payload
-	crcVal := crc32.Checksum(entryPayload, crc32cTable)
-	binary.BigEndian.PutUint32(frame[4:8], crcVal)
-
-	// Payload
+	binary.BigEndian.PutUint32(frame[4:8], crc32.Checksum(entryPayload, crc32cTable))
 	copy(frame[8:], entryPayload)
 
 	n, err := l.file.Write(frame)
@@ -145,7 +131,6 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 		}
 	}
 
-	// Check if compaction is needed
 	count := l.appendCount.Add(1)
 	if count%compactionCheckInterval == 0 && l.size > compactionThreshold {
 		// Compaction runs with the lock held — it's brief (~1ms for typical state)
@@ -155,10 +140,8 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 	return nil
 }
 
-// Replay reads all entries from the metadata.log and calls the appropriate
-// callback for each valid entry. Returns the number of entries replayed.
+// Replay reads all entries and calls the appropriate callback for each.
 func (l *Log) Replay() (int, error) {
-	// Open the file for reading from the start
 	f, err := os.Open(l.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -171,11 +154,9 @@ func (l *Log) Replay() (int, error) {
 	count := 0
 	_, scanErr := wal.ScanFramedEntries(f, func(payload []byte) bool {
 		if len(payload) < 4+1 {
-			// Need at least CRC(4) + type(1)
 			return false
 		}
 
-		// Validate CRC
 		storedCRC := binary.BigEndian.Uint32(payload[0:4])
 		actualCRC := crc32.Checksum(payload[4:], crc32cTable)
 		if storedCRC != actualCRC {
@@ -183,7 +164,6 @@ func (l *Log) Replay() (int, error) {
 			return false
 		}
 
-		// Parse entry type (first byte after CRC)
 		entryType := payload[4]
 		entryData := payload[5:]
 
@@ -203,7 +183,6 @@ func (l *Log) Replay() (int, error) {
 	return count, nil
 }
 
-// dispatchEntry routes a parsed entry to the appropriate callback.
 func (l *Log) dispatchEntry(entryType byte, data []byte) error {
 	switch entryType {
 	case EntryCreateTopic:
@@ -294,7 +273,6 @@ func (l *Log) dispatchEntry(entryType byte, data []byte) error {
 	return nil
 }
 
-// SetCallbacks sets all replay callbacks at once.
 func (l *Log) SetCallbacks(
 	topicCb func(CreateTopicEntry),
 	deleteTopicCb func(DeleteTopicEntry),
@@ -311,7 +289,6 @@ func (l *Log) SetCallbacks(
 	l.logStartCallback = logStartCb
 }
 
-// SetScramCallbacks sets replay callbacks for SCRAM credential entries.
 func (l *Log) SetScramCallbacks(
 	credentialCb func(ScramCredentialEntry),
 	deleteCb func(ScramCredentialDeleteEntry),
@@ -320,7 +297,6 @@ func (l *Log) SetScramCallbacks(
 	l.scramCredentialDeleteCallback = deleteCb
 }
 
-// SetCompactionWatermarkCallback sets the replay callback for compaction watermark entries.
 func (l *Log) SetCompactionWatermarkCallback(cb func(CompactionWatermarkEntry)) {
 	l.compactionWatermarkCallback = cb
 }
@@ -364,7 +340,6 @@ func (l *Log) compactLocked() {
 		newSize += int64(n)
 	}
 
-	// Fsync the tmp file
 	if err := tmpFile.Sync(); err != nil {
 		l.logger.Error("compaction: fsync tmp", "err", err)
 		_ = tmpFile.Close()
@@ -373,25 +348,20 @@ func (l *Log) compactLocked() {
 	}
 	_ = tmpFile.Close()
 
-	// Close current file before rename
 	_ = l.file.Close()
 
-	// Atomic rename
 	if err := os.Rename(tmpPath, l.path); err != nil {
 		l.logger.Error("compaction: rename", "err", err)
-		// Reopen old file
 		l.file, _ = os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 		return
 	}
 
-	// Fsync directory
 	dir, err := os.Open(l.dir)
 	if err == nil {
 		_ = dir.Sync()
 		_ = dir.Close()
 	}
 
-	// Reopen the compacted file
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		l.logger.Error("compaction: reopen", "err", err)
@@ -409,8 +379,6 @@ func (l *Log) compactLocked() {
 	)
 }
 
-// Compact triggers a compaction if the file exceeds the threshold.
-// Can be called externally (e.g., during startup after replay).
 func (l *Log) Compact() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -419,14 +387,12 @@ func (l *Log) Compact() {
 	}
 }
 
-// Size returns the current file size.
 func (l *Log) Size() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.size
 }
 
-// Close closes the metadata.log file.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -439,7 +405,6 @@ func (l *Log) Close() error {
 	return nil
 }
 
-// Path returns the file path.
 func (l *Log) Path() string {
 	return l.path
 }

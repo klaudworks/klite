@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleSyncGroup returns the SyncGroup handler (API key 14).
 func HandleSyncGroup(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.SyncGroupRequest)

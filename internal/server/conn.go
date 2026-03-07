@@ -14,7 +14,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// SASLStage tracks the SASL authentication state for a connection.
 type SASLStage uint8
 
 const (
@@ -27,30 +26,25 @@ const (
 )
 
 const (
-	connReadBufSize  = 64 * 1024 // 64KB read buffer
-	connWriteBufSize = 64 * 1024 // 64KB write buffer
-	maxFrameSize     = 100 << 20 // 100MB max frame size
-	maxInFlight      = 100       // max pipelined requests per connection
+	connReadBufSize  = 64 * 1024
+	connWriteBufSize = 64 * 1024
+	maxFrameSize     = 100 << 20
+	maxInFlight      = 100
 )
 
-// clientResp is a response to be written to the client, sent from handler
-// goroutines to the write goroutine via respCh.
 type clientResp struct {
-	kresp kmsg.Response // typed response (write goroutine encodes it)
-	corr  int32         // correlation ID
-	seq   uint32        // monotonic sequence assigned in READ goroutine
-	skip  bool          // true = no response to write (acks=0), just advance seq
-	err   error         // non-nil = close connection
+	kresp kmsg.Response
+	corr  int32
+	seq   uint32
+	skip  bool
+	err   error
 }
 
-// connReader wraps a bufio.Reader with a reusable frame buffer.
 type connReader struct {
 	br  *bufio.Reader
-	buf []byte // reused across requests, grown with append()
+	buf []byte
 }
 
-// readFrame reads a single Kafka wire frame (4-byte size prefix + body).
-// The returned slice is valid only until the next readFrame() call.
 func (cr *connReader) readFrame() ([]byte, error) {
 	var sizeBuf [4]byte
 	if _, err := io.ReadFull(cr.br, sizeBuf[:]); err != nil {
@@ -58,12 +52,10 @@ func (cr *connReader) readFrame() ([]byte, error) {
 	}
 	size := int(binary.BigEndian.Uint32(sizeBuf[:]))
 
-	// Validate frame size
 	if size < 0 || size > maxFrameSize {
 		return nil, fmt.Errorf("invalid frame size: %d", size)
 	}
 
-	// Reuse buffer, grow if needed
 	if cap(cr.buf) < size {
 		cr.buf = make([]byte, size)
 	} else {
@@ -75,33 +67,26 @@ func (cr *connReader) readFrame() ([]byte, error) {
 	return cr.buf, nil
 }
 
-// clientConn manages a single client TCP connection.
 type clientConn struct {
 	server     *Server
 	conn       net.Conn
 	respCh     chan clientResp
 	reader     connReader
 	bw         *bufio.Writer
-	writeBuf   []byte // reused encode buffer for response assembly
+	writeBuf   []byte
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
 
-	// inflightSem limits the number of in-flight handler goroutines.
-	// The read goroutine acquires before spawning; the handler releases.
 	inflightSem chan struct{}
+	wg          sync.WaitGroup
 
-	// wg tracks handler goroutines for clean shutdown.
-	wg sync.WaitGroup
-
-	// SASL authentication state
 	saslStage SASLStage
-	scramS0   *sasl.ScramServer0 // SCRAM server-first state (between rounds 1 and 2)
-	user      string             // authenticated username (set after auth completes)
+	scramS0   *sasl.ScramServer0
+	user      string
 }
 
-// newClientConn creates a new clientConn wrapping the given net.Conn.
 func newClientConn(s *Server, nc net.Conn) *clientConn {
-	stage := SASLStageComplete // no auth required by default
+	stage := SASLStageComplete
 	if s.saslEnabled {
 		stage = SASLStageBegin
 	}
@@ -120,19 +105,13 @@ func newClientConn(s *Server, nc net.Conn) *clientConn {
 	}
 }
 
-// serve runs the read and write goroutines for this connection.
-// It blocks until the connection is closed.
 func (cc *clientConn) serve() {
 	go cc.writeLoop()
 	cc.readLoop()
-	// readLoop returned: wait for all handlers to finish,
-	// then close respCh so writeLoop drains and exits.
 	cc.wg.Wait()
 	close(cc.respCh)
 }
 
-// readLoop reads frames from the connection, parses them, and spawns
-// handler goroutines. Sequence numbers are assigned here in arrival order.
 func (cc *clientConn) readLoop() {
 	who := cc.conn.RemoteAddr()
 	var nextSeq uint32
@@ -140,7 +119,6 @@ func (cc *clientConn) readLoop() {
 	for {
 		frame, err := cc.reader.readFrame()
 		if err != nil {
-			// Check if this is a shutdown
 			select {
 			case <-cc.shutdownCh:
 			default:
@@ -151,7 +129,6 @@ func (cc *clientConn) readLoop() {
 			return
 		}
 
-		// Minimum header: apiKey(2) + apiVersion(2) + corrID(4) + clientIDLen(2) = 10 bytes
 		if len(frame) < 10 {
 			cc.logger.Debug("frame too short", "remote", who, "size", len(frame))
 			return
@@ -161,39 +138,25 @@ func (cc *clientConn) readLoop() {
 		apiKey := reader.Int16()
 		apiVersion := reader.Int16()
 		corrID := reader.Int32()
-		_ = reader.NullableString() // client ID (unused for now)
+		_ = reader.NullableString()
 
-		// Get typed request struct for this API key
 		kreq := kmsg.RequestForKey(apiKey)
 		if kreq == nil {
-			// Unknown API key: close connection (matches Kafka behavior)
 			cc.logger.Debug("unknown API key, closing connection", "remote", who, "api_key", apiKey)
 			return
 		}
 		kreq.SetVersion(apiVersion)
 
-		// Flexible-version headers have tagged fields after the client ID.
-		// Must skip them before passing reader.Src to kreq.ReadFrom().
 		if kreq.IsFlexible() {
 			kmsg.SkipTags(&reader)
 		}
 
-		// Copy the remaining body bytes so the parsed request owns its
-		// memory. ReadFrom returns sub-slices (e.g. Records []byte) that
-		// alias the input — without this copy, the next readFrame() call
-		// would overwrite the reusable frame buffer and corrupt in-flight
-		// handler data.
+		// Copy body so parsed request owns its memory (ReadFrom aliases input).
 		bodyCopy := make([]byte, len(reader.Src))
 		copy(bodyCopy, reader.Src)
 
-		// ApiVersions (key 18) is special: if parsing fails due to an
-		// unsupported version, we still dispatch to the handler so it can
-		// return the version list with UNSUPPORTED_VERSION error code.
-		// This lets the client negotiate down to a supported version.
 		if err := kreq.ReadFrom(bodyCopy); err != nil {
 			if apiKey == 18 {
-				// For ApiVersions, ignore parse errors from unsupported versions.
-				// The handler will detect the version mismatch and respond accordingly.
 				cc.logger.Debug("ApiVersions parse error (will still dispatch)",
 					"remote", who, "version", apiVersion, "error", err)
 			} else {
@@ -202,8 +165,6 @@ func (cc *clientConn) readLoop() {
 			}
 		}
 
-		// SASL gate: if SASL is enabled, check whether this request
-		// is allowed given the connection's current auth stage.
 		if cc.saslStage != SASLStageComplete {
 			if !cc.saslAllowed(kreq) {
 				cc.logger.Debug("SASL gate: request not allowed before auth, closing",
@@ -212,21 +173,10 @@ func (cc *clientConn) readLoop() {
 			}
 		}
 
-		// Assign sequence number in arrival order BEFORE dispatching
 		seq := nextSeq
 		nextSeq++
 
-		// Produce requests (API key 0) are handled inline in the
-		// read loop to preserve arrival order. Kafka does the same:
-		// it mutes the socket after reading a request and only
-		// unmutes after the response is sent, ensuring at most one
-		// in-flight request per connection. Handling produce inline
-		// is critical for idempotent writes where the sequence
-		// window must see batches in wire order.
-		//
-		// All other requests are dispatched to goroutines so that
-		// long-running operations (e.g. fetch long-polling) don't
-		// block the connection.
+		// Produce handled inline to preserve arrival order (required for idempotency).
 		if apiKey == 0 {
 			func() {
 				defer func() {
@@ -245,20 +195,17 @@ func (cc *clientConn) readLoop() {
 			continue
 		}
 
-		// Acquire in-flight semaphore (backpressure on misbehaving clients)
 		select {
 		case cc.inflightSem <- struct{}{}:
 		case <-cc.shutdownCh:
 			return
 		}
 
-		// Spawn handler goroutine for non-produce requests
 		cc.wg.Add(1)
 		go func(corrID int32, kreq kmsg.Request, seq uint32) {
 			defer cc.wg.Done()
 			defer func() { <-cc.inflightSem }()
 
-			// Recover from handler panics
 			defer func() {
 				if r := recover(); r != nil {
 					cc.logger.Error("handler panic", "remote", who, "api_key", kreq.Key(), "panic", r)
@@ -268,7 +215,6 @@ func (cc *clientConn) readLoop() {
 
 			resp, err := cc.dispatchReq(kreq)
 
-			// nil response + nil error = no response expected (acks=0 produce)
 			if resp == nil && err == nil {
 				cc.sendResp(clientResp{seq: seq, skip: true})
 				return
@@ -278,7 +224,6 @@ func (cc *clientConn) readLoop() {
 	}
 }
 
-// saslAllowed checks if the given request is allowed in the current SASL stage.
 func (cc *clientConn) saslAllowed(kreq kmsg.Request) bool {
 	switch cc.saslStage {
 	case SASLStageBegin:
@@ -303,7 +248,6 @@ func (cc *clientConn) saslAllowed(kreq kmsg.Request) bool {
 	}
 }
 
-// sendResp sends a response to the write goroutine, respecting shutdown.
 func (cc *clientConn) sendResp(resp clientResp) {
 	select {
 	case cc.respCh <- resp:
@@ -311,37 +255,32 @@ func (cc *clientConn) sendResp(resp clientResp) {
 	}
 }
 
-// writeLoop receives responses from handler goroutines, reorders them by
-// sequence number, and writes them to the connection in request order.
 func (cc *clientConn) writeLoop() {
 	defer cc.conn.Close() //nolint:errcheck // best-effort close
 
 	var (
 		nextSeq uint32
-		oooresp = make(map[uint32]clientResp) // out-of-order buffer
+		oooresp = make(map[uint32]clientResp)
 	)
 
 	for {
-		// Check if we already have the next response buffered
 		resp, ok := oooresp[nextSeq]
 		if ok {
 			delete(oooresp, nextSeq)
 			nextSeq++
 		} else {
-			// Wait for a response from the handler
 			var resp2 clientResp
 			var open bool
 			select {
 			case resp2, open = <-cc.respCh:
 				if !open {
-					return // readLoop finished and all handlers done
+					return
 				}
 			case <-cc.shutdownCh:
 				return
 			}
 
 			if resp2.seq != nextSeq {
-				// Out of order: stash and continue waiting
 				oooresp[resp2.seq] = resp2
 				continue
 			}
@@ -349,19 +288,16 @@ func (cc *clientConn) writeLoop() {
 			nextSeq++
 		}
 
-		// Check for errors
 		if resp.err != nil {
 			cc.logger.Debug("handler error, closing connection",
 				"remote", cc.conn.RemoteAddr(), "error", resp.err)
 			return
 		}
 
-		// Skip marker (acks=0): advance sequence, write nothing
 		if resp.skip {
 			continue
 		}
 
-		// Encode and write the response
 		if err := cc.writeResponse(resp); err != nil {
 			cc.logger.Debug("write error", "remote", cc.conn.RemoteAddr(), "error", err)
 			return
@@ -369,27 +305,20 @@ func (cc *clientConn) writeLoop() {
 	}
 }
 
-// writeResponse encodes a Kafka response and writes it to the connection.
 func (cc *clientConn) writeResponse(resp clientResp) error {
 	buf := cc.writeBuf[:0]
 
-	// Size placeholder (4 bytes)
 	buf = append(buf, 0, 0, 0, 0)
-	// Correlation ID (4 bytes)
 	buf = binary.BigEndian.AppendUint32(buf, uint32(resp.corr))
-	// Flexible version response header tag byte (except ApiVersions key 18)
 	if resp.kresp.IsFlexible() && resp.kresp.Key() != 18 {
-		buf = append(buf, 0) // empty tagged fields
+		buf = append(buf, 0)
 	}
-	// Response body
 	buf = resp.kresp.AppendTo(buf)
-
-	// Fill in size
 	binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
 
 	if _, err := cc.bw.Write(buf); err != nil {
 		return err
 	}
-	cc.writeBuf = buf // keep grown buffer for next response
+	cc.writeBuf = buf
 	return cc.bw.Flush()
 }

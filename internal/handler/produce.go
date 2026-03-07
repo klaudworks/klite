@@ -13,13 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleProduce returns the Produce handler (API key 0).
-// Supports v3-11.
-//
-// Uses the durable WAL path:
-//
-//	reserveOffset -> WAL append -> fsync -> commitBatch
-func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.FetchMetrics) server.Handler {
+func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ProduceRequest)
 
@@ -29,7 +23,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 
 		resp := r.ResponseKind().(*kmsg.ProduceResponse)
 
-		// Version validation
 		minV, maxV, ok := VersionRange(0)
 		if !ok || r.Version < minV || r.Version > maxV {
 			if suppressResponse {
@@ -40,12 +33,9 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 
 		now := time.Now().UnixMilli()
 
-		// Two-phase produce: first submit all WAL writes (phase 1), then
-		// wait for the single fsync and commit all batches (phase 2).
-		// This batches all partition writes in one request into a single
-		// fsync cycle instead of one fsync per partition.
-
-		// pendingCommit ties a pending WAL entry to its response slot.
+		// Two-phase produce: submit all WAL writes (phase 1), then wait for
+		// a single fsync and commit all batches (phase 2). This batches all
+		// partition writes into one fsync cycle instead of one per partition.
 		type pendingCommit struct {
 			pending         pendingWAL
 			topicIdx        int
@@ -63,7 +53,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 			st := kmsg.NewProduceResponseTopic()
 			st.Topic = rt.Topic
 
-			// Look up or auto-create the topic
 			td, _, err := state.GetOrCreateTopic(rt.Topic)
 			if err != nil {
 				for _, rp := range rt.Partitions {
@@ -180,7 +169,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 					}
 				}
 
-				// Phase 1: reserve offset, append to chunk, submit WAL async
 				pending, walErr := produceSubmitWAL(pd, td, raw, meta, walWriter)
 				if walErr != nil {
 					sp.ErrorCode = kerr.KafkaStorageError.Code
@@ -190,7 +178,6 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 
 				partIdx := len(st.Partitions)
 
-				// Placeholder response — will be filled in phase 2
 				st.Partitions = append(st.Partitions, sp)
 
 				pendingCommits = append(pendingCommits, pendingCommit{
@@ -209,14 +196,11 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 			resp.Topics = append(resp.Topics, st)
 		}
 
-		// Phase 2: wait for fsync and commit all batches.
-		// All pending entries share the same fsync cycle in the WAL writer,
-		// so this is effectively one fsync wait regardless of partition count.
 		for i := range pendingCommits {
 			pc := &pendingCommits[i]
 			sp := &resp.Topics[pc.topicIdx].Partitions[pc.partIdx]
 
-			if walErr := produceCommitWAL(pc.pending, fm); walErr != nil {
+			if walErr := produceCommitWAL(pc.pending); walErr != nil {
 				slog.Error("WAL write failed for produce",
 					"topic", pc.topic, "partition", pc.partition,
 					"baseOffset", pc.pending.baseOffset, "err", walErr)
@@ -256,9 +240,7 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.Fetc
 	}
 }
 
-// pendingWAL holds state for a partition batch between the async WAL submit
-// and the post-fsync commit. Used by the two-phase produce path to batch
-// all WAL writes in a single produce request into one fsync cycle.
+// pendingWAL holds state between the async WAL submit and the post-fsync commit.
 type pendingWAL struct {
 	pd         *cluster.PartData
 	baseOffset int64
@@ -268,11 +250,9 @@ type pendingWAL struct {
 	errCh      <-chan error
 }
 
-// produceSubmitWAL is phase 1: reserve offset and enqueue the WAL entry.
-// The chunk pool write is deferred to phase 2 (after WAL fsync) so that
-// data never appears in memory before it is durable on disk.
-//
-// Ordering: pd.Lock() → reserve offset → AppendAsync → pd.Unlock().
+// produceSubmitWAL reserves offset and enqueues the WAL entry. Chunk pool
+// write is deferred until after fsync so data never appears in memory
+// before it is durable on disk.
 func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (pendingWAL, error) {
 	stored := make([]byte, len(raw))
 	copy(stored, raw)
@@ -308,10 +288,9 @@ func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, m
 	}, nil
 }
 
-// produceCommitWAL is phase 2: wait for WAL fsync, then write to the chunk
-// pool and commit (advance HW). If the WAL write failed, skip the offsets
-// so the partition doesn't stall. Returns non-nil error on WAL failure.
-func produceCommitWAL(p pendingWAL, fm *cluster.FetchMetrics) error {
+// produceCommitWAL waits for WAL fsync, then writes to the chunk pool and
+// commits (advances HW). On WAL failure, skips offsets so HW keeps advancing.
+func produceCommitWAL(p pendingWAL) error {
 	walErr := <-p.errCh
 
 	if walErr != nil {
@@ -323,9 +302,7 @@ func produceCommitWAL(p pendingWAL, fm *cluster.FetchMetrics) error {
 		return walErr
 	}
 
-	// WAL write succeeded. Write to chunk pool and commit.
-	// Acquire spare chunk outside the lock to avoid deadlock with
-	// the S3 flusher (same rationale as the original design).
+	// Acquire spare chunk outside the lock to avoid deadlock with the S3 flusher.
 	spare := p.pd.AcquireSpareChunk(len(p.stored))
 
 	p.pd.Lock()
@@ -345,12 +322,10 @@ func produceCommitWAL(p pendingWAL, fm *cluster.FetchMetrics) error {
 	p.pd.Unlock()
 	p.pd.ReleaseSpareChunk(spare)
 
-	p.pd.NotifyWaiters(fm)
+	p.pd.NotifyWaiters()
 	return nil
 }
 
-// getMaxMessageBytes returns the max.message.bytes config value for the topic.
-// Falls back to the default if not set or invalid.
 func getMaxMessageBytes(td *cluster.TopicData) int {
 	if v, ok := td.Configs["max.message.bytes"]; ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -360,8 +335,6 @@ func getMaxMessageBytes(td *cluster.TopicData) int {
 	return cluster.DefaultMaxMessageBytes
 }
 
-// getTimestampType returns the message.timestamp.type config value for the topic.
-// Returns "CreateTime" if not set.
 func getTimestampType(td *cluster.TopicData) string {
 	if v, ok := td.Configs["message.timestamp.type"]; ok {
 		return v

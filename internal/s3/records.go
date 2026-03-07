@@ -25,7 +25,6 @@ const (
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Record represents a single parsed record from a RecordBatch.
 type Record struct {
 	Length         int
 	Attributes     int8
@@ -36,23 +35,20 @@ type Record struct {
 	Headers        []RecordHeader
 }
 
-// AbsoluteOffset computes the absolute offset of this record given the batch's BaseOffset.
 func (r *Record) AbsoluteOffset(baseOffset int64) int64 {
 	return baseOffset + int64(r.OffsetDelta)
 }
 
-// AbsoluteTimestamp computes the absolute timestamp given the batch's BaseTimestamp.
 func (r *Record) AbsoluteTimestamp(baseTimestamp int64) int64 {
 	return baseTimestamp + r.TimestampDelta
 }
 
-// RecordHeader is a key-value header on a record.
 type RecordHeader struct {
 	Key   string
 	Value []byte
 }
 
-// BatchHeader holds the parsed 61-byte RecordBatch header fields needed for compaction.
+// BatchHeader holds the parsed 61-byte RecordBatch header fields.
 type BatchHeader struct {
 	BaseOffset      int64
 	BatchLength     int32
@@ -68,27 +64,23 @@ type BatchHeader struct {
 	NumRecords      int32
 }
 
-// CompressionCodec returns the compression codec from Attributes bits 0-2.
 func (h *BatchHeader) CompressionCodec() int {
 	return int(h.Attributes & 0x07)
 }
 
-// IsTransactional returns true if the batch is transactional (bit 4).
 func (h *BatchHeader) IsTransactional() bool {
 	return h.Attributes&0x10 != 0
 }
 
-// IsControlBatch returns true if the batch is a control batch (bit 5).
 func (h *BatchHeader) IsControlBatch() bool {
 	return h.Attributes&0x20 != 0
 }
 
-// TimestampType returns 0 for CreateTime, 1 for LogAppendTime (bit 3).
+// TimestampType returns 0 for CreateTime, 1 for LogAppendTime.
 func (h *BatchHeader) TimestampType() int {
 	return int((h.Attributes >> 3) & 0x01)
 }
 
-// ParseBatchHeaderFromRaw parses the 61-byte RecordBatch header.
 func ParseBatchHeaderFromRaw(raw []byte) (BatchHeader, error) {
 	if len(raw) < 61 {
 		return BatchHeader{}, errors.New("batch too short: need at least 61 bytes")
@@ -109,8 +101,6 @@ func ParseBatchHeaderFromRaw(raw []byte) (BatchHeader, error) {
 	}, nil
 }
 
-// DecompressRecords decompresses the records portion of a RecordBatch.
-// raw is the full batch bytes. Returns the decompressed record bytes.
 func DecompressRecords(raw []byte, codec int) ([]byte, error) {
 	recordsData := raw[61:]
 	if len(recordsData) == 0 {
@@ -133,7 +123,6 @@ func DecompressRecords(raw []byte, codec int) ([]byte, error) {
 	}
 }
 
-// CompressRecords compresses record bytes using the given codec.
 func CompressRecords(data []byte, codec int) ([]byte, error) {
 	switch codec {
 	case CompressionNone:
@@ -151,8 +140,6 @@ func CompressRecords(data []byte, codec int) ([]byte, error) {
 	}
 }
 
-// IterateRecords parses individual records from decompressed record bytes.
-// Calls fn for each record. Returns early if fn returns false.
 func IterateRecords(decompressed []byte, fn func(Record) bool) error {
 	off := 0
 	for off < len(decompressed) {
@@ -176,43 +163,29 @@ func BuildRecordBatch(header BatchHeader, records []Record, codec int) ([]byte, 
 		return nil, nil
 	}
 
-	// Serialize records
 	var recBuf bytes.Buffer
 	for _, r := range records {
 		appendRecord(&recBuf, r)
 	}
 
-	// Compress
 	compressed, err := CompressRecords(recBuf.Bytes(), codec)
 	if err != nil {
 		return nil, fmt.Errorf("compress records: %w", err)
 	}
 
-	// Build batch: 61-byte header + compressed records
-	batchLen := 49 + len(compressed) // BatchLength = everything after BaseOffset(8) + BatchLength(4)
-	totalSize := 12 + batchLen       // BaseOffset(8) + BatchLength(4) + rest
+	batchLen := 49 + len(compressed) // everything after BaseOffset(8) + BatchLength(4)
+	totalSize := 12 + batchLen
 	buf := make([]byte, totalSize)
 
-	// BaseOffset
 	binary.BigEndian.PutUint64(buf[0:8], uint64(header.BaseOffset))
-	// BatchLength (everything after the first 12 bytes)
 	binary.BigEndian.PutUint32(buf[8:12], uint32(batchLen))
-	// PartitionLeaderEpoch
-	binary.BigEndian.PutUint32(buf[12:16], 0)
-	// Magic
-	buf[16] = 2
-	// CRC placeholder (will be computed below)
-	// Attributes
+	binary.BigEndian.PutUint32(buf[12:16], 0) // PartitionLeaderEpoch
+	buf[16] = 2                               // Magic
+	// CRC at buf[17:21] computed below
 	binary.BigEndian.PutUint16(buf[21:23], uint16(header.Attributes))
-
-	// Update LastOffsetDelta from the records
-	lastOffsetDelta := records[len(records)-1].OffsetDelta
-	binary.BigEndian.PutUint32(buf[23:27], uint32(lastOffsetDelta))
-
-	// BaseTimestamp
+	binary.BigEndian.PutUint32(buf[23:27], uint32(records[len(records)-1].OffsetDelta))
 	binary.BigEndian.PutUint64(buf[27:35], uint64(header.BaseTimestamp))
 
-	// MaxTimestamp: compute from records
 	maxTS := header.BaseTimestamp
 	for _, r := range records {
 		ts := header.BaseTimestamp + r.TimestampDelta
@@ -221,20 +194,13 @@ func BuildRecordBatch(header BatchHeader, records []Record, codec int) ([]byte, 
 		}
 	}
 	binary.BigEndian.PutUint64(buf[35:43], uint64(maxTS))
-
-	// ProducerID
 	binary.BigEndian.PutUint64(buf[43:51], uint64(header.ProducerID))
-	// ProducerEpoch
 	binary.BigEndian.PutUint16(buf[51:53], uint16(header.ProducerEpoch))
-	// BaseSequence
 	binary.BigEndian.PutUint32(buf[53:57], uint32(header.BaseSequence))
-	// NumRecords
 	binary.BigEndian.PutUint32(buf[57:61], uint32(len(records)))
 
-	// Copy compressed records
 	copy(buf[61:], compressed)
 
-	// Compute CRC over bytes 21+
 	crc := crc32.Checksum(buf[21:], crc32cTable)
 	binary.BigEndian.PutUint32(buf[17:21], crc)
 
@@ -262,7 +228,6 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 		return Record{}, 0, errors.New("no data for record")
 	}
 
-	// Record length
 	length, n := decodeVarint(data[off:])
 	if n <= 0 {
 		return Record{}, 0, errors.New("invalid record length varint")
@@ -277,14 +242,12 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 	var rec Record
 	rec.Length = int(length)
 
-	// Attributes (1 byte)
 	if off >= recEnd {
 		return Record{}, 0, errors.New("truncated record: no attributes")
 	}
 	rec.Attributes = int8(data[off])
 	off++
 
-	// TimestampDelta
 	tsDelta, n := decodeVarint(data[off:])
 	if n <= 0 {
 		return Record{}, 0, errors.New("invalid timestamp delta varint")
@@ -292,7 +255,6 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 	rec.TimestampDelta = tsDelta
 	off += n
 
-	// OffsetDelta
 	offDelta, n := decodeVarint(data[off:])
 	if n <= 0 {
 		return Record{}, 0, errors.New("invalid offset delta varint")
@@ -300,7 +262,6 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 	rec.OffsetDelta = int32(offDelta)
 	off += n
 
-	// Key
 	keyLen, n := decodeVarint(data[off:])
 	if n <= 0 {
 		return Record{}, 0, errors.New("invalid key length varint")
@@ -314,9 +275,6 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 		copy(rec.Key, data[off:off+int(keyLen)])
 		off += int(keyLen)
 	}
-	// else: keyLen < 0 => null key, rec.Key stays nil
-
-	// Value
 	valLen, n := decodeVarint(data[off:])
 	if n <= 0 {
 		return Record{}, 0, errors.New("invalid value length varint")
@@ -330,9 +288,6 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 		copy(rec.Value, data[off:off+int(valLen)])
 		off += int(valLen)
 	}
-	// else: valLen < 0 => null value (tombstone)
-
-	// Headers
 	headerCount, n := decodeVarint(data[off:])
 	if n <= 0 {
 		return Record{}, 0, errors.New("invalid header count varint")
@@ -378,21 +333,13 @@ func parseRecord(data []byte, off int) (Record, int, error) {
 	return rec, recEnd - startOff, nil
 }
 
-// appendRecord serializes a record into a buffer.
 func appendRecord(buf *bytes.Buffer, rec Record) {
-	// Serialize to a temp buffer to compute length
 	var tmp bytes.Buffer
 
-	// Attributes
 	tmp.WriteByte(byte(rec.Attributes))
-
-	// TimestampDelta
 	appendVarint(&tmp, rec.TimestampDelta)
-
-	// OffsetDelta
 	appendVarint(&tmp, int64(rec.OffsetDelta))
 
-	// Key
 	if rec.Key == nil {
 		appendVarint(&tmp, -1)
 	} else {
@@ -400,7 +347,6 @@ func appendRecord(buf *bytes.Buffer, rec Record) {
 		tmp.Write(rec.Key)
 	}
 
-	// Value
 	if rec.Value == nil {
 		appendVarint(&tmp, -1)
 	} else {
@@ -408,7 +354,6 @@ func appendRecord(buf *bytes.Buffer, rec Record) {
 		tmp.Write(rec.Value)
 	}
 
-	// Headers
 	appendVarint(&tmp, int64(len(rec.Headers)))
 	for _, h := range rec.Headers {
 		appendVarint(&tmp, int64(len(h.Key)))
@@ -421,13 +366,10 @@ func appendRecord(buf *bytes.Buffer, rec Record) {
 		}
 	}
 
-	// Write length prefix + body
 	appendVarint(buf, int64(tmp.Len()))
 	buf.Write(tmp.Bytes())
 }
 
-// decodeVarint reads a zigzag-encoded varint from data.
-// Returns (value, bytesRead). bytesRead <= 0 means error.
 func decodeVarint(data []byte) (int64, int) {
 	var x uint64
 	var s uint
@@ -446,18 +388,14 @@ func decodeVarint(data []byte) (int64, int) {
 	return 0, -1 // short buffer
 }
 
-// appendVarint writes a zigzag-encoded varint to buf.
 func appendVarint(buf *bytes.Buffer, v int64) {
-	// Zigzag encode
-	ux := uint64(v<<1) ^ uint64(v>>63)
+	ux := uint64(v<<1) ^ uint64(v>>63) // zigzag encode
 	for ux >= 0x80 {
 		buf.WriteByte(byte(ux) | 0x80)
 		ux >>= 7
 	}
 	buf.WriteByte(byte(ux))
 }
-
-// Compression helpers
 
 func decompressGzip(data []byte) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(data))
@@ -530,8 +468,6 @@ func compressZSTD(data []byte) ([]byte, error) {
 	return zstdEncoder.EncodeAll(data, nil), nil
 }
 
-// BuildTestBatch creates a RecordBatch for testing purposes.
-// It builds a properly formatted batch with the given records, codec, and base offset.
 func BuildTestBatch(baseOffset, baseTimestamp int64, records []Record, codec int) ([]byte, error) {
 	header := BatchHeader{
 		BaseOffset:    baseOffset,
@@ -543,7 +479,6 @@ func BuildTestBatch(baseOffset, baseTimestamp int64, records []Record, codec int
 		BaseSequence:  -1,
 	}
 
-	// Set MaxTimestamp from records
 	for _, r := range records {
 		ts := baseTimestamp + r.TimestampDelta
 		if ts > header.MaxTimestamp {
@@ -551,7 +486,6 @@ func BuildTestBatch(baseOffset, baseTimestamp int64, records []Record, codec int
 		}
 	}
 
-	// Set LastOffsetDelta from last record
 	if len(records) > 0 {
 		header.LastOffsetDelta = records[len(records)-1].OffsetDelta
 	}

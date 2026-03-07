@@ -15,14 +15,6 @@ type FindCoordinatorConfig struct {
 	AdvertisedAddr string // host:port
 }
 
-// HandleFindCoordinator returns the FindCoordinator handler (API key 10).
-// For a single-broker deployment, always returns ourselves as the coordinator
-// for any group or transaction.
-//
-// Supports v0-v6:
-//   - v0-v3: single key lookup (CoordinatorKey field)
-//   - v4+: batch lookup (CoordinatorKeys field)
-//   - KeyType: 0 = group, 1 = transaction
 func HandleFindCoordinator(cfg FindCoordinatorConfig) server.Handler {
 	advHost, advPortStr, err := net.SplitHostPort(cfg.AdvertisedAddr)
 	if err != nil {
@@ -35,13 +27,11 @@ func HandleFindCoordinator(cfg FindCoordinatorConfig) server.Handler {
 		r := req.(*kmsg.FindCoordinatorRequest)
 		resp := r.ResponseKind().(*kmsg.FindCoordinatorResponse)
 
-		// Version validation
 		minV, maxV, ok := VersionRange(10)
 		if !ok || r.Version < minV || r.Version > maxV {
 			return resp, nil
 		}
 
-		// Validate coordinator type: 0 = group, 1 = transaction
 		var unknownType bool
 		if r.CoordinatorType != 0 && r.CoordinatorType != 1 {
 			unknownType = true

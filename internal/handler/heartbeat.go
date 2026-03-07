@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleHeartbeat returns the Heartbeat handler (API key 12).
 func HandleHeartbeat(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.HeartbeatRequest)

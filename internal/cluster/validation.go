@@ -4,8 +4,6 @@ import (
 	"unicode/utf8"
 )
 
-// ValidateTopicName checks if a topic name is valid per Kafka conventions.
-// Returns an error string if invalid, or empty string if valid.
 func ValidateTopicName(name string) string {
 	if name == "" {
 		return "topic name must not be empty"
@@ -27,8 +25,6 @@ func ValidateTopicName(name string) string {
 	return ""
 }
 
-// isValidTopicChar returns true if c is valid in a Kafka topic name.
-// Valid chars: [a-zA-Z0-9._-]
 func isValidTopicChar(c rune) bool {
 	return (c >= 'a' && c <= 'z') ||
 		(c >= 'A' && c <= 'Z') ||

@@ -7,8 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDescribeProducers returns the DescribeProducers handler (API key 61).
-// Supports v0.
 func HandleDescribeProducers(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DescribeProducersRequest)
@@ -30,7 +28,6 @@ func HandleDescribeProducers(state *cluster.State) server.Handler {
 					continue
 				}
 
-				// Get producers that have written to this partition
 				snapshots := state.PIDManager().GetProducersForPartition(rt.Topic, p)
 				for _, snap := range snapshots {
 					active := kmsg.NewDescribeProducersResponseTopicPartitionActiveProducer()

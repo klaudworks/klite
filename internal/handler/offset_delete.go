@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleOffsetDelete returns the OffsetDelete handler (API key 47).
 func HandleOffsetDelete(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.OffsetDeleteRequest)

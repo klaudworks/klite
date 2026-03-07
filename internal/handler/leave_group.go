@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleLeaveGroup returns the LeaveGroup handler (API key 13).
 func HandleLeaveGroup(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.LeaveGroupRequest)

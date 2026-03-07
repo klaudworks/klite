@@ -7,7 +7,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleDescribeGroups returns the DescribeGroups handler (API key 15).
 func HandleDescribeGroups(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DescribeGroupsRequest)
@@ -24,7 +23,6 @@ func HandleDescribeGroups(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// Access group state safely via Control()
 			g.Control(func() {
 				info := g.Describe()
 				sg.State = info.State
@@ -47,7 +45,6 @@ func HandleDescribeGroups(state *cluster.State) server.Handler {
 	}
 }
 
-// HandleListGroups returns the ListGroups handler (API key 16).
 func HandleListGroups(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ListGroupsRequest)
@@ -58,7 +55,6 @@ func HandleListGroups(state *cluster.State) server.Handler {
 			g.Control(func() {
 				info := g.Describe()
 
-				// Apply state filter if specified
 				if len(r.StatesFilter) > 0 {
 					found := false
 					for _, sf := range r.StatesFilter {
@@ -84,7 +80,6 @@ func HandleListGroups(state *cluster.State) server.Handler {
 	}
 }
 
-// HandleDeleteGroups returns the DeleteGroups handler (API key 42).
 func HandleDeleteGroups(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DeleteGroupsRequest)
@@ -101,7 +96,6 @@ func HandleDeleteGroups(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// Check group state via Control()
 			var canDelete bool
 			g.Control(func() {
 				info := g.Describe()

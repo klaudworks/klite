@@ -13,7 +13,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// DeletedTopic records a topic that was deleted and needs S3 GC.
 type DeletedTopic struct {
 	Name    string
 	TopicID [16]byte
@@ -47,14 +46,12 @@ type State struct {
 	pidManager *ProducerIDManager
 }
 
-// Config holds cluster-level configuration relevant to state management.
 type Config struct {
 	NodeID            int32
 	DefaultPartitions int
 	AutoCreateTopics  bool
 }
 
-// NewState creates a new empty cluster state.
 func NewState(cfg Config) *State {
 	return &State{
 		topics:     make(map[string]*TopicData),
@@ -66,23 +63,18 @@ func NewState(cfg Config) *State {
 	}
 }
 
-// PIDManager returns the producer ID manager.
 func (s *State) PIDManager() *ProducerIDManager {
 	return s.pidManager
 }
 
-// SetShutdownCh sets the shutdown channel used by group goroutines.
 func (s *State) SetShutdownCh(ch <-chan struct{}) {
 	s.shutdownCh = ch
 }
 
-// SetLogger sets the logger used by group goroutines.
 func (s *State) SetLogger(l *slog.Logger) {
 	s.logger = l
 }
 
-// SetWALConfig configures the cluster state for WAL mode with chunk pool.
-// All existing partitions get initialized with the chunk pool.
 func (s *State) SetWALConfig(w *wal.Writer, idx *wal.Index, pool *chunk.Pool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,16 +107,12 @@ func (s *State) checkCollision(name string) string {
 	return ""
 }
 
-// GetTopic returns the topic data for the given name, or nil if not found.
-// Caller must not modify the returned TopicData without holding appropriate locks.
 func (s *State) GetTopic(name string) *TopicData {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.topics[name]
 }
 
-// GetAllTopics returns a snapshot of all current topics.
-// The returned slice is safe to iterate without holding locks.
 func (s *State) GetAllTopics() []*TopicData {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -135,7 +123,6 @@ func (s *State) GetAllTopics() []*TopicData {
 	return result
 }
 
-// GetTopicByID returns the topic data matching the given UUID, or nil if not found.
 func (s *State) GetTopicByID(id [16]byte) *TopicData {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -147,9 +134,6 @@ func (s *State) GetTopicByID(id [16]byte) *TopicData {
 	return nil
 }
 
-// CreateTopic creates a new topic with the given name and partition count.
-// Returns the created topic, or the existing topic if it already exists.
-// The second return value is true if the topic was newly created.
 func (s *State) CreateTopic(name string, numPartitions int) (*TopicData, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,9 +152,6 @@ func (s *State) CreateTopic(name string, numPartitions int) (*TopicData, bool) {
 	return td, true
 }
 
-// CreateTopicWithConfigs creates a new topic with the given name, partition count,
-// and configuration. Returns the created topic data and true if newly created.
-// Returns (existing, false) if the topic already exists.
 func (s *State) CreateTopicWithConfigs(name string, numPartitions int, configs map[string]string) (*TopicData, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,7 +172,6 @@ func (s *State) CreateTopicWithConfigs(name string, numPartitions int, configs m
 	return td, true
 }
 
-// TopicExists returns whether a topic with the given name exists.
 func (s *State) TopicExists(name string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -208,7 +188,6 @@ func (s *State) CheckTopicCollision(name string) string {
 	return s.checkCollision(name)
 }
 
-// DefaultPartitions returns the configured default partition count.
 func (s *State) DefaultPartitions() int {
 	return s.cfg.DefaultPartitions
 }
@@ -234,12 +213,10 @@ func (s *State) GetOrCreateTopic(name string) (*TopicData, bool, error) {
 	return td, created, nil
 }
 
-// AutoCreateEnabled returns whether auto-create topics is enabled.
 func (s *State) AutoCreateEnabled() bool {
 	return s.cfg.AutoCreateTopics
 }
 
-// DeleteTopic removes a topic by name. Returns true if the topic existed.
 func (s *State) DeleteTopic(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,7 +232,6 @@ func (s *State) DeleteTopic(name string) bool {
 	return ok
 }
 
-// DrainDeletedTopics returns and clears the list of topics pending S3 GC.
 func (s *State) DrainDeletedTopics() []DeletedTopic {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,14 +240,12 @@ func (s *State) DrainDeletedTopics() []DeletedTopic {
 	return result
 }
 
-// AddDeletedTopic adds a deleted topic to the GC list (used during metadata replay).
 func (s *State) AddDeletedTopic(dt DeletedTopic) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deletedTopics = append(s.deletedTopics, dt)
 }
 
-// TopicData holds metadata and partitions for a single topic.
 type TopicData struct {
 	Name       string
 	ID         [16]byte // UUID
@@ -279,7 +253,6 @@ type TopicData struct {
 	Configs    map[string]string
 }
 
-// newTopicData creates a new TopicData with the given partition count.
 func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 	id := uuid.New()
 	var topicID [16]byte
@@ -302,10 +275,6 @@ func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
 	}
 }
 
-// PartData and StoredBatch are defined in partition.go.
-
-// GetOrCreateGroup returns an existing group, or creates a new one.
-// The group's manage goroutine is started on creation.
 func (s *State) GetOrCreateGroup(groupID string) *Group {
 	s.mu.RLock()
 	g, ok := s.groups[groupID]
@@ -316,7 +285,6 @@ func (s *State) GetOrCreateGroup(groupID string) *Group {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Double-check after acquiring write lock
 	if g, ok := s.groups[groupID]; ok {
 		return g
 	}
@@ -328,14 +296,12 @@ func (s *State) GetOrCreateGroup(groupID string) *Group {
 	return g
 }
 
-// GetGroup returns the group with the given ID, or nil if not found.
 func (s *State) GetGroup(groupID string) *Group {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.groups[groupID]
 }
 
-// GetAllGroups returns a snapshot of all current groups.
 func (s *State) GetAllGroups() []*Group {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -346,7 +312,6 @@ func (s *State) GetAllGroups() []*Group {
 	return result
 }
 
-// DeleteGroup removes a group by ID and stops its goroutine.
 func (s *State) DeleteGroup(groupID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -358,8 +323,6 @@ func (s *State) DeleteGroup(groupID string) bool {
 	return ok
 }
 
-// AddPartitions increases the partition count for a topic to newCount.
-// If newCount <= current count, this is a no-op.
 func (s *State) AddPartitions(topicName string, newCount int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -382,7 +345,6 @@ func (s *State) AddPartitions(topicName string, newCount int) {
 	}
 }
 
-// SetTopicConfig sets a single config key on a topic.
 func (s *State) SetTopicConfig(topicName, key, value string) {
 	s.mu.RLock()
 	td, ok := s.topics[topicName]
@@ -393,7 +355,6 @@ func (s *State) SetTopicConfig(topicName, key, value string) {
 	td.Configs[key] = value
 }
 
-// DeleteTopicConfig removes a single config override from a topic.
 func (s *State) DeleteTopicConfig(topicName, key string) {
 	s.mu.RLock()
 	td, ok := s.topics[topicName]
@@ -404,8 +365,6 @@ func (s *State) DeleteTopicConfig(topicName, key string) {
 	delete(td.Configs, key)
 }
 
-// ReplaceTopicConfigs replaces all topic configs with the provided set.
-// Configs not in the provided set revert to defaults (removed from overrides).
 func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfigsRequestResourceConfig) {
 	s.mu.RLock()
 	td, ok := s.topics[topicName]
@@ -413,11 +372,9 @@ func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfig
 	if !ok {
 		return
 	}
-	// Clear existing overrides
 	for k := range td.Configs {
 		delete(td.Configs, k)
 	}
-	// Apply new ones
 	for _, c := range configs {
 		if c.Value != nil {
 			td.Configs[c.Name] = *c.Value
@@ -425,12 +382,10 @@ func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfig
 	}
 }
 
-// SetMetadataLog sets the metadata log reference.
 func (s *State) SetMetadataLog(ml *metadata.Log) {
 	s.metaLog = ml
 }
 
-// MetadataLog returns the metadata log, or nil if not set.
 func (s *State) MetadataLog() *metadata.Log {
 	return s.metaLog
 }
@@ -444,7 +399,6 @@ func (s *State) SnapshotEntries() [][]byte {
 
 	var entries [][]byte
 
-	// 1. CREATE_TOPIC entries for all topics
 	for _, td := range s.topics {
 		e := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
 			TopicName:      td.Name,
@@ -455,7 +409,6 @@ func (s *State) SnapshotEntries() [][]byte {
 		entries = append(entries, e)
 	}
 
-	// 2. OFFSET_COMMIT entries for all groups
 	for _, g := range s.groups {
 		offsets := g.GetCommittedOffsets()
 		for tp, co := range offsets {
@@ -470,7 +423,6 @@ func (s *State) SnapshotEntries() [][]byte {
 		}
 	}
 
-	// 3. PRODUCER_ID entry
 	nextPID := s.pidManager.NextPID()
 	if nextPID > 1 {
 		e := metadata.MarshalProducerID(&metadata.ProducerIDEntry{
@@ -479,7 +431,6 @@ func (s *State) SnapshotEntries() [][]byte {
 		entries = append(entries, e)
 	}
 
-	// 4. LOG_START_OFFSET entries for partitions with logStart > 0
 	for _, td := range s.topics {
 		for _, pd := range td.Partitions {
 			pd.mu.RLock()
@@ -496,7 +447,6 @@ func (s *State) SnapshotEntries() [][]byte {
 		}
 	}
 
-	// 5. COMPACTION_WATERMARK entries for partitions with cleanedUpTo > 0
 	for _, td := range s.topics {
 		for _, pd := range td.Partitions {
 			pd.mu.RLock()
@@ -517,12 +467,11 @@ func (s *State) SnapshotEntries() [][]byte {
 }
 
 // CreateTopicFromReplay creates a topic during metadata.log replay.
-// Unlike CreateTopic, this accepts a specific topic ID.
+// Unlike CreateTopic, it accepts a specific topic ID rather than generating one.
 func (s *State) CreateTopicFromReplay(name string, numPartitions int, topicID [16]byte, configs map[string]string) *TopicData {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If topic already exists, skip (handles duplicate entries in log)
 	if td, ok := s.topics[name]; ok {
 		return td
 	}
@@ -552,8 +501,6 @@ func (s *State) CreateTopicFromReplay(name string, numPartitions int, topicID [1
 	return td
 }
 
-// SetCommittedOffsetFromReplay sets a committed offset during replay.
-// This bypasses the group goroutine since it's used during startup.
 func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition int32, offset int64, metadataStr string) {
 	s.mu.Lock()
 	g, ok := s.groups[groupID]
@@ -575,7 +522,6 @@ func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition in
 	})
 }
 
-// SetCompactionWatermarkFromReplay sets the cleanedUpTo for a partition during replay.
 func (s *State) SetCompactionWatermarkFromReplay(topicName string, partition int32, cleanedUpTo int64) {
 	s.mu.RLock()
 	td, ok := s.topics[topicName]
@@ -590,7 +536,6 @@ func (s *State) SetCompactionWatermarkFromReplay(topicName string, partition int
 	pd.mu.Unlock()
 }
 
-// SetLogStartOffsetFromReplay sets the logStartOffset for a partition during replay.
 func (s *State) SetLogStartOffsetFromReplay(topicName string, partition int32, logStart int64) {
 	s.mu.RLock()
 	td, ok := s.topics[topicName]
@@ -616,7 +561,6 @@ func (s *State) SetLogStartOffsetFromReplay(topicName string, partition int32, l
 	pd.mu.Unlock()
 }
 
-// StopAllGroups stops all group goroutines. Called during broker shutdown.
 func (s *State) StopAllGroups() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -625,7 +569,6 @@ func (s *State) StopAllGroups() {
 	}
 }
 
-// initPartitionsWAL initializes chunk pool and WAL references on all partitions of a topic.
 // Caller must hold s.mu.Lock().
 func (s *State) initPartitionsWAL(td *TopicData) {
 	for _, pd := range td.Partitions {
@@ -636,7 +579,6 @@ func (s *State) initPartitionsWAL(td *TopicData) {
 	}
 }
 
-// SetS3Fetcher sets the S3 fetcher on all existing partitions.
 func (s *State) SetS3Fetcher(fetcher S3Fetcher) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -648,8 +590,6 @@ func (s *State) SetS3Fetcher(fetcher S3Fetcher) {
 	s.s3Fetcher = fetcher
 }
 
-// FlushablePartitions returns all partitions with unflushed WAL data.
-// Implements s3.PartitionFlusher.
 func (s *State) FlushablePartitions() []FlushablePartition {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -682,7 +622,6 @@ func (s *State) FlushablePartitions() []FlushablePartition {
 	return result
 }
 
-// FlushablePartition holds data needed for S3 flush of a single partition.
 type FlushablePartition struct {
 	Topic       string
 	Partition   int32

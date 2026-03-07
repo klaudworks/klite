@@ -7,13 +7,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleOffsetFetch returns the OffsetFetch handler (API key 9).
 func HandleOffsetFetch(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.OffsetFetchRequest)
 		resp := r.ResponseKind().(*kmsg.OffsetFetchResponse)
 
-		// v8+: batch (multiple groups) — process each group independently.
 		if r.Version >= 8 {
 			for _, rg := range r.Groups {
 				gResp := kmsg.NewOffsetFetchResponseGroup()
@@ -32,7 +30,6 @@ func HandleOffsetFetch(state *cluster.State) server.Handler {
 					continue
 				}
 
-				// Build a single-group v8 request for this group's goroutine.
 				perGroup := &kmsg.OffsetFetchRequest{Version: r.Version}
 				perGroup.Groups = []kmsg.OffsetFetchRequestGroup{rg}
 
@@ -49,7 +46,6 @@ func HandleOffsetFetch(state *cluster.State) server.Handler {
 			return resp, nil
 		}
 
-		// v0-v7: single group.
 		if r.Group == "" {
 			resp.ErrorCode = kerr.InvalidGroupID.Code
 			return resp, nil
@@ -70,7 +66,6 @@ func HandleOffsetFetch(state *cluster.State) server.Handler {
 	}
 }
 
-// fillOffsetFetchNotFound fills the v0-v7 response with offset=-1 for unknown groups.
 func fillOffsetFetchNotFound(req *kmsg.OffsetFetchRequest, resp *kmsg.OffsetFetchResponse) {
 	for _, rt := range req.Topics {
 		tResp := kmsg.NewOffsetFetchResponseTopic()
@@ -86,7 +81,6 @@ func fillOffsetFetchNotFound(req *kmsg.OffsetFetchRequest, resp *kmsg.OffsetFetc
 	}
 }
 
-// fillOffsetFetchGroupNotFound fills a v8+ group response with offset=-1 for unknown groups.
 func fillOffsetFetchGroupNotFound(rg kmsg.OffsetFetchRequestGroup, gResp *kmsg.OffsetFetchResponseGroup) {
 	for _, rt := range rg.Topics {
 		tResp := kmsg.NewOffsetFetchResponseGroupTopic()

@@ -29,7 +29,6 @@ type DescribeConfigsConfig struct {
 	State  *cluster.State
 }
 
-// HandleDescribeConfigs returns the DescribeConfigs handler (API key 32).
 func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.DescribeConfigsRequest)
@@ -43,7 +42,6 @@ func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 
 			switch rr.ResourceType {
 			case kmsg.ConfigResourceTypeBroker:
-				// Broker configs
 				addBrokerConfig := func(name, value string, src kmsg.ConfigSource) {
 					rc := kmsg.NewDescribeConfigsResponseResourceConfig()
 					rc.Name = name
@@ -54,7 +52,6 @@ func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 					rc.ReadOnly = src == kmsg.ConfigSourceStaticBrokerConfig
 					st.Configs = append(st.Configs, rc)
 				}
-				// Return node ID
 				nodeStr := fmt.Sprintf("%d", cfg.NodeID)
 				addBrokerConfig("broker.id", nodeStr, kmsg.ConfigSourceStaticBrokerConfig)
 
@@ -66,7 +63,6 @@ func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 					continue
 				}
 
-				// Return topic configs: defaults + overrides
 				for name, defaultVal := range topicConfigDefaults {
 					rc := kmsg.NewDescribeConfigsResponseResourceConfig()
 					rc.Name = name
@@ -88,7 +84,6 @@ func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 				st.ErrorCode = kerr.InvalidRequest.Code
 			}
 
-			// Filter by requested config names if specified
 			if len(rr.ConfigNames) > 0 {
 				names := make(map[string]struct{})
 				for _, n := range rr.ConfigNames {

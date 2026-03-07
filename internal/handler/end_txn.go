@@ -6,8 +6,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleEndTxn returns the EndTxn handler (API key 26).
-// Supports v0-v4.
 func HandleEndTxn(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.EndTxnRequest)
@@ -29,7 +27,6 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 			return resp, nil
 		}
 
-		// Write control batches to each partition in the transaction
 		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, endState.Commit)
 
 		for tp := range endState.TxnPartitions {
@@ -44,16 +41,13 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 				continue
 			}
 
-			// Make a copy for each partition
 			raw := make([]byte, len(controlBatch))
 			copy(raw, controlBatch)
 
 			spare := pd.AcquireSpareChunk(len(raw))
 			pd.Lock()
 			baseOffset, spare := pd.PushBatch(raw, meta, spare)
-			// Remove open txn tracking
 			pd.RemoveOpenTxn(endState.ProducerID)
-			// If aborting, record the aborted transaction index entry
 			if !endState.Commit {
 				if firstOffset, ok := endState.TxnFirstOffsets[tp]; ok {
 					pd.AddAbortedTxn(cluster.AbortedTxnEntry{
@@ -65,10 +59,9 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 			}
 			pd.Unlock()
 			pd.ReleaseSpareChunk(spare)
-			pd.NotifyWaiters(nil)
+			pd.NotifyWaiters()
 		}
 
-		// Apply offset commits if committing
 		if endState.Commit {
 			for groupID, offsets := range endState.TxnOffsets {
 				g := state.GetOrCreateGroup(groupID)

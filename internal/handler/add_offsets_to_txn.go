@@ -6,8 +6,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// HandleAddOffsetsToTxn returns the AddOffsetsToTxn handler (API key 25).
-// Supports v0-v3.
 func HandleAddOffsetsToTxn(state *cluster.State) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.AddOffsetsToTxnRequest)
