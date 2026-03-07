@@ -17,7 +17,7 @@ func TestConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal("failed to connect to broker:", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 }
 
 // TestMalformedRequest verifies the broker closes the connection when it
@@ -30,19 +30,19 @@ func TestMalformedRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal("failed to connect:", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send a frame with size=100 but only 5 bytes of body,
 	// then close the write side so the broker sees EOF on the body read.
 	var sizeBuf [4]byte
 	binary.BigEndian.PutUint32(sizeBuf[:], 100)
-	conn.Write(sizeBuf[:])
-	conn.Write([]byte("short"))
+	_, _ = conn.Write(sizeBuf[:])
+	_, _ = conn.Write([]byte("short"))
 	// Close write side to trigger EOF
-	conn.(*net.TCPConn).CloseWrite()
+	_ = conn.(*net.TCPConn).CloseWrite()
 
 	// The broker should close the connection. Verify by reading until EOF.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 1)
 	_, err = conn.Read(buf)
 	if err == nil {
@@ -60,7 +60,7 @@ func TestMetadataInvalidApiKey(t *testing.T) {
 	if err != nil {
 		t.Fatal("failed to connect:", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Build a minimal Kafka request frame with an invalid API key (999).
 	// Header: apiKey(2) + apiVersion(2) + corrID(4) + clientIDLen(2) = 10 bytes
@@ -73,11 +73,11 @@ func TestMetadataInvalidApiKey(t *testing.T) {
 	// Send length-prefixed frame
 	var sizeBuf [4]byte
 	binary.BigEndian.PutUint32(sizeBuf[:], uint32(len(frame)))
-	conn.Write(sizeBuf[:])
-	conn.Write(frame[:])
+	_, _ = conn.Write(sizeBuf[:])
+	_, _ = conn.Write(frame[:])
 
 	// The broker should close the connection. Read to verify.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 1024)
 	_, err = io.ReadAtLeast(conn, buf, 1)
 	if err == nil {

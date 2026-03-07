@@ -12,7 +12,7 @@ import (
 )
 
 // sendJoinGroup is a helper that sends a JoinGroup request using a raw client.
-func sendJoinGroup(t *testing.T, addr string, group string, memberID string, instanceID *string, protocols []kmsg.JoinGroupRequestProtocol) *kmsg.JoinGroupResponse {
+func sendJoinGroup(t *testing.T, addr, group, memberID string, instanceID *string, protocols []kmsg.JoinGroupRequestProtocol) *kmsg.JoinGroupResponse {
 	t.Helper()
 	cl := NewClient(t, addr)
 	req := kmsg.NewJoinGroupRequest()
@@ -31,7 +31,7 @@ func sendJoinGroup(t *testing.T, addr string, group string, memberID string, ins
 }
 
 // sendSyncGroup is a helper that sends a SyncGroup request.
-func sendSyncGroup(t *testing.T, addr string, group string, generation int32, memberID string, instanceID *string, assignments []kmsg.SyncGroupRequestGroupAssignment) *kmsg.SyncGroupResponse {
+func sendSyncGroup(t *testing.T, addr, group string, generation int32, memberID string, instanceID *string, assignments []kmsg.SyncGroupRequestGroupAssignment) *kmsg.SyncGroupResponse {
 	t.Helper()
 	cl := NewClient(t, addr)
 	req := kmsg.NewSyncGroupRequest()
@@ -48,7 +48,7 @@ func sendSyncGroup(t *testing.T, addr string, group string, generation int32, me
 }
 
 // sendHeartbeat is a helper that sends a Heartbeat request.
-func sendHeartbeat(t *testing.T, addr string, group string, generation int32, memberID string, instanceID *string) *kmsg.HeartbeatResponse {
+func sendHeartbeat(t *testing.T, addr, group string, generation int32, memberID string, instanceID *string) *kmsg.HeartbeatResponse {
 	t.Helper()
 	cl := NewClient(t, addr)
 	req := kmsg.NewHeartbeatRequest()
@@ -64,7 +64,7 @@ func sendHeartbeat(t *testing.T, addr string, group string, generation int32, me
 }
 
 // sendLeaveGroup is a helper that sends a LeaveGroup request.
-func sendLeaveGroup(t *testing.T, addr string, group string, memberID string) *kmsg.LeaveGroupResponse {
+func sendLeaveGroup(t *testing.T, addr, group, memberID string) *kmsg.LeaveGroupResponse {
 	t.Helper()
 	cl := NewClient(t, addr)
 	req := kmsg.NewLeaveGroupRequest()

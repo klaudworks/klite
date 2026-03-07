@@ -46,7 +46,7 @@ func countS3Objects(mem *s3store.InMemoryS3, topic string, partition int) int {
 
 // waitForS3ObjectCount polls until the object count for a topic/partition
 // reaches at least minCount.
-func waitForS3ObjectCount(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int, minCount int, timeout time.Duration) {
+func waitForS3ObjectCount(t *testing.T, mem *s3store.InMemoryS3, topic string, partition, minCount int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -62,7 +62,7 @@ func waitForS3ObjectCount(t *testing.T, mem *s3store.InMemoryS3, topic string, p
 
 // waitForCompaction polls S3 until the number of objects for the given
 // topic/partition is less than initialCount (compaction merged them).
-func waitForCompaction(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int, initialCount int, timeout time.Duration) {
+func waitForCompaction(t *testing.T, mem *s3store.InMemoryS3, topic string, partition, initialCount int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -133,8 +133,11 @@ func TestCompactionEndToEnd(t *testing.T) {
 	topic := "compact-e2e"
 
 	records := []struct{ key, value string }{
-		{"A", "A-old"}, {"B", "B-old"}, {"C", "C-val"},
-		{"A", "A-new"}, {"B", "B-new"},
+		{"A", "A-old"},
+		{"B", "B-old"},
+		{"C", "C-val"},
+		{"A", "A-new"},
+		{"B", "B-new"},
 	}
 
 	tb := produceFlushProduce(t, dataDir, mem, prefix, topic, records)
@@ -158,7 +161,7 @@ func TestCompactionEndToEnd(t *testing.T) {
 
 	// Stop and delete WAL so reads come from compacted S3 objects
 	tb2.Stop()
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
 
@@ -246,7 +249,7 @@ func TestCompactDeletePolicy(t *testing.T) {
 
 	// Stop, delete WAL, restart to force reads from compacted S3
 	tb2.Stop()
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
 
@@ -309,7 +312,7 @@ func TestCompactionS3ObjectCount(t *testing.T) {
 
 	// Stop, delete WAL, restart to verify from compacted S3
 	tb2.Stop()
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
 
@@ -368,7 +371,7 @@ func TestCompactionIdempotentIntegration(t *testing.T) {
 
 	// Verify records from compacted S3: delete WAL, restart, consume
 	tb2.Stop()
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
 
@@ -429,7 +432,7 @@ func TestCompactionWatermarkSurvivesRestart(t *testing.T) {
 
 	// Phase 3: restart — watermark should be restored from metadata.log
 	// Delete WAL so we read from compacted S3 data
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
 
@@ -499,7 +502,7 @@ func TestCompactionDirtyCounterRestart(t *testing.T) {
 
 	// Verify data integrity: delete WAL, restart, read from compacted S3
 	tb2.Stop()
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	tb3 := StartBroker(t,
 

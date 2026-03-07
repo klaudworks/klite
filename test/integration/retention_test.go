@@ -90,7 +90,7 @@ func produceRecordWithTimestamp(t *testing.T, cl *kgo.Client, topic string, part
 
 // waitForS3Objects polls until at least minCount .obj files exist for a
 // topic/partition in the given InMemoryS3.
-func waitForS3Objects(t *testing.T, mem *s3store.InMemoryS3, topic string, partition int, minCount int, timeout time.Duration) {
+func waitForS3Objects(t *testing.T, mem *s3store.InMemoryS3, topic string, partition, minCount int, timeout time.Duration) {
 	t.Helper()
 	topicPrefix := fmt.Sprintf("%s-", topic)
 	partSuffix := fmt.Sprintf("/%d/", partition)

@@ -481,7 +481,7 @@ func TestWALCrashRecovery(t *testing.T) {
 	}
 	_, err = f.Write(garbage)
 	require.NoError(t, err)
-	f.Close()
+	_ = f.Close()
 
 	// Verify file is now larger
 	corruptStat, err := os.Stat(segPath)

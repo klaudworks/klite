@@ -80,7 +80,7 @@ func TestApiVersionsUnsupportedVersion(t *testing.T) {
 
 	conn, err := net.DialTimeout("tcp", tb.Addr, 2*time.Second)
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Build an ApiVersions v99 request manually.
 	// Header: apiKey(2) + apiVersion(2) + corrID(4) + clientIDLen(2) = 10 bytes
@@ -106,7 +106,7 @@ func TestApiVersionsUnsupportedVersion(t *testing.T) {
 	require.NoError(t, err)
 
 	// Read response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	// Response frame: [4 size][4 corrID][body]
 	// Note: ApiVersions response has NO tag byte in the header (protocol quirk)

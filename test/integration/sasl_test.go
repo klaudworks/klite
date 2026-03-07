@@ -15,7 +15,7 @@ import (
 )
 
 // createTopicSASL creates a topic using an authenticated client.
-func createTopicSASL(t *testing.T, addr string, topic string, opts ...kgo.Opt) {
+func createTopicSASL(t *testing.T, addr, topic string, opts ...kgo.Opt) {
 	t.Helper()
 	cl := NewClient(t, addr, opts...)
 	admin := kadm.NewClient(cl)

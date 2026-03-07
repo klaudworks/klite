@@ -144,7 +144,7 @@ func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
 		cancel()
 		b.Wait()
 	})
-	go b.Run(ctx)
+	go func() { _ = b.Run(ctx) }()
 
 	// Wait for broker to be ready (initialization complete)
 	select {

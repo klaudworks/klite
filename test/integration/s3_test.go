@@ -177,7 +177,7 @@ func TestS3ReadAfterWALTrim(t *testing.T) {
 	tb.Stop()
 
 	// Delete WAL data to simulate trim
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	// Phase 2: restart with S3 — data should be readable from S3
 	tb2 := StartBroker(t,
@@ -240,7 +240,7 @@ func TestS3ReadCascade(t *testing.T) {
 	tb.Stop()
 
 	// Delete WAL so only S3 has the old data
-	os.RemoveAll(dataDir + "/wal")
+	_ = os.RemoveAll(dataDir + "/wal")
 
 	// Phase 2: restart, produce more (these go to ring buffer/WAL)
 	tb2 := StartBroker(t,
@@ -500,8 +500,8 @@ func TestS3DisasterRecoveryWithBackup(t *testing.T) {
 	tb.Stop()
 
 	// Delete the entire data directory (simulate disk loss)
-	os.RemoveAll(dataDir)
-	os.MkdirAll(dataDir, 0o755)
+	_ = os.RemoveAll(dataDir)
+	_ = os.MkdirAll(dataDir, 0o755)
 
 	// Phase 2: restart with same cluster ID — should recover from S3 backup
 	tb2 := StartBroker(t,
@@ -631,8 +631,8 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 	require.NotEmpty(t, dataKeys, "expected S3 data objects after flush")
 
 	// Delete the entire data directory (simulate disk loss)
-	os.RemoveAll(dataDir)
-	os.MkdirAll(dataDir, 0o755)
+	_ = os.RemoveAll(dataDir)
+	_ = os.MkdirAll(dataDir, 0o755)
 
 	// Also delete the metadata.log backup from S3 (simulate backup loss)
 	metaKey := resolvedPrefix + "/metadata.log"
