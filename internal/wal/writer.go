@@ -14,6 +14,21 @@ import (
 	"github.com/klaudworks/klite/internal/clock"
 )
 
+const diskCleanupThreshold = 0.9
+
+// Replicator sends WAL batches to a standby for synchronous replication.
+type Replicator interface {
+	// Replicate sends a batch of serialized WAL entries to the standby.
+	// firstSeq and lastSeq identify the sequence range for ACK tracking.
+	// Returns a channel that receives nil on standby ACK, or an error
+	// on timeout/disconnect.
+	Replicate(batch []byte, firstSeq, lastSeq uint64) <-chan error
+
+	// Connected returns true if a standby is currently connected and
+	// has completed the HELLO handshake.
+	Connected() bool
+}
+
 type WriterConfig struct {
 	Dir             string        // WAL directory
 	SyncInterval    time.Duration // Fsync batch window (default 2ms)
@@ -22,6 +37,10 @@ type WriterConfig struct {
 	FsyncEnabled    bool          // Whether to fsync (default true)
 	Clock           clock.Clock   // Clock for ticker (default RealClock)
 	Logger          *slog.Logger
+
+	// Replicator, if non-nil, sends each fsync batch to a standby.
+	// The writer waits for the replication ACK before signaling handlers.
+	Replicator Replicator
 }
 
 func DefaultWriterConfig() WriterConfig {
@@ -82,6 +101,9 @@ type Writer struct {
 	// For external callers to check
 	mu      sync.Mutex
 	stopped bool
+
+	// noStandbyWarned tracks whether we've logged the no-standby warning
+	noStandbyWarned bool
 }
 
 func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
@@ -219,12 +241,58 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 	}
 }
 
+// AppendReplicated writes an already-serialized WAL entry (the exact bytes
+// from MarshalEntry, including the 4-byte length prefix) to the current segment.
+// It does NOT assign a sequence number — the sequence is already embedded in
+// the entry by the primary. Entries with sequence <= nextSequence-1 are
+// silently skipped (duplicate from reconnect). The caller must call Sync()
+// separately after the batch.
+func (w *Writer) AppendReplicated(serializedEntry []byte) (skipped bool, err error) {
+	if len(serializedEntry) <= 8+8 {
+		return false, fmt.Errorf("replicated entry too short: %d bytes", len(serializedEntry))
+	}
+
+	seq := parseSequence(serializedEntry)
+	currentNext := w.nextSeq.Load()
+	if currentNext > 0 && seq < currentNext {
+		return true, nil
+	}
+
+	if err := w.appendEntry(serializedEntry); err != nil {
+		return false, err
+	}
+
+	w.nextSeq.Store(seq + 1)
+
+	if w.DiskPressure() >= diskCleanupThreshold {
+		w.TryCleanupSegments()
+	}
+
+	return false, nil
+}
+
+// Sync fsyncs the current segment file.
+func (w *Writer) Sync() error {
+	if w.current != nil && w.current.file != nil {
+		return w.current.file.Sync()
+	}
+	return nil
+}
+
 func (w *Writer) NextSequence() uint64 {
 	return w.nextSeq.Load()
 }
 
 func (w *Writer) SetNextSequence(seq uint64) {
 	w.nextSeq.Store(seq)
+}
+
+// SetReplicator dynamically sets or clears the replicator.
+// Must only be called when no writes are in flight (e.g., during
+// promotion/demotion after draining or before starting the listener).
+func (w *Writer) SetReplicator(r Replicator) {
+	w.cfg.Replicator = r
+	w.noStandbyWarned = false
 }
 
 func (w *Writer) Stop() {
@@ -313,19 +381,47 @@ func (w *Writer) run() {
 			written = i + 1
 		}
 
+		// Phase 2: fsync local + replicate in parallel
+		var replCh <-chan error
+		if written > 0 && w.cfg.Replicator != nil && w.cfg.Replicator.Connected() {
+			batch := w.collectBatchBytes(pending[:written])
+			firstSeq, lastSeq := w.batchSeqRange(pending[:written])
+			replCh = w.cfg.Replicator.Replicate(batch, firstSeq, lastSeq)
+		}
+
 		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
 			if err := w.current.file.Sync(); err != nil {
 				w.logger.Error("WAL fsync error", "err", err)
-				// Fsync failure: none of the written entries are durable.
 				for _, req := range pending[:written] {
 					req.errCh <- err
 				}
 				written = 0
+				// Drain replication channel if started
+				if replCh != nil {
+					<-replCh
+				}
 			}
 		}
 
-		for _, req := range pending[:written] {
-			req.errCh <- nil
+		if written > 0 {
+			// Phase 3: wait for standby ACK (if replicating)
+			var replErr error
+			if replCh != nil {
+				replErr = <-replCh
+			}
+
+			if replErr != nil {
+				for _, req := range pending[:written] {
+					req.errCh <- replErr
+				}
+			} else {
+				if w.cfg.Replicator != nil && !w.cfg.Replicator.Connected() {
+					w.logNoStandbyOnce()
+				}
+				for _, req := range pending[:written] {
+					req.errCh <- nil
+				}
+			}
 		}
 		pending = pending[:0]
 		w.maybePreCreateSegment()
@@ -403,8 +499,52 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 			return
 		}
 	}
+
+	// Best-effort replicate on shutdown (short timeout)
+	if w.cfg.Replicator != nil && written > 0 {
+		batch := w.collectBatchBytes(pending[:written])
+		firstSeq, lastSeq := w.batchSeqRange(pending[:written])
+		replCh := w.cfg.Replicator.Replicate(batch, firstSeq, lastSeq)
+		select {
+		case <-replCh:
+		case <-time.After(2 * time.Second):
+			w.logger.Warn("standby replication timed out during shutdown")
+		}
+	}
+
 	for _, req := range pending[:written] {
 		req.errCh <- nil
+	}
+}
+
+func (w *Writer) collectBatchBytes(pending []writeRequest) []byte {
+	var total int
+	for _, req := range pending {
+		total += len(req.entry)
+	}
+	buf := make([]byte, 0, total)
+	for _, req := range pending {
+		buf = append(buf, req.entry...)
+	}
+	return buf
+}
+
+func (w *Writer) batchSeqRange(pending []writeRequest) (first, last uint64) {
+	first = parseSequence(pending[0].entry)
+	last = parseSequence(pending[len(pending)-1].entry)
+	return first, last
+}
+
+// parseSequence extracts the WAL sequence number from a serialized entry.
+// Entry format: [4B length][4B CRC][8B sequence]...
+func parseSequence(entry []byte) uint64 {
+	return binary.BigEndian.Uint64(entry[8:16])
+}
+
+func (w *Writer) logNoStandbyOnce() {
+	if !w.noStandbyWarned {
+		w.logger.Warn("replicator configured but no standby connected, proceeding with local fsync only")
+		w.noStandbyWarned = true
 	}
 }
 
@@ -525,9 +665,14 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 	}
 	w.segments = kept
 
-	// Enforce MaxDiskSize: if total size still exceeds the limit, force-delete
-	// oldest segments (pruning their index entries).
-	for len(w.segments) > 1 && w.TotalDiskSize() > w.cfg.MaxDiskSize {
+	w.cleanByDiskPressure(diskCleanupThreshold)
+}
+
+// cleanByDiskPressure force-deletes the oldest segments (pruning their index
+// entries) until disk usage drops below limit × MaxDiskSize.
+func (w *Writer) cleanByDiskPressure(limit float64) {
+	maxBytes := int64(float64(w.cfg.MaxDiskSize) * limit)
+	for len(w.segments) > 1 && w.TotalDiskSize() > maxBytes {
 		oldest := w.segments[0]
 		if oldest == w.current {
 			break
@@ -544,8 +689,9 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 			break
 		}
 		w.diskUsage.Add(-deletedSegSize)
-		w.logger.Warn("force-deleted WAL segment (disk limit exceeded)",
-			"seq", oldest.seq, "path", oldest.path)
+		w.logger.Warn("force-deleted WAL segment (disk pressure)",
+			"seq", oldest.seq, "path", oldest.path,
+			"limit", limit)
 		w.segments = w.segments[1:]
 	}
 }
