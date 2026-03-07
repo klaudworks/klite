@@ -138,7 +138,9 @@ func NewScramServerFirst(client0 ScramClient0, auth ScramAuth) (ScramServer0, []
 	if _, err := rand.Read(serverNonceBytes); err != nil {
 		panic("crypto/rand failed: " + err.Error())
 	}
-	nonce := append(client0.Nonce, base64.RawStdEncoding.EncodeToString(serverNonceBytes)...)
+	nonce := make([]byte, 0, len(client0.Nonce)+24)
+	nonce = append(nonce, client0.Nonce...)
+	nonce = append(nonce, base64.RawStdEncoding.EncodeToString(serverNonceBytes)...)
 	serverFirst := []byte(fmt.Sprintf("r=%s,s=%s,i=%d",
 		nonce,
 		base64.StdEncoding.EncodeToString(auth.Salt),
@@ -177,16 +179,16 @@ func (s *ScramServer0) ServerFinal(clientFinal []byte) ([]byte, error) {
 		return nil, fmt.Errorf("client proof length %d != expected %d", len(clientProof), h().Size())
 	}
 
-	// ClientKey = HMAC(SaltedPass, "Client Key")
+	// Derive ClientKey via HMAC of salted password
 	clientKey := computeHMAC(h, s.Auth.SaltedPass, []byte("Client Key"))
 
-	// StoredKey = H(ClientKey)
+	// Derive StoredKey by hashing ClientKey
 	storedKey := computeHash(h, clientKey)
 
-	// AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
+	// Build the auth message from the three SCRAM legs
 	authMessage := buildAuthMessage(s.Client0Bare, s.ServerFirst, finalWithoutProof)
 
-	// ClientSignature = HMAC(StoredKey, AuthMessage)
+	// Derive client signature from stored key and auth message
 	clientSignature := computeHMAC(h, storedKey, authMessage)
 
 	// Verify: XOR(ClientProof, ClientSignature) should give ClientKey,
@@ -201,10 +203,8 @@ func (s *ScramServer0) ServerFinal(clientFinal []byte) ([]byte, error) {
 		return nil, errors.New("invalid password")
 	}
 
-	// ServerKey = HMAC(SaltedPass, "Server Key")
+	// Derive server key and signature for the server-final message
 	serverKey := computeHMAC(h, s.Auth.SaltedPass, []byte("Server Key"))
-
-	// ServerSignature = HMAC(ServerKey, AuthMessage)
 	serverSignature := computeHMAC(h, serverKey, authMessage)
 
 	serverFinal := []byte(fmt.Sprintf("v=%s", base64.StdEncoding.EncodeToString(serverSignature)))
