@@ -5,7 +5,7 @@ description: End-to-end latency benchmarks for klite under sustained 100K events
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Sustained 100K events/sec over one hour, including network round-trips to and from klite (acks=1). We chose 100K because shortly above that, AWS disk I/O becomes the bottleneck, not klite.
+Sustained 100K events/sec over one hour, including network round-trips to and from klite (acks=1). We chose 100K because it stays comfortably below the gp3 volume's 125 MiB/s throughput cap.
 
 <Tabs syncKey="metric">
   <TabItem label="avg">
@@ -32,7 +32,7 @@ Sustained 100K events/sec over one hour, including network round-trips to and fr
 
 ## Setup
 
-Two `m7g.xlarge` (ARM, 4 vCPU, 16 GB) instances on AWS in the same availability zone. One runs klite, the other runs the benchmark client. Separate machines so the numbers include real network hops, not loopback. klite only uses ~6 GB of memory. We need this instance size not for RAM but because AWS throttles disk throughput on smaller instances, and anything below `xlarge` can't sustain 100 MB/s of writes.
+Two `m7g.xlarge` (ARM, 4 vCPU, 16 GB) instances on AWS in the same availability zone. One runs klite, the other runs the benchmark client. Separate machines so the numbers include real network hops, not loopback. klite only uses ~6 GB of memory. We need this instance size not for RAM but because smaller instances have lower baseline EBS bandwidth — m7g.large is capped at 79 MB/s baseline, which would bottleneck before the gp3 volume's 125 MiB/s limit.
 
 The benchmark produces 100,000 events/sec (~1 KB each, ~97 MB/s) and consumes them back, sustained for one hour. 360 million events total. Acks=1 — klite acknowledges each batch after writing to disk.
 
