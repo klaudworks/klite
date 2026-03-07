@@ -32,12 +32,14 @@ export default defineConfig({
 						{ label: 'Design Philosophy', slug: 'concepts/design-philosophy' },
 						{ label: 'Storage', slug: 'concepts/storage' },
 						{ label: 'Durability', slug: 'concepts/durability' },
+					{ label: 'Testing', slug: 'concepts/testing' },
 					],
 				},
 		{
 			label: 'Performance',
 			items: [
-				{ label: 'Benchmarks', slug: 'performance/benchmarks' },
+			{ label: 'Latency Benchmark', slug: 'performance/benchmarks' },
+			{ label: 'Throughput Benchmark', slug: 'performance/stress-test' },
 				{ label: 'Optimizations', slug: 'performance/optimizations' },
 			],
 		},

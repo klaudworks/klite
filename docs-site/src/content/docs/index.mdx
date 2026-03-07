@@ -1,9 +1,9 @@
 ---
 title: klite
-description: Kafka without the ops. One binary, S3 durability.
+description: Kafka without the ops. 1 binary, 1 S3 bucket, 1M events/sec.
 template: splash
 hero:
-  tagline: Kafka without the ops. One binary, S3 durability.
+  tagline: "Kafka without the ops.<br/><span class='hero-sub'>1 binary. 1 S3 bucket. 1M events/sec.</span>"
   image:
     html: |
       <div class="adaptive-terminal">
@@ -34,25 +34,25 @@ import { Card, CardGrid, LinkButton } from '@astrojs/starlight/components';
 <CardGrid stagger>
   <Card title="Performance" icon="rocket">
     <a href="/performance/benchmarks/" class="full-card-link">
-      100K events/s sustained. 15ms p95 end-to-end latency. Graduate to a full Kafka cluster when you need to.
+      550K events/sec sustained, 27ms end-to-end latency. Standard Kafka protocol, so you can switch to a full cluster if you ever outgrow it.
       <span class="card-link-hint">Benchmarks →</span>
     </a>
   </Card>
   <Card title="Durable by default" icon="approve-check-circle">
     <a href="/concepts/storage/" class="full-card-link">
-      Every event is flushed to any S3-compatible object store. S3 is the source of truth.
+      Every record is persisted to S3. No disks to manage, no data to lose. Storage scales with your data, not your ops team.
       <span class="card-link-hint">Storage →</span>
     </a>
   </Card>
   <Card title="15 MB container" icon="seti:docker">
     <a href="/concepts/design-philosophy/" class="full-card-link">
-      Single binary, no JVM, no dependencies. Runs anywhere Docker runs.
+      Single Go binary, no JVM, no ZooKeeper, no dependencies. Container boots in under a second.
       <span class="card-link-hint">Design →</span>
     </a>
   </Card>
   <Card title="Any Kafka client works" icon="puzzle">
     <a href="/reference/kafka-compatibility/" class="full-card-link">
-      franz-go, librdkafka, Java, Python. No code changes required.
+      Point your existing franz-go, librdkafka, Java, or Python clients at klite. No code changes. Zero-downtime migration to or from Kafka via MirrorMaker 2.
       <span class="card-link-hint">Compatibility →</span>
     </a>
   </Card>

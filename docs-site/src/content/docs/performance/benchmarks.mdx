@@ -1,6 +1,6 @@
 ---
-title: Benchmarks
-description: End-to-end latency benchmarks for klite under sustained 100K events/sec load.
+title: Latency Benchmark
+description: End-to-end latency under sustained 100K events/sec load on a single node.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -32,35 +32,26 @@ Sustained 100K events/sec over one hour, including network round-trips to and fr
 
 ## Setup
 
-Two `m7g.xlarge` (ARM, 4 vCPU, 16 GB) instances on AWS in the same availability zone. One runs klite, the other runs the benchmark client. Separate machines so the numbers include real network hops, not loopback. klite only uses ~6 GB of memory. We need this instance size not for RAM but because smaller instances have lower baseline EBS bandwidth — m7g.large is capped at 79 MB/s baseline, which would bottleneck before the gp3 volume's 125 MiB/s limit.
+Two `m7g.xlarge` (Graviton3, 4 vCPU, 16 GB) instances on AWS in the same availability zone. One runs klite, the other runs the benchmark client. Separate machines so the numbers include real network hops, not loopback. klite only uses ~6 GB of memory. We need this instance size not for RAM but because smaller instances have lower baseline EBS bandwidth.
 
-The benchmark produces 100,000 events/sec (~1 KB each, ~97 MB/s) and consumes them back, sustained for one hour. 360 million events total. Acks=1 — klite acknowledges each batch after writing to disk.
+The benchmark produces 100,000 events/sec (~1 KB each, ~97 MB/s) and consumes them back, sustained for one hour. 360 million events total. Acks=1.
 
 ## Reproduce
 
-[`scripts/bench-aws.py`](https://github.com/klaudworks/klite/blob/main/scripts/bench-aws.py) is a self-contained [uv](https://docs.astral.sh/uv/) Python script. Run it directly — `uv` resolves dependencies inline.
-
-**Requirements:**
-
-- [uv](https://docs.astral.sh/uv/)
-- [Terraform](https://www.terraform.io/)
-- [Docker](https://www.docker.com/) with buildx
-- AWS CLI with a configured profile (`aws configure --profile klite-bench`)
-- An SSH key pair (defaults to `~/.ssh/id_ed25519.pub`)
-
 ```sh
-./scripts/bench-aws.py up    # provision EC2, build & push Docker images
-./scripts/bench-aws.py run   # run benchmark (100K rec/s, 1KB, acks=1, 1h)
-./scripts/bench-aws.py down  # tear down
+./scripts/bench-aws.py up \
+  --klite-instance m7g.xlarge --bench-instance m7g.xlarge
+
+./scripts/bench-aws.py run \
+  --mode produce-consume \
+  --partitions 6 --producers 6 --consumers 6 \
+  --num-records 360000000 --record-size 1024 \
+  --throughput 100000 --acks 1 \
+  --max-buffered-records 2048 --warmup-records 50000 \
+  --wal-max-disk-size 32212254720
+
+./scripts/bench-aws.py down
 ```
-
-Flags override defaults:
-
-```sh
-./scripts/bench-aws.py run --throughput 200000 --acks -1 --partitions 12
-```
-
-Run `./scripts/bench-aws.py --help` for the full list of options.
 
 <script is:inline src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script is:inline src="/bench.js"></script>

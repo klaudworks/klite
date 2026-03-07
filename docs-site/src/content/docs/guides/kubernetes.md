@@ -134,7 +134,7 @@ s3:
 helm upgrade klite oci://ghcr.io/klaudworks/charts/klite --version "$KLITE_VERSION"
 ```
 
-klite replays its WAL on startup, so upgrades are safe. The pod shuts down gracefully on SIGTERM.
+On SIGTERM, klite flushes all buffered data to S3, uploads the metadata log, and exits cleanly. Startup replays the metadata log and WAL in 1-2 seconds. Kafka clients retry by default, so the upgrade causes a brief interruption (a few seconds of back-pressure) but no data loss.
 
 ## Uninstalling
 

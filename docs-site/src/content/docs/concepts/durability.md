@@ -11,9 +11,15 @@ Most deployments already have reliable storage underneath. Cloud VMs use network
 
 ## Failure scenarios
 
-### Process crash (kill, OOM, graceful shutdown)
+### Graceful shutdown (SIGTERM, SIGINT)
 
-No data loss. All acknowledged writes are on disk. On restart, klite replays its metadata log and WAL to rebuild state. This takes 1-2 seconds. Clients with retries configured (the default in franz-go, librdkafka, and the Java client) reconnect automatically.
+No data loss. On shutdown, klite flushes all buffered partition data to S3, uploads the current metadata log to S3, fsyncs the local metadata log, and closes the WAL. Everything -- topic definitions, consumer group offsets, producer state, and record data -- is fully persisted before the process exits.
+
+Startup after a graceful shutdown takes 1-2 seconds (metadata log and WAL replay). Kafka clients with retries enabled (the default in franz-go, librdkafka, and the Java client) reconnect automatically, so a restart during an upgrade typically results in only a few seconds of producer back-pressure.
+
+### Process crash (kill -9, OOM)
+
+No data loss. All acknowledged writes are already fsync'd to the WAL. On restart, klite replays its metadata log and WAL to rebuild state. This takes 1-2 seconds. Clients with retries configured reconnect automatically.
 
 ### Kernel panic or power loss
 

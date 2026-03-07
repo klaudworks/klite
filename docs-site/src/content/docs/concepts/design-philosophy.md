@@ -15,7 +15,7 @@ We kept running into projects where Kafka would have been the right tool, but th
 
 **Kafka protocol compatible.** Use any existing Kafka client library. Start small, and if you ever outgrow klite, switch to full Kafka without changing a line of code.
 
-**Good enough performance.** Designed to handle 100K+ messages per second on a single machine. That's more than enough for the vast majority of workloads. See [benchmarks](/performance/benchmarks/) for real numbers.
+**Good enough performance.** Sustains 550K+ messages per second on a single machine with standard gp3 storage. That's more than enough for the vast majority of workloads. See [benchmarks](/performance/benchmarks/) for real numbers.
 
 **Durable by default.** Every event is persisted to disk immediately and written to S3 within seconds. S3 is the single source of truth. No backup tooling, no snapshots to manage.
 
@@ -25,5 +25,5 @@ Running Kafka on a single server has a few advantages, but it also comes with tr
 
 **Hardware and network.** klite gets the most out of your hardware, but it is still designed for a single server. It won't replace a full Kafka cluster doing millions of messages per second across a fleet of machines. If you need that, use Kafka. It's great at it.
 
-**No failover yet.** There is currently no failover mechanism for zero-downtime upgrades, server reboots, or failures. Your producers will have to retry. klite is a small binary so it starts up fast, but there will be a brief interruption. Failover for Kubernetes and other multi-server setups is on the roadmap and will be tackled in the next few weeks.
+**No failover yet.** There is currently no failover mechanism for zero-downtime upgrades, server reboots, or failures. On SIGTERM, klite flushes all data to S3 and shuts down cleanly. Restarts take 1-2 seconds, and Kafka clients retry by default, so upgrades cause only a brief interruption rather than data loss. Failover for Kubernetes and other multi-server setups is on the roadmap and will be tackled in the next few weeks.
 

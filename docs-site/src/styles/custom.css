@@ -77,6 +77,14 @@
 	color: var(--sl-color-accent) !important;
 }
 
+/* Hero subtitle: smaller, lighter second line */
+.hero-sub {
+	font-size: 0.75em;
+	opacity: 0.75;
+	font-weight: 400;
+	letter-spacing: 0.02em;
+}
+
 :root[data-theme='dark'] .hero h1 {
 	color: var(--sl-color-text-accent) !important;
 }

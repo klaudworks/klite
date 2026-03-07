@@ -1,0 +1,92 @@
+---
+title: Throughput Benchmark
+description: Maximum throughput on a single node. 1 billion records, no rate limit, 16 producers, 16 partitions.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+No rate limit. 16 producers push 1 KB records as fast as the broker can flush them to disk, 16 consumers read everything back in real time. 1 billion records in ~31 minutes: ~553K events/sec, ~540 MB/s sustained.
+
+<Tabs syncKey="metric">
+  <TabItem label="throughput">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-throughput"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="avg">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-avg"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="p50">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-p50"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="p95">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-p95"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="p99">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-p99"></canvas>
+    </div>
+  </TabItem>
+</Tabs>
+
+### System metrics
+
+<Tabs syncKey="sysmetric">
+  <TabItem label="disk writes">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-disk"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="network I/O">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-net"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="CPU">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-cpu"></canvas>
+    </div>
+  </TabItem>
+  <TabItem label="memory">
+    <div style="position:relative;height:320px;">
+      <canvas id="stress-mem"></canvas>
+    </div>
+  </TabItem>
+</Tabs>
+
+## What limits throughput
+
+The bottleneck is EBS flush latency. Every durable flush is a network round-trip to the EBS volume, averaging 2.6ms on gp3. The disk writes 365 MB/s but the volume can sustain 625 MB/s -- it sits idle 40% of the time waiting between flushes. Only 1,800 of the 16,000 provisioned IOPS are used. CPU is 83% idle.
+
+Application-layer throughput (540 MB/s) is higher than disk throughput (365 MB/s) because Snappy compresses records to ~68% of their original size on the wire.
+
+Local NVMe SSDs would reduce flush latency from 2.6ms to 10-100us and push throughput significantly higher. This test used standard gp3, the same storage most workloads run on.
+
+When producers outrun the disk, klite back-pressures gracefully: writes queue up, producers wait, throughput stabilizes at the hardware limit. No crashes, no dropped data.
+
+## Reproduce
+
+```sh
+./scripts/bench-aws.py up \
+  --klite-instance m7g.xlarge --bench-instance m7g.xlarge \
+  --ebs-throughput 1000 --ebs-iops 16000 --ebs-size 500
+
+./scripts/bench-aws.py run \
+  --mode produce-consume \
+  --partitions 16 --producers 16 --consumers 16 \
+  --num-records 1000000000 --record-size 1024 \
+  --throughput -1 --acks 1 \
+  --max-buffered-records 1024 --warmup-records 50000 \
+  --wal-max-disk-size 53687091200
+
+./scripts/bench-aws.py down
+```
+
+<script is:inline src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script is:inline src="/bench-stress.js"></script>
