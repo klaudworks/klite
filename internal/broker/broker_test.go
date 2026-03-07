@@ -211,3 +211,79 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("HealthAddr = %q, want %q (disabled by default)", cfg.HealthAddr, "")
 	}
 }
+
+func TestLeaseTimingValidation(t *testing.T) {
+	t.Parallel()
+
+	// lease-duration < 2 * lease-renew-interval should fail
+	cfg := Config{
+		ReplicationAddr:    ":9093",
+		S3Bucket:           "test-bucket",
+		LeaseDuration:      5 * time.Second,
+		LeaseRenewInterval: 5 * time.Second,
+	}
+	_, err := cfg.ValidateReplication()
+	if err == nil {
+		t.Fatal("expected error when lease-duration < 2 * lease-renew-interval")
+	}
+
+	// Exactly 2x should pass
+	cfg.LeaseDuration = 10 * time.Second
+	cfg.LeaseRenewInterval = 5 * time.Second
+	_, err = cfg.ValidateReplication()
+	if err != nil {
+		t.Fatal("expected no error when lease-duration == 2 * lease-renew-interval:", err)
+	}
+
+	// Default values should pass
+	cfg.LeaseDuration = 0
+	cfg.LeaseRenewInterval = 0
+	_, err = cfg.ValidateReplication()
+	if err != nil {
+		t.Fatal("expected no error with default values:", err)
+	}
+}
+
+func TestLeaseTimingWarning(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		ReplicationAddr:    ":9093",
+		S3Bucket:           "test-bucket",
+		LeaseDuration:      15 * time.Second,
+		LeaseRetryInterval: 20 * time.Second,
+	}
+	warnings, err := cfg.ValidateReplication()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("expected warning when lease-retry-interval > lease-duration")
+	}
+}
+
+func TestReplicationRequiresS3(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		ReplicationAddr: ":9093",
+	}
+	_, err := cfg.ValidateReplication()
+	if err == nil {
+		t.Fatal("expected error when replication-addr set without s3-bucket")
+	}
+}
+
+func TestReplicationNoReplicationAddr(t *testing.T) {
+	t.Parallel()
+
+	// No replication addr = no validation needed
+	cfg := Config{}
+	warnings, err := cfg.ValidateReplication()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatal("unexpected warnings:", warnings)
+	}
+}

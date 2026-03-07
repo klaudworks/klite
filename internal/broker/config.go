@@ -59,6 +59,18 @@ type Config struct {
 	// SASLStore allows injecting a pre-configured SASL credential store (for tests).
 	SASLStore interface{} // *sasl.Store when set
 
+	// Replication configuration
+	ReplicationAddr           string        // Listen address for replication (e.g. ":9093"). Setting enables standby mode.
+	ReplicationAdvertisedAddr string        // Advertised replication address for standby discovery
+	ReplicationID             string        // Node identity for lease (default: hostname)
+	ReplicationAckTimeout     time.Duration // Timeout for standby ACK in sync mode (default 5s)
+	LeaseDuration             time.Duration // How long the lease is valid without renewal (default 15s)
+	LeaseRenewInterval        time.Duration // How often the primary renews the lease (default 5s)
+	LeaseRetryInterval        time.Duration // How often the standby polls the lease (default 2s)
+
+	// LeaseElector allows injecting a lease.Elector for tests.
+	LeaseElector interface{} // lease.Elector when set
+
 	// Clock allows injecting a controllable clock for tests.
 	// If nil, defaults to clock.RealClock{}.
 	Clock clock.Clock
@@ -141,6 +153,14 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.SASLMechanism, "sasl-mechanism", cfg.SASLMechanism, "Mechanism for CLI-specified user: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512")
 	fs.StringVar(&cfg.SASLUser, "sasl-user", cfg.SASLUser, "Username for CLI-specified bootstrap user")
 	fs.StringVar(&cfg.SASLPassword, "sasl-password", cfg.SASLPassword, "Password for CLI-specified bootstrap user")
+
+	fs.StringVar(&cfg.ReplicationAddr, "replication-addr", cfg.ReplicationAddr, "Replication listen address. Setting this enables standby mode.")
+	fs.StringVar(&cfg.ReplicationAdvertisedAddr, "replication-advertised-addr", cfg.ReplicationAdvertisedAddr, "Routable replication address written to the lease")
+	fs.StringVar(&cfg.ReplicationID, "replication-id", cfg.ReplicationID, "Node identity for lease (default: hostname)")
+	fs.DurationVar(&cfg.ReplicationAckTimeout, "replication-ack-timeout", cfg.ReplicationAckTimeout, "Timeout for standby ACK in sync mode (default: 5s)")
+	fs.DurationVar(&cfg.LeaseDuration, "lease-duration", cfg.LeaseDuration, "How long the lease is valid without renewal (default: 15s)")
+	fs.DurationVar(&cfg.LeaseRenewInterval, "lease-renew-interval", cfg.LeaseRenewInterval, "How often the primary renews the lease (default: 5s)")
+	fs.DurationVar(&cfg.LeaseRetryInterval, "lease-retry-interval", cfg.LeaseRetryInterval, "How often the standby polls the lease (default: 2s)")
 }
 
 // ApplyEnvOverrides reads KLITE_* environment variables and applies them to
@@ -184,6 +204,72 @@ func (cfg *Config) ApplyEnvOverrides() {
 			cfg.WALMaxDiskSize = n
 		}
 	}
+
+	replEnvOverrides := []struct {
+		env    string
+		target *string
+	}{
+		{"KLITE_REPLICATION_ADDR", &cfg.ReplicationAddr},
+		{"KLITE_REPLICATION_ADVERTISED_ADDR", &cfg.ReplicationAdvertisedAddr},
+		{"KLITE_REPLICATION_ID", &cfg.ReplicationID},
+	}
+	for _, eo := range replEnvOverrides {
+		if v := os.Getenv(eo.env); v != "" {
+			*eo.target = v
+		}
+	}
+
+	replDurOverrides := []struct {
+		env    string
+		target *time.Duration
+	}{
+		{"KLITE_REPLICATION_ACK_TIMEOUT", &cfg.ReplicationAckTimeout},
+		{"KLITE_LEASE_DURATION", &cfg.LeaseDuration},
+		{"KLITE_LEASE_RENEW_INTERVAL", &cfg.LeaseRenewInterval},
+		{"KLITE_LEASE_RETRY_INTERVAL", &cfg.LeaseRetryInterval},
+	}
+	for _, eo := range replDurOverrides {
+		if v := os.Getenv(eo.env); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				*eo.target = d
+			}
+		}
+	}
+}
+
+// ValidateReplication checks replication configuration constraints.
+// Returns an error for fatal misconfigurations, and a list of warnings.
+func (cfg *Config) ValidateReplication() (warnings []string, err error) {
+	if cfg.ReplicationAddr == "" {
+		return nil, nil
+	}
+
+	if cfg.S3Bucket == "" && cfg.LeaseElector == nil {
+		return nil, fmt.Errorf("--replication-addr requires --s3-bucket (S3 is needed for lease fencing and TLS cert storage)")
+	}
+
+	leaseDur := cfg.LeaseDuration
+	if leaseDur == 0 {
+		leaseDur = 15 * time.Second
+	}
+	renewInt := cfg.LeaseRenewInterval
+	if renewInt == 0 {
+		renewInt = 5 * time.Second
+	}
+	retryInt := cfg.LeaseRetryInterval
+	if retryInt == 0 {
+		retryInt = 2 * time.Second
+	}
+
+	if leaseDur < 2*renewInt {
+		return nil, fmt.Errorf("--lease-duration (%s) must be >= 2x --lease-renew-interval (%s)", leaseDur, renewInt)
+	}
+
+	if retryInt > leaseDur {
+		warnings = append(warnings, fmt.Sprintf("--lease-retry-interval (%s) > --lease-duration (%s): standby may miss the expiry window", retryInt, leaseDur))
+	}
+
+	return warnings, nil
 }
 
 func (cfg *Config) ResolveAdvertisedAddr() (addr string, warn bool) {

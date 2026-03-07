@@ -47,6 +47,12 @@ func (b *Broker) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	select {
 	case <-b.ready:
+		// In replication mode, standby returns 503.
+		if b.isStandby() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("standby"))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	default:
