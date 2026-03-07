@@ -109,10 +109,17 @@ func NewFlusher(cfg FlusherConfig, provider PartitionProvider) *Flusher {
 }
 
 func (f *Flusher) Start() {
+	f.stopCh = make(chan struct{})
+	f.done = make(chan struct{})
 	go f.run()
 }
 
 func (f *Flusher) Stop() {
+	select {
+	case <-f.stopCh:
+		return // already stopped
+	default:
+	}
 	close(f.stopCh)
 	<-f.done
 }

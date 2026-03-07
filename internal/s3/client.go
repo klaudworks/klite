@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithy "github.com/aws/smithy-go"
 )
 
 type Client struct {
@@ -212,6 +213,8 @@ func (c *Client) Prefix() string {
 type InMemoryS3 struct {
 	mu            sync.Mutex
 	objects       map[string][]byte
+	etags         map[string]string
+	etagCounter   int
 	timestamps    map[string]time.Time
 	RangeRequests []RangeRequest
 }
@@ -224,6 +227,7 @@ type RangeRequest struct {
 func NewInMemoryS3() *InMemoryS3 {
 	return &InMemoryS3{
 		objects:    make(map[string][]byte),
+		etags:      make(map[string]string),
 		timestamps: make(map[string]time.Time),
 	}
 }
@@ -232,14 +236,39 @@ func (m *InMemoryS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ..
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	key := aws.ToString(input.Key)
+
+	if input.IfNoneMatch != nil && *input.IfNoneMatch == "*" {
+		if _, exists := m.objects[key]; exists {
+			return nil, &smithy.GenericAPIError{
+				Code:    "PreconditionFailed",
+				Message: "At least one of the pre-conditions you specified did not hold",
+			}
+		}
+	}
+
+	if input.IfMatch != nil {
+		storedETag, exists := m.etags[key]
+		if !exists || storedETag != *input.IfMatch {
+			return nil, &smithy.GenericAPIError{
+				Code:    "PreconditionFailed",
+				Message: "At least one of the pre-conditions you specified did not hold",
+			}
+		}
+	}
+
 	data, err := io.ReadAll(input.Body)
 	if err != nil {
 		return nil, err
 	}
-	key := aws.ToString(input.Key)
+
+	m.etagCounter++
+	etag := fmt.Sprintf("\"etag-%d\"", m.etagCounter)
+
 	m.objects[key] = data
+	m.etags[key] = etag
 	m.timestamps[key] = time.Now()
-	return &s3.PutObjectOutput{}, nil
+	return &s3.PutObjectOutput{ETag: &etag}, nil
 }
 
 func (m *InMemoryS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
@@ -280,18 +309,22 @@ func (m *InMemoryS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ..
 		totalSize := int64(len(data))
 		contentRange := fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize)
 		contentLen := int64(len(slice))
+		rangeETag := m.etags[key]
 
 		return &s3.GetObjectOutput{
 			Body:          io.NopCloser(bytes.NewReader(slice)),
 			ContentRange:  &contentRange,
 			ContentLength: &contentLen,
+			ETag:          &rangeETag,
 		}, nil
 	}
 
 	contentLen := int64(len(data))
+	etag := m.etags[key]
 	return &s3.GetObjectOutput{
 		Body:          io.NopCloser(bytes.NewReader(data)),
 		ContentLength: &contentLen,
+		ETag:          &etag,
 	}, nil
 }
 
@@ -347,8 +380,10 @@ func (m *InMemoryS3) HeadObject(_ context.Context, input *s3.HeadObjectInput, _ 
 		return nil, fmt.Errorf("NoSuchKey: %s", key)
 	}
 	size := int64(len(data))
+	etag := m.etags[key]
 	return &s3.HeadObjectOutput{
 		ContentLength: &size,
+		ETag:          &etag,
 	}, nil
 }
 
