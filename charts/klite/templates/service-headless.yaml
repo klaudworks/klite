@@ -1,0 +1,22 @@
+{{- if .Values.replication.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "klite.fullname" . }}-headless
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "klite.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: replication
+      port: {{ .Values.replication.port }}
+      targetPort: replication
+  selector:
+    {{- include "klite.selectorLabels" . | nindent 4 }}
+{{- end }}

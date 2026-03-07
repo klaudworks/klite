@@ -21,3 +21,17 @@ NOTE: Persistence is disabled. The broker will recover from S3 on restart.
   This adds a few seconds to startup and creates a ~60s data-loss window for
   in-flight writes. Set persistence.enabled=true to eliminate this.
 {{- end }}
+
+{{- if .Values.replication.enabled }}
+
+Streaming replication is enabled (synchronous).
+  Two pods will start: one becomes primary (accepts Kafka traffic),
+  the other runs as a standby replica.
+
+  Failover is automatic:
+    Graceful (SIGTERM): ~2s
+    Crash:              ~{{ .Values.replication.leaseDuration }}
+
+  Replication uses the headless service for DNS discovery:
+    {{ include "klite.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+{{- end }}

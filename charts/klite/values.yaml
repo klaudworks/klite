@@ -166,6 +166,24 @@ serviceAccount:
   ## @param serviceAccount.automountServiceAccountToken Mount the token into pods
   automountServiceAccountToken: false
 
+## @section Replication
+## Enable active-passive streaming replication with automatic failover.
+## Requires s3.bucket to be set (S3 is used for lease fencing and TLS cert storage).
+
+replication:
+  ## @param replication.enabled Enable streaming replication (deploys StatefulSet with 2 replicas)
+  enabled: false
+  ## @param replication.port Replication listen port inside the container
+  port: 9093
+  ## @param replication.ackTimeout Timeout for standby ACK
+  ackTimeout: 5s
+  ## @param replication.leaseDuration How long the S3 lease is valid without renewal
+  leaseDuration: 15s
+  ## @param replication.leaseRenewInterval How often the primary renews the S3 lease
+  leaseRenewInterval: 5s
+  ## @param replication.leaseRetryInterval How often the standby polls the S3 lease
+  leaseRetryInterval: 2s
+
 ## @section Persistence
 ## Optional PVC for the WAL / metadata directory.
 ## Without a PVC, klite recovers from S3 on every restart (slightly slower, ~60s data-loss window).
