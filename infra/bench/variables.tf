@@ -36,13 +36,31 @@ variable "msk_broker_count" {
 variable "klite_instance_type" {
   description = "EC2 instance type for klite (Graviton arm64)"
   type        = string
-  default     = "m7g.xlarge"
+  default     = "m8g.2xlarge"
 }
 
 variable "bench_instance_type" {
   description = "EC2 instance type for benchmark client (Graviton arm64)"
   type        = string
-  default     = "m7g.large"
+  default     = "m8g.xlarge"
+}
+
+variable "klite_ebs_size_gb" {
+  description = "Size of the klite EBS root volume in GB"
+  type        = number
+  default     = 100
+}
+
+variable "klite_ebs_iops" {
+  description = "Provisioned IOPS for klite gp3 EBS volume (baseline 3000 included free)"
+  type        = number
+  default     = 6000
+}
+
+variable "klite_ebs_throughput" {
+  description = "Provisioned throughput in MiB/s for klite gp3 EBS volume (baseline 125 included free)"
+  type        = number
+  default     = 500
 }
 
 variable "use_spot" {

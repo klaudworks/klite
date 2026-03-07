@@ -176,9 +176,9 @@ resource "aws_instance" "klite" {
 
   root_block_device {
     volume_type = "gp3"
-    volume_size = 100
-    iops        = 3000
-    throughput  = 125
+    volume_size = var.klite_ebs_size_gb
+    iops        = var.klite_ebs_iops
+    throughput  = var.klite_ebs_throughput
   }
 
   user_data = base64encode(templatefile("${path.module}/userdata-klite.sh.tpl", {

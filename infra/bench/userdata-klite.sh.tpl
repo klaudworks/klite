@@ -1,7 +1,7 @@
 #!/bin/bash
 set -ex
 
-dnf install -y docker
+dnf install -y docker sysstat
 systemctl enable docker
 systemctl start docker
 usermod -aG docker ec2-user
