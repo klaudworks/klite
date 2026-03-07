@@ -7,7 +7,7 @@ import (
 
 // makeBatchBytes builds a minimal 61-byte RecordBatch header + optional padding.
 // Fields are written in big-endian at their standard byte offsets.
-func makeBatchBytes(baseOffset int64, batchLength int32, leaderEpoch int32, magic int8, crc uint32, attrs int16, lastOffsetDelta int32, baseTS, maxTS int64, producerID int64, producerEpoch int16, baseSeq int32, numRecords int32) []byte {
+func makeBatchBytes(baseOffset int64, batchLength, leaderEpoch int32, magic int8, crc uint32, attrs int16, lastOffsetDelta int32, baseTS, maxTS, producerID int64, producerEpoch int16, baseSeq, numRecords int32) []byte {
 	raw := make([]byte, 61)
 	binary.BigEndian.PutUint64(raw[0:8], uint64(baseOffset))
 	binary.BigEndian.PutUint32(raw[8:12], uint32(batchLength))

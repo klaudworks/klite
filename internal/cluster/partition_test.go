@@ -908,14 +908,14 @@ func TestAdvanceLogStartOffsetConcurrent(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		pd.CompactionMu.Lock()
-		pd.AdvanceLogStartOffset(5, nil)
+		_ = pd.AdvanceLogStartOffset(5, nil)
 		pd.CompactionMu.Unlock()
 	}()
 
 	go func() {
 		defer wg.Done()
 		pd.CompactionMu.Lock()
-		pd.AdvanceLogStartOffset(7, nil)
+		_ = pd.AdvanceLogStartOffset(7, nil)
 		pd.CompactionMu.Unlock()
 	}()
 

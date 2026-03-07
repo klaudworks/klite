@@ -121,7 +121,6 @@ func TestScanFramedEntries(t *testing.T) {
 		entries = append(entries, entry)
 		return true
 	})
-
 	if err != nil {
 		t.Fatalf("ScanFramedEntries error: %v", err)
 	}
@@ -693,7 +692,7 @@ func TestWriteErrorSignalsAllWaitersAsSuccessful(t *testing.T) {
 		t.Fatalf("Chmod: %v", err)
 	}
 	t.Cleanup(func() {
-		os.Chmod(walDir, 0o755)
+		_ = os.Chmod(walDir, 0o755)
 	})
 
 	// Entry 4: 210+105=315>250, triggers rotation. If a pre-created

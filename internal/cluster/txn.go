@@ -64,7 +64,7 @@ type SequenceWindow struct {
 //   - ok=true, isDuplicate=false: new batch accepted, window updated
 //   - ok=true, isDuplicate=true: duplicate detected, dupOffset is the original offset
 //   - ok=false: out-of-order sequence
-func (w *SequenceWindow) PushAndValidate(epoch int16, firstSeq int32, numRecords int32, baseOffset int64) (ok bool, isDuplicate bool, dupOffset int64) {
+func (w *SequenceWindow) PushAndValidate(epoch int16, firstSeq, numRecords int32, baseOffset int64) (ok, isDuplicate bool, dupOffset int64) {
 	// Epoch change: reset window, require seq=0
 	if !w.filled || epoch != w.epoch {
 		if firstSeq != 0 {
@@ -230,7 +230,7 @@ func (m *ProducerIDManager) GetProducerByTxnID(txnID string) *ProducerState {
 // ValidateAndDedup validates a produce request's PID/epoch/sequence and checks for duplicates.
 // Returns (errorCode, isDuplicate, dupBaseOffset).
 // errorCode 0 means success.
-func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPartition, firstSeq int32, numRecords int32, baseOffset int64) (errCode int16, isDup bool, dupOffset int64) {
+func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPartition, firstSeq, numRecords int32, baseOffset int64) (errCode int16, isDup bool, dupOffset int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -629,11 +629,11 @@ func encodeRecord(key, value []byte) []byte {
 	// We need to compute the record body first, then prepend the length as varint
 
 	var body []byte
-	// Attributes (int8) = 0
+	// attributes byte set to zero
 	body = append(body, 0)
-	// TimestampDelta (varint) = 0
+	// timestamp delta (varint zero)
 	body = appendVarint(body, 0)
-	// OffsetDelta (varint) = 0
+	// offset delta (varint zero)
 	body = appendVarint(body, 0)
 	// Key length (varint)
 	if key == nil {

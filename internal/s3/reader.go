@@ -77,7 +77,7 @@ func (r *Reader) Fetch(ctx context.Context, topic string, topicID [16]byte, part
 }
 
 // fetchRawFromObject reads concatenated batch bytes from a single S3 object.
-func (r *Reader) fetchRawFromObject(ctx context.Context, key string, objectSize int64, offset int64, maxBytes int32) ([]byte, error) {
+func (r *Reader) fetchRawFromObject(ctx context.Context, key string, objectSize, offset int64, maxBytes int32) ([]byte, error) {
 	footer, err := r.GetFooter(ctx, key, objectSize)
 	if err != nil {
 		return nil, fmt.Errorf("read footer for %s: %w", key, err)
@@ -141,7 +141,7 @@ func (r *Reader) FetchBatches(ctx context.Context, topic string, topicID [16]byt
 }
 
 // fetchFromObject reads batches from a single S3 object starting at offset.
-func (r *Reader) fetchFromObject(ctx context.Context, key string, objectSize int64, offset int64, maxBytes int32) ([]BatchData, error) {
+func (r *Reader) fetchFromObject(ctx context.Context, key string, objectSize, offset int64, maxBytes int32) ([]BatchData, error) {
 	footer, err := r.GetFooter(ctx, key, objectSize)
 	if err != nil {
 		return nil, fmt.Errorf("read footer for %s: %w", key, err)
@@ -416,5 +416,5 @@ func (r *Reader) DiscoverHW(ctx context.Context, topic string, topicID [16]byte,
 	if lastOff < 0 {
 		return 0, nil
 	}
-	return lastOff + 1, nil // HW = lastOffset + 1
+	return lastOff + 1, nil
 }

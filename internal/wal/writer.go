@@ -77,9 +77,9 @@ type Writer struct {
 	// The writer goroutine reads from the channel and parks the result in
 	// preCreated. No locks needed: only the writer goroutine touches
 	// preCreated, and only the background goroutine sends on the channel.
-	preCreated         *segmentInfo
-	preCreateCh        chan *segmentInfo // background -> writer goroutine
-	preCreateInflight  bool             // owned by writer goroutine
+	preCreated        *segmentInfo
+	preCreateCh       chan *segmentInfo // background -> writer goroutine
+	preCreateInflight bool              // owned by writer goroutine
 
 	// Disk usage tracking (for segment cleanup)
 	diskUsage atomic.Int64 // total bytes across all WAL segment files
@@ -477,8 +477,8 @@ func (w *Writer) rotateSegment() error {
 
 		dir, err := os.Open(w.walDir)
 		if err == nil {
-			dir.Sync()
-			dir.Close()
+			_ = dir.Sync()
+			_ = dir.Close()
 		}
 	}
 
@@ -512,8 +512,8 @@ func (w *Writer) maybePreCreateSegment() {
 
 		dir, err := os.Open(walDir)
 		if err == nil {
-			dir.Sync()
-			dir.Close()
+			_ = dir.Sync()
+			_ = dir.Close()
 		}
 
 		w.preCreateCh <- seg
@@ -554,7 +554,7 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 		// No references — safe to delete
 		deletedSize := seg.size
 		if seg.file != nil {
-			seg.file.Close()
+			_ = seg.file.Close()
 			seg.file = nil
 		}
 		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
@@ -578,7 +578,7 @@ func (w *Writer) tryCleanupSegmentsLocked() {
 		deletedSegSize := oldest.size
 		w.idx.PruneSegment(oldest.seq)
 		if oldest.file != nil {
-			oldest.file.Close()
+			_ = oldest.file.Close()
 			oldest.file = nil
 		}
 		if err := os.Remove(oldest.path); err != nil && !os.IsNotExist(err) {
@@ -629,7 +629,7 @@ func (w *Writer) openSegment(seq uint64, forAppend bool) (*segmentInfo, error) {
 
 	stat, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("stat segment %s: %w", name, err)
 	}
 
@@ -690,18 +690,18 @@ func (w *Writer) scanExistingSegments() ([]uint64, error) {
 // pre-created segment that hasn't been delivered yet.
 func (w *Writer) closeSegments() {
 	if w.current != nil && w.current.file != nil {
-		w.current.file.Close()
+		_ = w.current.file.Close()
 		w.current.file = nil
 	}
 	if w.preCreated != nil && w.preCreated.file != nil {
-		w.preCreated.file.Close()
+		_ = w.preCreated.file.Close()
 		w.preCreated.file = nil
 	}
 	// Drain any in-flight pre-create result so the goroutine doesn't leak.
 	if w.preCreateInflight {
 		seg := <-w.preCreateCh
 		if seg != nil && seg.file != nil {
-			seg.file.Close()
+			_ = seg.file.Close()
 		}
 	}
 }
@@ -730,7 +730,7 @@ func (w *Writer) ReadBatch(entry IndexEntry) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open segment for read: %w", err)
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck // best-effort close
 
 	// Read the full entry from disk
 	entryBuf := make([]byte, entry.EntrySize)
@@ -797,7 +797,7 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 			return true
 		})
 
-		f.Close()
+		_ = f.Close()
 
 		if scanErr != nil {
 			return fmt.Errorf("scan segment %d: %w", seq, scanErr)

@@ -70,7 +70,7 @@ func TestBrokerStartStop(t *testing.T) {
 	if dialErr != nil {
 		t.Fatal("failed to connect:", dialErr)
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	// Shutdown
 	cancel()

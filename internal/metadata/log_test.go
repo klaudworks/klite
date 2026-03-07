@@ -156,14 +156,14 @@ func TestLogAppendAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ml.Close()
+	_ = ml.Close()
 
 	// Replay
 	ml2, err := NewLog(LogConfig{DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ml2.Close()
+	defer func() { _ = ml2.Close() }()
 
 	var topics []CreateTopicEntry
 	var offsets []OffsetCommitEntry
@@ -283,14 +283,14 @@ func TestLogCompaction(t *testing.T) {
 		t.Fatalf("compaction did not reduce size: before=%d after=%d", sizeBeforeCompaction, sizeAfterCompaction)
 	}
 
-	ml.Close()
+	_ = ml.Close()
 
 	// Verify replay after compaction produces correct state
 	ml2, err := NewLog(LogConfig{DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ml2.Close()
+	defer func() { _ = ml2.Close() }()
 
 	var topics []CreateTopicEntry
 	var offsets []OffsetCommitEntry
@@ -334,20 +334,20 @@ func TestLogDeleteTopic(t *testing.T) {
 
 	// Create topic then delete it
 	topicID := [16]byte{1, 2, 3}
-	ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
+	_ = ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
 		TopicName:      "ephemeral",
 		PartitionCount: 1,
 		TopicID:        topicID,
 	}))
-	ml.AppendSync(MarshalDeleteTopic(&DeleteTopicEntry{TopicName: "ephemeral"}))
-	ml.Close()
+	_ = ml.AppendSync(MarshalDeleteTopic(&DeleteTopicEntry{TopicName: "ephemeral"}))
+	_ = ml.Close()
 
 	// Replay
 	ml2, err := NewLog(LogConfig{DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ml2.Close()
+	defer func() { _ = ml2.Close() }()
 
 	liveTopics := make(map[string]bool)
 	ml2.SetCallbacks(
@@ -380,25 +380,25 @@ func TestLogAlterConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
+	_ = ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
 		TopicName:      "cfg-topic",
 		PartitionCount: 1,
 		TopicID:        [16]byte{7, 8, 9},
 		Configs:        map[string]string{"retention.ms": "1000"},
 	}))
-	ml.Append(MarshalAlterConfig(&AlterConfigEntry{
+	_ = ml.Append(MarshalAlterConfig(&AlterConfigEntry{
 		TopicName: "cfg-topic",
 		Key:       "retention.ms",
 		Value:     "9999",
 	}))
-	ml.Close()
+	_ = ml.Close()
 
 	// Replay
 	ml2, err := NewLog(LogConfig{DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ml2.Close()
+	defer func() { _ = ml2.Close() }()
 
 	topicConfigs := make(map[string]map[string]string)
 	ml2.SetCallbacks(
@@ -440,12 +440,12 @@ func TestLogCrashSafety(t *testing.T) {
 	}
 
 	// Write a good entry
-	ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
+	_ = ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
 		TopicName:      "good-topic",
 		PartitionCount: 1,
 		TopicID:        [16]byte{1},
 	}))
-	ml.Close()
+	_ = ml.Close()
 
 	// Append garbage to simulate partial write / crash
 	metaPath := filepath.Join(dir, "metadata.log")
@@ -453,16 +453,16 @@ func TestLogCrashSafety(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Write([]byte{0x00, 0x00, 0x00, 0x10}) // length prefix saying 16 bytes
-	f.Write([]byte{0xFF, 0xFF, 0xFF})       // truncated entry
-	f.Close()
+	_, _ = f.Write([]byte{0x00, 0x00, 0x00, 0x10}) // length prefix saying 16 bytes
+	_, _ = f.Write([]byte{0xFF, 0xFF, 0xFF})       // truncated entry
+	_ = f.Close()
 
 	// Replay should recover the good entry and stop at the corrupt one
 	ml2, err := NewLog(LogConfig{DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ml2.Close()
+	defer func() { _ = ml2.Close() }()
 
 	var topics []CreateTopicEntry
 	ml2.SetCallbacks(
@@ -497,7 +497,7 @@ func TestLogEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ml.Close()
+	defer func() { _ = ml.Close() }()
 
 	count, err := ml.Replay()
 	if err != nil {

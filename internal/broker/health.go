@@ -28,21 +28,21 @@ func (b *Broker) startHealthServer() (shutdown func(), err error) {
 		}
 	}
 
-	go srv.Serve(ln)
+	go func() { _ = srv.Serve(ln) }()
 
 	b.logger.Info("health server started", "addr", ln.Addr().String())
 
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		srv.Shutdown(ctx)
+		_ = srv.Shutdown(ctx)
 	}, nil
 }
 
 func (b *Broker) handleLivez(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	_, _ = w.Write([]byte("ok"))
 }
 
 func (b *Broker) handleReadyz(w http.ResponseWriter, r *http.Request) {
@@ -50,9 +50,9 @@ func (b *Broker) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-b.ready:
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	default:
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("not ready"))
+		_, _ = w.Write([]byte("not ready"))
 	}
 }

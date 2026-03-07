@@ -464,7 +464,7 @@ func decompressGzip(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gzip reader: %w", err)
 	}
-	defer r.Close()
+	defer r.Close() //nolint:errcheck // best-effort close
 	return io.ReadAll(r)
 }
 
@@ -532,7 +532,7 @@ func compressZSTD(data []byte) ([]byte, error) {
 
 // BuildTestBatch creates a RecordBatch for testing purposes.
 // It builds a properly formatted batch with the given records, codec, and base offset.
-func BuildTestBatch(baseOffset int64, baseTimestamp int64, records []Record, codec int) ([]byte, error) {
+func BuildTestBatch(baseOffset, baseTimestamp int64, records []Record, codec int) ([]byte, error) {
 	header := BatchHeader{
 		BaseOffset:    baseOffset,
 		Attributes:    int16(codec), // bits 0-2 = codec

@@ -307,7 +307,7 @@ func (pd *PartData) RollbackReserve(baseOffset int64) {
 // SkipOffsets advances nextCommit past a gap of offsets that will never be
 // committed (e.g., WAL write failure). Drains any pending commits that
 // become unblocked. Caller must hold pd.mu.Lock().
-func (pd *PartData) SkipOffsets(baseOffset int64, count int64) {
+func (pd *PartData) SkipOffsets(baseOffset, count int64) {
 	endOffset := baseOffset + count
 	if endOffset <= pd.nextCommit {
 		return // already past this range
@@ -557,10 +557,10 @@ func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32
 //
 // Returns (offset, timestamp). For -1 and -2, timestamp is -1.
 // Caller must hold pd.mu.RLock().
-func (pd *PartData) ListOffsets(timestamp int64, isolationLevel int8) (offset int64, ts int64) {
+func (pd *PartData) ListOffsets(timestamp int64, isolationLevel int8) (offset, ts int64) {
 	switch timestamp {
 	case -1: // Latest
-		if isolationLevel == 1 { // read_committed: return LSO
+		if isolationLevel == 1 { // read-committed isolation: return LSO
 			return pd.LSO(), -1
 		}
 		return pd.hw, -1
@@ -614,7 +614,7 @@ func (pd *PartData) LSO() int64 {
 
 // AddOpenTxn records that a transactional producer has started writing to this partition.
 // Caller must hold pd.mu.Lock().
-func (pd *PartData) AddOpenTxn(producerID int64, firstOffset int64) {
+func (pd *PartData) AddOpenTxn(producerID, firstOffset int64) {
 	if pd.openTxnPIDs == nil {
 		pd.openTxnPIDs = make(map[int64]int64)
 	}
@@ -637,7 +637,7 @@ func (pd *PartData) AddAbortedTxn(entry AbortedTxnEntry) {
 
 // AbortedTxnsInRange returns aborted transactions overlapping the given offset range.
 // Caller must hold pd.mu.RLock().
-func (pd *PartData) AbortedTxnsInRange(fetchOffset int64, lastOffset int64) []AbortedTxnEntry {
+func (pd *PartData) AbortedTxnsInRange(fetchOffset, lastOffset int64) []AbortedTxnEntry {
 	var result []AbortedTxnEntry
 	for _, e := range pd.abortedTxns {
 		if e.LastOffset < fetchOffset {

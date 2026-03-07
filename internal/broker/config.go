@@ -99,6 +99,7 @@ func (v *nodeIDValue) String() string {
 	}
 	return fmt.Sprintf("%d", *v.target)
 }
+
 func (v *nodeIDValue) Set(s string) error {
 	var n int64
 	_, err := fmt.Sscanf(s, "%d", &n)

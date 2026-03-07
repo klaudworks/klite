@@ -115,5 +115,5 @@ func ValidateBatchCRC(raw []byte, expectedCRC uint32) bool {
 // so no CRC recalculation is needed.
 func AssignOffset(raw []byte, baseOffset int64) {
 	binary.BigEndian.PutUint64(raw[0:8], uint64(baseOffset))
-	binary.BigEndian.PutUint32(raw[12:16], 0) // PartitionLeaderEpoch = 0
+	binary.BigEndian.PutUint32(raw[12:16], 0) // partition leader epoch zero
 }

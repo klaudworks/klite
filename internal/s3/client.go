@@ -76,7 +76,7 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 get %s: %w", key, err)
 	}
-	defer out.Body.Close()
+	defer out.Body.Close() //nolint:errcheck // best-effort close
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -97,7 +97,7 @@ func (c *Client) RangeGet(ctx context.Context, key string, startByte, endByte in
 	if err != nil {
 		return nil, fmt.Errorf("s3 range get %s [%d-%d]: %w", key, startByte, endByte, err)
 	}
-	defer out.Body.Close()
+	defer out.Body.Close() //nolint:errcheck // best-effort close
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -117,7 +117,7 @@ func (c *Client) TailGet(ctx context.Context, key string, n int64) ([]byte, int6
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3 tail get %s (last %d bytes): %w", key, n, err)
 	}
-	defer out.Body.Close()
+	defer out.Body.Close() //nolint:errcheck // best-effort close
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -130,7 +130,7 @@ func (c *Client) TailGet(ctx context.Context, key string, n int64) ([]byte, int6
 		// Format: "bytes start-end/total"
 		parts := strings.Split(*out.ContentRange, "/")
 		if len(parts) == 2 {
-			fmt.Sscanf(parts[1], "%d", &objectSize)
+			_, _ = fmt.Sscanf(parts[1], "%d", &objectSize)
 		}
 	}
 	if objectSize == 0 && out.ContentLength != nil {
@@ -282,14 +282,14 @@ func (m *InMemoryS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ..
 		if strings.HasPrefix(rangeStr, "bytes=-") {
 			// Suffix range: last N bytes
 			var n int64
-			fmt.Sscanf(rangeStr, "bytes=-%d", &n)
+			_, _ = fmt.Sscanf(rangeStr, "bytes=-%d", &n)
 			start = int64(len(data)) - n
 			if start < 0 {
 				start = 0
 			}
 			end = int64(len(data)) - 1
 		} else {
-			fmt.Sscanf(rangeStr, "bytes=%d-%d", &start, &end)
+			_, _ = fmt.Sscanf(rangeStr, "bytes=%d-%d", &start, &end)
 		}
 
 		if start < 0 {

@@ -406,16 +406,18 @@ func (b *Broker) initMetadataLog() error {
 					e.SaltedPass,
 					e.Salt,
 				)
-				if e.Mechanism == 1 {
+				switch e.Mechanism {
+				case 1:
 					b.saslStore.AddScram256(e.Username, auth)
-				} else if e.Mechanism == 2 {
+				case 2:
 					b.saslStore.AddScram512(e.Username, auth)
 				}
 			},
 			func(e metadata.ScramCredentialDeleteEntry) {
-				if e.Mechanism == 1 {
+				switch e.Mechanism {
+				case 1:
 					b.saslStore.DeleteScram256(e.Username)
-				} else if e.Mechanism == 2 {
+				case 2:
 					b.saslStore.DeleteScram512(e.Username)
 				}
 			},
@@ -425,7 +427,7 @@ func (b *Broker) initMetadataLog() error {
 	// Replay existing entries
 	count, err := ml.Replay()
 	if err != nil {
-		ml.Close()
+		_ = ml.Close()
 		return fmt.Errorf("replay metadata.log: %w", err)
 	}
 
@@ -619,7 +621,6 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 		entryCount++
 		return nil
 	})
-
 	if err != nil {
 		return err
 	}
@@ -878,7 +879,7 @@ func (b *Broker) inferTopicsFromS3(ctx context.Context, client *s3store.Client, 
 	if err != nil {
 		return fmt.Errorf("create inferred metadata.log: %w", err)
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck // best-effort close
 
 	for _, name := range topicNames {
 		ti := topics[name]
@@ -1165,7 +1166,7 @@ func (b *Broker) shutdown() {
 
 	// 2. Close listener to stop accepting
 	if b.listener != nil {
-		b.listener.Close()
+		_ = b.listener.Close()
 	}
 }
 
@@ -1314,11 +1315,12 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 			if dirty < minDirty {
 				// Check staleness guarantee
 				lc := pd.LastCompacted()
-				if lc.IsZero() && dirty > 0 {
+				switch {
+				case lc.IsZero() && dirty > 0:
 					// Never compacted and has dirty objects — eligible
-				} else if dirty <= 0 {
+				case dirty <= 0:
 					continue
-				} else {
+				default:
 					// Check max.compaction.lag.ms
 					maxLagMs := int64(9223372036854775807) // math.MaxInt64
 					if v, ok := td.Configs["max.compaction.lag.ms"]; ok {
@@ -1376,7 +1378,6 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		func() { bestPD.CompactionMu.Lock() },
 		func() { bestPD.CompactionMu.Unlock() },
 	)
-
 	if err != nil {
 		b.logger.Warn("compaction failed",
 			"topic", bestTD.Name, "partition", bestPD.Index, "err", err)

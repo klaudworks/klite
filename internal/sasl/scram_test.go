@@ -240,7 +240,7 @@ func buildClientFinalForTest(t *testing.T, mechanism, password string, c0 ScramC
 		} else if strings.HasPrefix(p, "s=") {
 			salt64 = p[2:]
 		} else if strings.HasPrefix(p, "i=") {
-			fmt.Sscanf(p[2:], "%d", &iterations)
+			_, _ = fmt.Sscanf(p[2:], "%d", &iterations)
 		}
 	}
 

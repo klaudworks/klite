@@ -16,7 +16,7 @@ func TestConnReaderReadFrame(t *testing.T) {
 	// Build a frame: 4-byte size prefix + body
 	body := []byte("hello world")
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, int32(len(body)))
+	_ = binary.Write(&buf, binary.BigEndian, int32(len(body)))
 	buf.Write(body)
 
 	cr := &connReader{
@@ -40,7 +40,7 @@ func TestConnReaderReadFrameReusesBuffer(t *testing.T) {
 	// Write two frames
 	var buf bytes.Buffer
 	writeFrame := func(data []byte) {
-		binary.Write(&buf, binary.BigEndian, int32(len(data)))
+		_ = binary.Write(&buf, binary.BigEndian, int32(len(data)))
 		buf.Write(data)
 	}
 	writeFrame([]byte("first"))
@@ -72,7 +72,7 @@ func TestConnReaderInvalidFrameSize(t *testing.T) {
 
 	// Frame with size > maxFrameSize
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, int32(maxFrameSize+1))
+	_ = binary.Write(&buf, binary.BigEndian, int32(maxFrameSize+1))
 
 	cr := &connReader{
 		br: newBufioReader(&buf),
@@ -89,7 +89,7 @@ func TestConnReaderTruncatedFrame(t *testing.T) {
 
 	// Frame says 100 bytes but only has 5
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, int32(100))
+	_ = binary.Write(&buf, binary.BigEndian, int32(100))
 	buf.Write([]byte("short"))
 
 	cr := &connReader{
@@ -160,7 +160,7 @@ func TestHandlerRegistryBasic(t *testing.T) {
 		t.Fatal("expected non-nil handler after registration")
 	}
 
-	h(nil)
+	_, _ = h(nil)
 	if !called {
 		t.Fatal("handler was not called")
 	}

@@ -314,7 +314,7 @@ func (cc *clientConn) sendResp(resp clientResp) {
 // writeLoop receives responses from handler goroutines, reorders them by
 // sequence number, and writes them to the connection in request order.
 func (cc *clientConn) writeLoop() {
-	defer cc.conn.Close()
+	defer cc.conn.Close() //nolint:errcheck // best-effort close
 
 	var (
 		nextSeq uint32

@@ -50,7 +50,7 @@ func TestHealthEndpoints(t *testing.T) {
 		t.Fatal("GET /livez:", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("/livez: got status %d, want 200", resp.StatusCode)
 	}
@@ -64,7 +64,7 @@ func TestHealthEndpoints(t *testing.T) {
 		t.Fatal("GET /readyz:", err)
 	}
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("/readyz: got status %d, want 200", resp.StatusCode)
 	}
@@ -100,8 +100,8 @@ func TestReadyzBeforeReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := &http.Server{Handler: mux}
-	go srv.Serve(ln)
-	defer srv.Close()
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get("http://" + ln.Addr().String() + "/readyz")
@@ -109,7 +109,7 @@ func TestReadyzBeforeReady(t *testing.T) {
 		t.Fatal("GET /readyz:", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz before ready: got status %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)

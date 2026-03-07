@@ -81,7 +81,7 @@ func NewLog(cfg LogConfig) (*Log, error) {
 
 	stat, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("stat metadata.log: %w", err)
 	}
 
@@ -123,7 +123,7 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 	frameSize := 4 + 4 + len(entryPayload)
 	frame := make([]byte, frameSize)
 
-	// Length = crc(4) + payload
+	// Length covers CRC (4 bytes) plus payload
 	binary.BigEndian.PutUint32(frame[0:4], uint32(4+len(entryPayload)))
 
 	// CRC over payload
@@ -166,7 +166,7 @@ func (l *Log) Replay() (int, error) {
 		}
 		return 0, fmt.Errorf("open metadata.log for replay: %w", err)
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck // best-effort close
 
 	count := 0
 	_, scanErr := wal.ScanFramedEntries(f, func(payload []byte) bool {
@@ -357,8 +357,8 @@ func (l *Log) compactLocked() {
 		n, err := tmpFile.Write(frame)
 		if err != nil {
 			l.logger.Error("compaction: write entry", "err", err)
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 			return
 		}
 		newSize += int64(n)
@@ -367,14 +367,14 @@ func (l *Log) compactLocked() {
 	// Fsync the tmp file
 	if err := tmpFile.Sync(); err != nil {
 		l.logger.Error("compaction: fsync tmp", "err", err)
-		tmpFile.Close()
-		os.Remove(tmpPath)
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 
 	// Close current file before rename
-	l.file.Close()
+	_ = l.file.Close()
 
 	// Atomic rename
 	if err := os.Rename(tmpPath, l.path); err != nil {
@@ -387,8 +387,8 @@ func (l *Log) compactLocked() {
 	// Fsync directory
 	dir, err := os.Open(l.dir)
 	if err == nil {
-		dir.Sync()
-		dir.Close()
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 
 	// Reopen the compacted file

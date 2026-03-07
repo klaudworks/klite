@@ -294,7 +294,7 @@ func TestCompactionNilKeyRetained(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key == nil {
 					nullKeyCount++
 				}
@@ -363,7 +363,7 @@ func TestCompactionEmptyKeyDedup(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && len(r.Key) == 0 {
 					emptyKeyRecords = append(emptyKeyRecords, string(r.Value))
 				}
@@ -433,7 +433,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, _ := ParseBatchHeaderFromRaw(batchRaw)
 			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && string(r.Key) == "A" && r.Value == nil {
 					tombstoneFound = true
 				}
@@ -492,7 +492,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, _ := ParseBatchHeaderFromRaw(batchRaw)
 			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && string(r.Key) == "A" && r.Value == nil {
 					tombstoneFound = true
 				}
@@ -622,7 +622,7 @@ func TestCompactionPreservesOrder(t *testing.T) {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, _ := ParseBatchHeaderFromRaw(batchRaw)
 			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					records = append(records, keyOff{
 						key:    string(r.Key),
@@ -761,7 +761,7 @@ func TestCompactionSparseOffsets(t *testing.T) {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, _ := ParseBatchHeaderFromRaw(batchRaw)
 			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				recordCount++
 				return true
 			})
@@ -1162,7 +1162,7 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 					require.NoError(t, err)
 					decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 					require.NoError(t, err, "decompression should work after compaction")
-					IterateRecords(decompressed, func(r Record) bool {
+					_ = IterateRecords(decompressed, func(r Record) bool {
 						if r.Key != nil {
 							recordKeys = append(recordKeys, string(r.Key))
 						}
@@ -1230,7 +1230,7 @@ func TestCompactionIdempotent(t *testing.T) {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, _ := ParseBatchHeaderFromRaw(batchRaw)
 			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					keys1 = append(keys1, string(r.Key))
 				}
@@ -1255,7 +1255,7 @@ func TestCompactionIdempotent(t *testing.T) {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, _ := ParseBatchHeaderFromRaw(batchRaw)
 			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
-			IterateRecords(decompressed, func(r Record) bool {
+			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					keys2 = append(keys2, string(r.Key))
 				}

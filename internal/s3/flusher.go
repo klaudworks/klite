@@ -267,8 +267,8 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 	var errMu sync.Mutex
 	var firstErr error
 
-	for _, job := range jobs {
-		job := job
+	for i := range jobs {
+		job := jobs[i]
 
 		wg.Add(1)
 		sem <- struct{}{}

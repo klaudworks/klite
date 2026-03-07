@@ -64,7 +64,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		if s.connCount.Load() >= s.maxConns {
 			s.logger.Warn("connection limit reached, rejecting",
 				"remote", conn.RemoteAddr(), "limit", s.maxConns)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 
