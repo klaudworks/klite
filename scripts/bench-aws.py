@@ -374,10 +374,11 @@ def run_bench(
     partitions: Annotated[int, typer.Option(help="Partition count")] = 6,
     num_records: Annotated[int, typer.Option(help="Measured records to produce (warmup is extra)")] = 360_000_000,
     record_size: Annotated[int, typer.Option(help="Bytes per record")] = 1024,
-    producers: Annotated[int, typer.Option(help="Producer count")] = 4,
-    consumers: Annotated[int, typer.Option(help="Consumer count")] = 4,
+    producers: Annotated[int, typer.Option(help="Producer count")] = 6,
+    consumers: Annotated[int, typer.Option(help="Consumer count")] = 6,
     acks: Annotated[int, typer.Option(help="Required acks: -1, 0, 1")] = 1,
     throughput: Annotated[int, typer.Option(help="Records/sec cap (-1 = unlimited)")] = 100_000,
+    max_buffered_records: Annotated[int, typer.Option(help="Max records buffered in client (backpressure)")] = 2048,
     warmup_records: Annotated[int, typer.Option(help="Warmup records (excluded from stats)")] = 50_000,
     reporting_interval: Annotated[int, typer.Option(help="Report interval in ms")] = 60_000,
     label: Annotated[str, typer.Option(help="Label appended to output filename")] = "",
@@ -404,7 +405,7 @@ def run_bench(
     console.print(f"\n[bold]Benchmark run {run_id}:[/]")
     console.print(f"  mode={mode}  topic={topic}  partitions={partitions}")
     console.print(f"  records={num_records:,}  size={record_size}B  throughput={throughput:,} rec/s")
-    console.print(f"  producers={producers}  consumers={consumers}  acks={acks}")
+    console.print(f"  producers={producers}  consumers={consumers}  acks={acks}  max-buffered={max_buffered_records}")
     console.print(f"  warmup={warmup_records:,}  interval={reporting_interval}ms")
     if label:
         console.print(f"  label={label}")
@@ -468,6 +469,7 @@ def run_bench(
     if mode in ("produce-consume", "produce"):
         bench_flags += f" -producers {producers}"
         bench_flags += f" -batch-max-bytes 1048576 -linger-ms 5"
+        bench_flags += f" -max-buffered-records {max_buffered_records}"
     if mode in ("produce-consume", "consume"):
         bench_flags += f" -consumers {consumers}"
 
