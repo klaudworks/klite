@@ -65,7 +65,7 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 			}
 			pd.Unlock()
 			pd.ReleaseSpareChunk(spare)
-			pd.NotifyWaiters()
+			pd.NotifyWaiters(nil)
 		}
 
 		// Apply offset commits if committing

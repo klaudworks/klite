@@ -32,24 +32,25 @@ import (
 
 // Broker is the top-level klite broker.
 type Broker struct {
-	cfg        Config
-	listener   net.Listener
-	clusterID  string
-	state      *cluster.State
-	shutdownCh chan struct{} // closed on shutdown to wake all blockers
-	done       chan struct{} // closed when Run() returns
-	ready      chan struct{} // closed when initialization is complete
-	logger     *slog.Logger
-	server     *server.Server
-	handlers   *server.HandlerRegistry
-	walWriter  *wal.Writer      // nil if WAL disabled
-	walIndex   *wal.Index       // nil if WAL disabled
-	chunkPool  *chunk.Pool      // nil if WAL disabled
-	metaLog    *metadata.Log    // nil if metadata persistence disabled
-	s3Client   *s3store.Client  // nil if S3 disabled
-	s3Reader   *s3store.Reader  // nil if S3 disabled
-	s3Flusher  *s3store.Flusher // nil if S3 disabled
-	saslStore  *sasl.Store      // nil if SASL disabled
+	cfg          Config
+	listener     net.Listener
+	clusterID    string
+	state        *cluster.State
+	shutdownCh   chan struct{} // closed on shutdown to wake all blockers
+	done         chan struct{} // closed when Run() returns
+	ready        chan struct{} // closed when initialization is complete
+	logger       *slog.Logger
+	server       *server.Server
+	handlers     *server.HandlerRegistry
+	walWriter    *wal.Writer      // nil if WAL disabled
+	walIndex     *wal.Index       // nil if WAL disabled
+	chunkPool    *chunk.Pool      // nil if WAL disabled
+	metaLog      *metadata.Log    // nil if metadata persistence disabled
+	s3Client     *s3store.Client  // nil if S3 disabled
+	s3Reader     *s3store.Reader  // nil if S3 disabled
+	s3Flusher    *s3store.Flusher // nil if S3 disabled
+	saslStore    *sasl.Store      // nil if SASL disabled
+	fetchMetrics *cluster.FetchMetrics
 
 	mu   sync.Mutex
 	quit bool
@@ -72,14 +73,15 @@ func New(cfg Config) *Broker {
 	state.SetLogger(logger)
 
 	b := &Broker{
-		cfg:        cfg,
-		state:      state,
-		shutdownCh: shutdownCh,
-		done:       make(chan struct{}),
-		ready:      make(chan struct{}),
-		logger:     logger,
-		server:     srv,
-		handlers:   handlers,
+		cfg:          cfg,
+		state:        state,
+		shutdownCh:   shutdownCh,
+		done:         make(chan struct{}),
+		ready:        make(chan struct{}),
+		logger:       logger,
+		server:       srv,
+		handlers:     handlers,
+		fetchMetrics: &cluster.FetchMetrics{},
 	}
 
 	// Initialize SASL if enabled
@@ -132,8 +134,8 @@ func (b *Broker) registerBaseHandlers() {
 // registerRuntimeHandlers wires up handlers that depend on runtime state
 // (cluster ID, advertised address, etc.). Must be called after initialization.
 func (b *Broker) registerRuntimeHandlers(advAddr string) {
-	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter))
-	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh))
+	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter, b.fetchMetrics))
+	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh, b.fetchMetrics))
 	b.handlers.Register(2, handler.HandleListOffsets(b.state))
 	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
 		NodeID:         b.cfg.NodeID,
@@ -293,6 +295,9 @@ func (b *Broker) Run(ctx context.Context) error {
 		go b.compactionLoop(ctx)
 		go b.s3GCLoop(ctx)
 	}
+
+	// 8d. Start fetch metrics reporter
+	go b.fetchMetricsLoop(ctx)
 
 	// 9. Serve connections (blocks until listener closed)
 	errCh := make(chan error, 1)
@@ -1392,6 +1397,51 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		b.logger.Info("compaction complete",
 			"topic", bestTD.Name, "partition", bestPD.Index,
 			"cleaned_up_to", newWatermark)
+	}
+}
+
+// fetchMetricsLoop logs fetch long-poll metrics every 5 seconds.
+// Only emits a log line when there is fetch activity in the interval.
+func (b *Broker) fetchMetricsLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-b.shutdownCh:
+			return
+		case <-ticker.C:
+			s := b.fetchMetrics.SnapshotAndReset()
+			if s.IsZero() {
+				continue
+			}
+			b.logger.Info("fetch metrics",
+				"immediate", s.ImmediateData,
+				"longpoll", s.LongPollEntered,
+				"woken_by_produce", s.WokenByNotify,
+				"woken_by_timer", s.WokenByTimer,
+				"wait_<1ms", s.WaitUnder1ms,
+				"wait_1-5ms", s.WaitUnder5ms,
+				"wait_5-20ms", s.WaitUnder20ms,
+				"wait_20-100ms", s.WaitUnder100ms,
+				"wait_>100ms", s.WaitOver100ms,
+				"handler_<1ms", s.HandlerUnder1ms,
+				"handler_1-5ms", s.HandlerUnder5ms,
+				"handler_5-20ms", s.HandlerUnder20ms,
+				"handler_20-100ms", s.HandlerUnder100ms,
+				"handler_>100ms", s.HandlerOver100ms,
+				"reg_on_0", s.RegisteredOnZero,
+				"reg_on_1", s.RegisteredOnOne,
+				"reg_on_2+", s.RegisteredOnMany,
+				"zero_reason_nil_pd", s.SkippedNilPD,
+				"zero_reason_error", s.SkippedError,
+				"err_below_start", s.ErrBelowStart,
+				"err_above_hw", s.ErrAboveHW,
+				"notify_calls", s.NotifyCalls,
+				"waiters_found", s.NotifyWaitersHit,
+			)
+		}
 	}
 }
 

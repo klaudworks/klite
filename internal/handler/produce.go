@@ -19,7 +19,7 @@ import (
 // Uses the durable WAL path:
 //
 //	reserveOffset -> WAL append -> fsync -> commitBatch
-func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
+func HandleProduce(state *cluster.State, walWriter *wal.Writer, fm *cluster.FetchMetrics) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ProduceRequest)
 
@@ -216,7 +216,7 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 			pc := &pendingCommits[i]
 			sp := &resp.Topics[pc.topicIdx].Partitions[pc.partIdx]
 
-			if walErr := produceCommitWAL(pc.pending); walErr != nil {
+			if walErr := produceCommitWAL(pc.pending, fm); walErr != nil {
 				slog.Error("WAL write failed for produce",
 					"topic", pc.topic, "partition", pc.partition,
 					"baseOffset", pc.pending.baseOffset, "err", walErr)
@@ -311,7 +311,7 @@ func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, m
 // produceCommitWAL is phase 2: wait for WAL fsync, then write to the chunk
 // pool and commit (advance HW). If the WAL write failed, skip the offsets
 // so the partition doesn't stall. Returns non-nil error on WAL failure.
-func produceCommitWAL(p pendingWAL) error {
+func produceCommitWAL(p pendingWAL, fm *cluster.FetchMetrics) error {
 	walErr := <-p.errCh
 
 	if walErr != nil {
@@ -345,7 +345,7 @@ func produceCommitWAL(p pendingWAL) error {
 	p.pd.Unlock()
 	p.pd.ReleaseSpareChunk(spare)
 
-	p.pd.NotifyWaiters()
+	p.pd.NotifyWaiters(fm)
 	return nil
 }
 

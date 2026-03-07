@@ -16,8 +16,9 @@ import (
 // PartitionMaxBytes), KIP-74 (first batch always returned even if oversized),
 // fetch sessions (FETCH_SESSION_ID_NOT_FOUND for non-zero), and TopicID
 // resolution for v13+.
-func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handler {
+func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, fm *cluster.FetchMetrics) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
+		handlerStart := time.Now()
 		r := req.(*kmsg.FetchRequest)
 		resp := r.ResponseKind().(*kmsg.FetchResponse)
 
@@ -105,32 +106,32 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 				pd := info.pd
 				rp := r.Topics[info.topicIdx].Partitions[info.partIdx]
 
-				// Read metadata under RLock, then release before I/O.
-				pd.RLock()
-				hw := pd.HW()
-				logStart := pd.LogStart()
-				lso := pd.LSO()
-
-				// Validate fetch offset
-				fetchOffset := rp.FetchOffset
-				if fetchOffset < logStart || fetchOffset > hw {
-					pd.RUnlock()
-					sp.ErrorCode = kerr.OffsetOutOfRange.Code
-					sp.HighWatermark = hw
-					sp.LastStableOffset = lso
-					sp.LogStartOffset = logStart
-					results[i] = partResult{sp: sp}
-					continue
-				}
-				pd.RUnlock()
-
-				// Fetch batches (FetchFrom manages its own locking;
-				// WAL pread and S3 HTTP happen without holding pd.mu).
 				maxBytes := rp.PartitionMaxBytes
 				if maxBytes <= 0 {
 					maxBytes = 1024 * 1024 // 1MB default
 				}
-				batches := pd.FetchFrom(fetchOffset, maxBytes)
+
+				// Fetch validates the offset and reads chunks under a single
+				// RLock, so the HW used for validation is the same HW used
+				// for the visibility gate. Cold reads (WAL/S3) happen after
+				// the lock is released.
+				fr := pd.Fetch(rp.FetchOffset, maxBytes)
+
+				if fr.Err != 0 {
+					if rp.FetchOffset < fr.LogStart {
+						fm.ErrBelowStart.Add(1)
+					} else {
+						fm.ErrAboveHW.Add(1)
+					}
+					sp.ErrorCode = fr.Err
+					sp.HighWatermark = fr.HW
+					sp.LastStableOffset = fr.LSO
+					sp.LogStartOffset = fr.LogStart
+					results[i] = partResult{sp: sp}
+					continue
+				}
+
+				batches := fr.Batches
 
 				// For READ_COMMITTED (IsolationLevel=1), filter and cap at LSO
 				readCommitted := r.IsolationLevel == 1
@@ -139,7 +140,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 					// Filter out batches at or beyond LSO
 					var filtered []cluster.StoredBatch
 					for _, b := range batches {
-						if b.BaseOffset >= lso {
+						if b.BaseOffset >= fr.LSO {
 							break
 						}
 						filtered = append(filtered, b)
@@ -151,14 +152,14 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 						pd.RLock()
 						lastBatch := batches[len(batches)-1]
 						lastOffset := lastBatch.BaseOffset + int64(lastBatch.LastOffsetDelta) + 1
-						abortedTxns = pd.AbortedTxnsInRange(fetchOffset, lastOffset)
+						abortedTxns = pd.AbortedTxnsInRange(rp.FetchOffset, lastOffset)
 						pd.RUnlock()
 					}
 				}
 
-				sp.HighWatermark = hw
-				sp.LastStableOffset = lso
-				sp.LogStartOffset = logStart
+				sp.HighWatermark = fr.HW
+				sp.LastStableOffset = fr.LSO
+				sp.LogStartOffset = fr.LogStart
 
 				// Add aborted transaction info to response
 				if readCommitted {
@@ -194,26 +195,64 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 
 		// Long-polling: if we have less than MinBytes and MaxWaitMs > 0, wait
 		// for new data or timeout.
-		if int32(totalBytes) < r.MinBytes && r.MaxWaitMillis > 0 {
+		needsLongPoll := int32(totalBytes) < r.MinBytes && r.MaxWaitMillis > 0
+		if !needsLongPoll {
+			fm.ImmediateData.Add(1)
+		} else {
+			fm.LongPollEntered.Add(1)
+
 			// Create a shared waiter and register on partitions that had no data
 			w := cluster.NewFetchWaiter()
+			var regCount int
+			var skippedNilPD, skippedError int
 			for i, info := range allParts {
-				if info.pd != nil && !results[i].hasData && results[i].sp.ErrorCode == 0 {
+				if info.pd == nil {
+					skippedNilPD++
+					continue
+				}
+				if results[i].sp.ErrorCode != 0 {
+					skippedError++
+					continue
+				}
+				if !results[i].hasData {
 					info.pd.RegisterWaiter(w)
+					regCount++
 				}
 			}
-
-			// Block until woken, timeout, or shutdown
-			timer := time.NewTimer(time.Duration(r.MaxWaitMillis) * time.Millisecond)
-			select {
-			case <-w.Ch():
-				// Woken by produce — re-fetch all partitions below
-			case <-timer.C:
-				// Timeout — return whatever we had from the initial fetch
-			case <-shutdownCh:
-				// Broker shutting down
+			if regCount == 0 {
+				if skippedNilPD > 0 {
+					fm.SkippedNilPD.Add(1)
+				}
+				if skippedError > 0 {
+					fm.SkippedError.Add(1)
+				}
 			}
-			timer.Stop()
+			switch regCount {
+			case 0:
+				fm.RegisteredOnZero.Add(1)
+			case 1:
+				fm.RegisteredOnOne.Add(1)
+			default:
+				fm.RegisteredOnMany.Add(1)
+			}
+
+			// If no partitions were registered, skip the wait entirely —
+			// nothing can wake us, so we'd always hit the timer.
+			if regCount > 0 {
+				// Block until woken, timeout, or shutdown
+				waitStart := time.Now()
+				timer := time.NewTimer(time.Duration(r.MaxWaitMillis) * time.Millisecond)
+				select {
+				case <-w.Ch():
+					fm.WokenByNotify.Add(1)
+				case <-timer.C:
+					fm.WokenByTimer.Add(1)
+				case <-shutdownCh:
+					fm.WokenByShutdown.Add(1)
+				}
+				timer.Stop()
+				fm.RecordWait(time.Since(waitStart).Milliseconds())
+			}
 
 			// Re-fetch ALL partitions (not just the one that woke us)
 			results, _ = doFetch()
@@ -259,6 +298,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 			resp.Topics[tidx].Partitions = append(resp.Topics[tidx].Partitions, results[i].sp)
 		}
 
+		fm.RecordHandlerDuration(time.Since(handlerStart).Milliseconds())
 		return resp, nil
 	}
 }
