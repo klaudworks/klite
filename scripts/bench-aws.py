@@ -249,13 +249,18 @@ def up(
     else:
         ok("already initialized")
 
-    # 2. Terraform apply
-    step(2, total, "Applying infrastructure...")
+    # 2. Terraform plan + confirm + apply
+    step(2, total, "Planning infrastructure changes...")
     run_local(
-        ["terraform", "apply", "-var-file=bench.tfvars",
-         f"-var=ssh_public_key={pubkey}", "-auto-approve"],
+        ["terraform", "plan", "-var-file=bench.tfvars",
+         f"-var=ssh_public_key={pubkey}", "-out=tfplan"],
         cwd=TF_DIR,
     )
+    if not typer.confirm("\nApply this plan?"):
+        console.print("[yellow]Aborted.[/]")
+        raise typer.Exit(0)
+    run_local(["terraform", "apply", "tfplan"], cwd=TF_DIR)
+    (TF_DIR / "tfplan").unlink(missing_ok=True)
     ok("infrastructure provisioned")
 
     # 3. Read outputs and wait for instances
@@ -544,14 +549,19 @@ def down(
 ) -> None:
     """Tear down all AWS infrastructure."""
     pubkey = get_ssh_pubkey(ssh_key)
-    console.print("[cyan]Destroying infrastructure...[/]")
+    console.print("[cyan]Planning destroy...[/]")
     if not TFVARS.exists():
         die(f"Missing {TFVARS}")
     run_local(
-        ["terraform", "destroy", "-var-file=bench.tfvars",
-         f"-var=ssh_public_key={pubkey}", "-auto-approve"],
+        ["terraform", "plan", "-destroy", "-var-file=bench.tfvars",
+         f"-var=ssh_public_key={pubkey}", "-out=tfplan"],
         cwd=TF_DIR,
     )
+    if not typer.confirm("\nDestroy these resources?"):
+        console.print("[yellow]Aborted.[/]")
+        raise typer.Exit(0)
+    run_local(["terraform", "apply", "tfplan"], cwd=TF_DIR)
+    (TF_DIR / "tfplan").unlink(missing_ok=True)
     console.print("[green bold]Infrastructure destroyed.[/]")
 
 

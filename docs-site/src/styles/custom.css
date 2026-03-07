@@ -72,6 +72,15 @@
 	/* base02 */
 }
 
+/* Hero title in accent orange to match the site title in the nav bar */
+.hero h1 {
+	color: var(--sl-color-accent) !important;
+}
+
+:root[data-theme='dark'] .hero h1 {
+	color: var(--sl-color-text-accent) !important;
+}
+
 /* Hero Section Refinements */
 @media (min-width: 50rem) {
 	.hero {

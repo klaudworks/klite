@@ -173,7 +173,7 @@ serviceAccount:
 
 persistence:
   ## @param persistence.enabled Enable persistent storage for the data directory
-  enabled: false
+  enabled: true
   ## @param persistence.storageClass StorageClass (empty = cluster default)
   storageClass: ""
   ## @param persistence.accessModes PVC access modes
