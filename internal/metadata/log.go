@@ -53,6 +53,16 @@ type Log struct {
 
 	// Snapshot provider for compaction (set by broker during init)
 	snapshotFn func() [][]byte
+
+	// replicateHook is called from appendLocked after a successful local
+	// write, passing the complete framed entry bytes ([4B length][4B CRC][payload]).
+	// Must not block or acquire metadata.Log.mu. Set before any writes,
+	// cleared after writes are drained. Fire-and-forget.
+	replicateHook func(frame []byte)
+
+	// compactHook is called at the end of compactLocked after the rename
+	// succeeds. Receives the compacted file contents. Must not block.
+	compactHook func(data []byte)
 }
 
 type LogConfig struct {
@@ -95,6 +105,20 @@ func (l *Log) SetSnapshotFn(fn func() [][]byte) {
 	l.snapshotFn = fn
 }
 
+// SetReplicateHook sets the replication hook called after each successful
+// local append. Must be called before any writes (during broker init) or
+// after writes are drained (during demotion). Not safe for concurrent use
+// with Append/AppendSync.
+func (l *Log) SetReplicateHook(fn func(frame []byte)) {
+	l.replicateHook = fn
+}
+
+// SetCompactHook sets the compaction hook called after a successful compaction
+// rename. The hook receives the compacted file contents. Must not block.
+func (l *Log) SetCompactHook(fn func(data []byte)) {
+	l.compactHook = fn
+}
+
 // Append writes a serialized entry (buffered, no fsync).
 func (l *Log) Append(entryPayload []byte) error {
 	l.mu.Lock()
@@ -129,6 +153,10 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 		if err := l.file.Sync(); err != nil {
 			return fmt.Errorf("fsync metadata.log: %w", err)
 		}
+	}
+
+	if l.replicateHook != nil {
+		l.replicateHook(frame)
 	}
 
 	count := l.appendCount.Add(1)
@@ -377,6 +405,15 @@ func (l *Log) compactLocked() {
 		"new_size", newSize,
 		"entries", len(entries),
 	)
+
+	if l.compactHook != nil {
+		data, err := os.ReadFile(l.path)
+		if err != nil {
+			l.logger.Error("compaction: read file for hook", "err", err)
+		} else {
+			l.compactHook(data)
+		}
+	}
 }
 
 func (l *Log) Compact() {
@@ -407,4 +444,95 @@ func (l *Log) Close() error {
 
 func (l *Log) Path() string {
 	return l.path
+}
+
+// ReplayEntry processes a single framed metadata entry: [4B length][4B CRC][payload].
+// It validates the CRC, parses the entry type, and dispatches to the appropriate callback.
+func (l *Log) ReplayEntry(frame []byte) error {
+	if len(frame) < 4+4+1 {
+		return fmt.Errorf("metadata frame too short: %d bytes", len(frame))
+	}
+
+	// The frame has the same structure as what ScanFramedEntries yields:
+	// [4B CRC][payload] — the 4B length prefix has already been consumed by
+	// the scanner. But when called from replication, we receive the complete
+	// frame: [4B length][4B CRC][payload].
+	//
+	// Detect which format: if first 4 bytes encode a plausible length matching
+	// the frame, it's [length][CRC][payload]. Otherwise it's [CRC][payload].
+	payload := frame
+	declaredLen := binary.BigEndian.Uint32(frame[0:4])
+	if int(declaredLen) == len(frame)-4 {
+		// Full frame: [4B length][CRC + payload]
+		payload = frame[4:]
+	}
+
+	if len(payload) < 4+1 {
+		return fmt.Errorf("metadata payload too short: %d bytes", len(payload))
+	}
+
+	storedCRC := binary.BigEndian.Uint32(payload[0:4])
+	actualCRC := crc32.Checksum(payload[4:], crc32cTable)
+	if storedCRC != actualCRC {
+		return fmt.Errorf("metadata entry CRC mismatch")
+	}
+
+	entryType := payload[4]
+	entryData := payload[5:]
+
+	return l.dispatchEntry(entryType, entryData)
+}
+
+// AppendRaw writes raw framed bytes directly to the metadata.log file.
+// Used by the standby receiver to replicate metadata entries from the primary.
+func (l *Log) AppendRaw(frame []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	n, err := l.file.Write(frame)
+	if err != nil {
+		return fmt.Errorf("write raw metadata entry: %w", err)
+	}
+	l.size += int64(n)
+	return nil
+}
+
+// ReplaceFromSnapshot replaces the metadata.log file with snapshot contents
+// and replays it to rebuild in-memory state.
+func (l *Log) ReplaceFromSnapshot(data []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Close current file
+	if l.file != nil {
+		_ = l.file.Close()
+	}
+
+	// Write snapshot to file
+	if err := os.WriteFile(l.path, data, 0o644); err != nil {
+		return fmt.Errorf("write snapshot to metadata.log: %w", err)
+	}
+
+	// Fsync the directory to make the new file entry durable
+	dir, err := os.Open(l.dir)
+	if err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+
+	// Reopen for appending
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("reopen metadata.log after snapshot: %w", err)
+	}
+	l.file = f
+	l.size = int64(len(data))
+
+	// Replay the snapshot (scan and dispatch all entries)
+	// We unlock mu temporarily since Replay opens its own file handle
+	l.mu.Unlock()
+	_, replayErr := l.Replay()
+	l.mu.Lock()
+
+	return replayErr
 }
