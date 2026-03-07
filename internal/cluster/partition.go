@@ -2,14 +2,21 @@ package cluster
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/wal"
 )
+
+var fetchAboveHWLogCount atomic.Int64
+
+// ErrCodeOffsetOutOfRange is the Kafka error code for OFFSET_OUT_OF_RANGE.
+const ErrCodeOffsetOutOfRange int16 = 1
 
 // StoredBatch holds raw bytes and metadata extracted from the batch header.
 // Used in ring buffers, WAL reads, and S3 reads.
@@ -386,12 +393,18 @@ func (pd *PartData) updateMaxTimestamp(baseOffset int64, lastOffsetDelta int32, 
 }
 
 // NotifyWaiters wakes all registered fetch waiters.
+// If fm is non-nil, increments the notify counters.
 // Caller must NOT hold pd.mu (takes pd.waiterMu internally).
-func (pd *PartData) NotifyWaiters() {
+func (pd *PartData) NotifyWaiters(fm *FetchMetrics) {
 	pd.waiterMu.Lock()
 	waiters := pd.waiters
 	pd.waiters = nil
 	pd.waiterMu.Unlock()
+
+	if fm != nil {
+		fm.NotifyCalls.Add(1)
+		fm.NotifyWaitersHit.Add(int64(len(waiters)))
+	}
 
 	for _, w := range waiters {
 		w.CloseOnce() // safe even if another partition already closed it
@@ -405,6 +418,82 @@ func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 	pd.waiterMu.Lock()
 	pd.waiters = append(pd.waiters, w)
 	pd.waiterMu.Unlock()
+}
+
+// FetchResponse is the result of a validated fetch on a single partition.
+type FetchResponse struct {
+	HW       int64
+	LogStart int64
+	LSO      int64
+	Batches  []StoredBatch
+	Err      int16 // non-zero = Kafka error code; batches will be nil
+}
+
+// Fetch validates the fetch offset and returns batches in one atomic operation.
+// Offset validation and the chunk-pool read share a single RLock acquisition,
+// so the HW used for validation is the same HW used for the visibility gate.
+// Cold-path reads (WAL, S3) happen after releasing the lock.
+// Caller must NOT hold pd.mu.
+func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
+	pd.mu.RLock()
+	hw := pd.hw
+	logStart := pd.logStart
+	lso := pd.LSO()
+
+	if fetchOffset < logStart || fetchOffset > hw {
+		if fetchOffset > hw {
+			cnt := fetchAboveHWLogCount.Add(1)
+			if cnt <= 5 || cnt%500 == 0 {
+				slog.Warn("Fetch: offset above HW (under RLock)",
+					"partition", pd.Index,
+					"fetchOffset", fetchOffset,
+					"hw", hw,
+					"nextReserve", pd.nextReserve,
+					"nextCommit", pd.nextCommit,
+					"logStart", logStart)
+			}
+		}
+		pd.mu.RUnlock()
+		return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Err: ErrCodeOffsetOutOfRange}
+	}
+
+	if fetchOffset == hw {
+		// Caught up — no data to return but not an error.
+		pd.mu.RUnlock()
+		return FetchResponse{HW: hw, LogStart: logStart, LSO: lso}
+	}
+
+	chunkBatches := pd.fetchFromChunks(fetchOffset, maxBytes, hw)
+	if len(chunkBatches) > 0 {
+		first := chunkBatches[0]
+		if first.BaseOffset <= fetchOffset || first.BaseOffset == pd.logStart {
+			pd.mu.RUnlock()
+			return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: chunkBatches}
+		}
+	}
+
+	// Capture immutable references needed for cold reads before releasing lock.
+	topicID := pd.TopicID
+	partIdx := pd.Index
+	topic := pd.Topic
+	walIdx := pd.walIndex
+	walW := pd.walWriter
+	s3Fetch := pd.s3Fetch
+	pd.mu.RUnlock()
+
+	// Tier 2 & 3: WAL and S3 reads (no lock held)
+	if coldBatches := fetchFromCold(fetchOffset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch); len(coldBatches) > 0 {
+		// Apply the same HW visibility gate as the chunk path: drop any
+		// batch whose offsets extend beyond the HW we captured under RLock.
+		coldBatches = filterBatchesByHW(coldBatches, hw)
+		if len(coldBatches) > 0 {
+			return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: coldBatches}
+		}
+	}
+
+	// Cold storage has nothing. If chunks had data at a higher offset (gap),
+	// return it so the consumer skips past the gap instead of getting stuck.
+	return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: chunkBatches}
 }
 
 // FetchFrom collects batches starting at offset, up to maxBytes.
@@ -505,6 +594,18 @@ func readFromS3(s3Fetch S3Fetcher, topic string, topicID [16]byte, partition int
 		})
 	}
 	return result
+}
+
+// filterBatchesByHW drops batches whose offsets extend beyond hw.
+func filterBatchesByHW(batches []StoredBatch, hw int64) []StoredBatch {
+	n := 0
+	for _, b := range batches {
+		if b.BaseOffset+int64(b.LastOffsetDelta)+1 > hw {
+			break
+		}
+		n++
+	}
+	return batches[:n]
 }
 
 // fetchFromCold implements the WAL + S3 tiers of the read cascade.
@@ -829,8 +930,8 @@ func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chun
 }
 
 // fetchFromChunks scans sealed + current chunks for batches matching
-// the requested offset range. Only returns batches whose BaseOffset < hw
-// (HW visibility gate — prevents exposing uncommitted data).
+// the requested offset range. Only returns fully committed batches
+// (BaseOffset + LastOffsetDelta + 1 <= hw).
 // Caller must hold pd.mu.RLock().
 func (pd *PartData) fetchFromChunks(offset int64, maxBytes int32, hw int64) []StoredBatch {
 	var result []StoredBatch
@@ -838,9 +939,11 @@ func (pd *PartData) fetchFromChunks(offset int64, maxBytes int32, hw int64) []St
 
 	collectFromChunk := func(c *chunk.Chunk) bool {
 		for _, b := range c.Batches {
-			// HW visibility gate: only return committed batches
-			if b.BaseOffset >= hw {
-				return false // stop — all subsequent batches are also >= hw
+			// HW visibility gate: only return fully committed batches.
+			// A batch is fully committed when all its offsets are below HW.
+			batchEnd := b.BaseOffset + int64(b.LastOffsetDelta) + 1
+			if batchEnd > hw {
+				return false // stop — this and all subsequent batches extend beyond hw
 			}
 			lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
 			if lastOffset < offset {

@@ -499,7 +499,7 @@ func TestNotifyWaiters(t *testing.T) {
 		pd.RegisterWaiter(w)
 
 		// NotifyWaiters should close the channel
-		pd.NotifyWaiters()
+		pd.NotifyWaiters(nil)
 
 		select {
 		case <-w.Ch():
@@ -520,7 +520,7 @@ func TestNotifyWaiters(t *testing.T) {
 		pd.RegisterWaiter(w2)
 		pd.RegisterWaiter(w3)
 
-		pd.NotifyWaiters()
+		pd.NotifyWaiters(nil)
 
 		for i, w := range []*FetchWaiter{w1, w2, w3} {
 			select {
@@ -536,14 +536,14 @@ func TestNotifyWaiters(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 		// Should not panic
-		pd.NotifyWaiters()
+		pd.NotifyWaiters(nil)
 	})
 
 	t.Run("new waiter after notify not woken", func(t *testing.T) {
 		t.Parallel()
 		pd := newTestPartition()
 
-		pd.NotifyWaiters() // notify with no waiters
+		pd.NotifyWaiters(nil) // notify with no waiters
 
 		w := NewFetchWaiter()
 		pd.RegisterWaiter(w)
@@ -567,7 +567,7 @@ func TestNotifyWaiters(t *testing.T) {
 		pd2.RegisterWaiter(w)
 
 		// Notifying one partition should wake the shared waiter
-		pd1.NotifyWaiters()
+		pd1.NotifyWaiters(nil)
 		select {
 		case <-w.Ch():
 			// OK
@@ -576,7 +576,7 @@ func TestNotifyWaiters(t *testing.T) {
 		}
 
 		// Notifying the second partition should not panic (sync.Once protects double-close)
-		pd2.NotifyWaiters()
+		pd2.NotifyWaiters(nil)
 	})
 }
 
@@ -1188,5 +1188,231 @@ func TestAcquireSpareChunkDoesNotHoldPartitionLock(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("AcquireSpareChunk did not unblock after pool release")
+	}
+}
+
+// TestFetchHWConsistency verifies that Fetch() never returns batches whose
+// offsets extend beyond the HW reported in the same response. This guards
+// against the TOCTOU race where a producer commits between the HW read and
+// the chunk scan, causing the consumer to advance past the advertised HW.
+func TestFetchHWConsistency(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	const batches = 5000
+	var wg sync.WaitGroup
+
+	// Writer goroutine: push batches as fast as possible.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < batches; i++ {
+			raw := makeSimpleBatch(10, int64(i))
+			meta, err := ParseBatchHeader(raw)
+			if err != nil {
+				return
+			}
+			spare := pd.AcquireSpareChunk(len(raw))
+			pd.Lock()
+			_, spare = pd.PushBatch(raw, meta, spare)
+			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
+		}
+	}()
+
+	// Reader goroutine: call Fetch() repeatedly and check the invariant.
+	wg.Add(1)
+	var violations int
+	go func() {
+		defer wg.Done()
+		fetchOffset := int64(0)
+		for fetchOffset < batches*10 {
+			fr := pd.Fetch(fetchOffset, 1024*1024)
+			if fr.Err != 0 {
+				// OffsetOutOfRange is a hard failure in this test —
+				// the writer only advances HW, never moves logStart.
+				if fr.Err == ErrCodeOffsetOutOfRange {
+					t.Errorf("unexpected OffsetOutOfRange at fetchOffset=%d hw=%d logStart=%d",
+						fetchOffset, fr.HW, fr.LogStart)
+					return
+				}
+				continue
+			}
+
+			for _, b := range fr.Batches {
+				lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+				if lastOffset >= fr.HW {
+					violations++
+					if violations <= 5 {
+						t.Errorf("batch [%d..%d] extends to offset %d but response HW=%d",
+							b.BaseOffset, lastOffset, lastOffset, fr.HW)
+					}
+				}
+			}
+
+			if len(fr.Batches) > 0 {
+				last := fr.Batches[len(fr.Batches)-1]
+				fetchOffset = last.BaseOffset + int64(last.LastOffsetDelta) + 1
+			}
+		}
+	}()
+
+	wg.Wait()
+	if violations > 0 {
+		t.Errorf("total HW consistency violations: %d", violations)
+	}
+}
+
+// TestFetchHWConsistencyTwoPhase verifies the invariant under the two-phase
+// produce path used in production (ReserveOffset → AppendToChunk → CommitBatch).
+// Between AppendToChunk and CommitBatch, the batch data is visible in the chunk
+// pool but HW has not advanced. Fetch must not return these uncommitted batches.
+func TestFetchHWConsistencyTwoPhase(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	const iterations = 5000
+	var wg sync.WaitGroup
+
+	// Writer goroutine: two-phase produce with a deliberate gap.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			raw := makeSimpleBatch(10, int64(i))
+			meta, err := ParseBatchHeader(raw)
+			if err != nil {
+				return
+			}
+			stored := make([]byte, len(raw))
+			copy(stored, raw)
+
+			spare := pd.AcquireSpareChunk(len(stored))
+
+			// Phase 1: reserve offset and append to chunk (data visible, HW not advanced)
+			pd.Lock()
+			baseOffset := pd.ReserveOffset(meta)
+			AssignOffset(stored, baseOffset)
+			spare = pd.AppendToChunk(stored, chunk.ChunkBatch{
+				BaseOffset:      baseOffset,
+				LastOffsetDelta: meta.LastOffsetDelta,
+				MaxTimestamp:    meta.MaxTimestamp,
+				NumRecords:      meta.NumRecords,
+			}, spare)
+			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
+
+			// Simulate WAL fsync delay — this is where the race window exists.
+			// The batch is in the chunk pool but HW has not advanced.
+
+			// Phase 2: commit (advance HW)
+			pd.Lock()
+			pd.CommitBatch(StoredBatch{
+				BaseOffset:      baseOffset,
+				LastOffsetDelta: meta.LastOffsetDelta,
+				RawBytes:        stored,
+				MaxTimestamp:    meta.MaxTimestamp,
+				NumRecords:      meta.NumRecords,
+			})
+			pd.Unlock()
+			pd.NotifyWaiters(nil)
+		}
+	}()
+
+	// Reader goroutine: Fetch must never return uncommitted data.
+	wg.Add(1)
+	var violations int
+	go func() {
+		defer wg.Done()
+		fetchOffset := int64(0)
+		for fetchOffset < iterations*10 {
+			fr := pd.Fetch(fetchOffset, 1024*1024)
+			if fr.Err != 0 {
+				if fr.Err == ErrCodeOffsetOutOfRange {
+					t.Errorf("unexpected OffsetOutOfRange at fetchOffset=%d hw=%d logStart=%d",
+						fetchOffset, fr.HW, fr.LogStart)
+					return
+				}
+				continue
+			}
+
+			for _, b := range fr.Batches {
+				lastOffset := b.BaseOffset + int64(b.LastOffsetDelta)
+				if lastOffset >= fr.HW {
+					violations++
+					if violations <= 5 {
+						t.Errorf("batch [%d..%d] extends to offset %d but response HW=%d",
+							b.BaseOffset, lastOffset, lastOffset, fr.HW)
+					}
+				}
+			}
+
+			if len(fr.Batches) > 0 {
+				last := fr.Batches[len(fr.Batches)-1]
+				fetchOffset = last.BaseOffset + int64(last.LastOffsetDelta) + 1
+			}
+		}
+	}()
+
+	wg.Wait()
+	if violations > 0 {
+		t.Errorf("total HW consistency violations: %d", violations)
+	}
+}
+
+// TestFetchCaughtUp verifies that Fetch at fetchOffset==HW returns no error
+// and no data (the "caught up" case).
+func TestFetchCaughtUp(t *testing.T) {
+	t.Parallel()
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 5, 1000)
+	pd.Unlock()
+
+	fr := pd.Fetch(5, 1024*1024)
+	if fr.Err != 0 {
+		t.Errorf("Fetch at HW should not error, got err=%d", fr.Err)
+	}
+	if len(fr.Batches) != 0 {
+		t.Errorf("Fetch at HW should return no batches, got %d", len(fr.Batches))
+	}
+	if fr.HW != 5 {
+		t.Errorf("HW: got %d, want 5", fr.HW)
+	}
+}
+
+// TestFetchOutOfRangeBounds verifies that Fetch returns OffsetOutOfRange
+// for offsets below logStart and above HW.
+func TestFetchOutOfRangeBounds(t *testing.T) {
+	t.Parallel()
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 5, 1000) // offsets 0-4, HW=5
+	pd.Unlock()
+
+	pd.CompactionMu.Lock()
+	_ = pd.AdvanceLogStartOffset(2, nil) // logStart=2
+	pd.CompactionMu.Unlock()
+
+	// Below logStart
+	fr := pd.Fetch(1, 1024*1024)
+	if fr.Err != ErrCodeOffsetOutOfRange {
+		t.Errorf("fetch below logStart: want err=%d, got err=%d", ErrCodeOffsetOutOfRange, fr.Err)
+	}
+
+	// Above HW
+	fr = pd.Fetch(6, 1024*1024)
+	if fr.Err != ErrCodeOffsetOutOfRange {
+		t.Errorf("fetch above HW: want err=%d, got err=%d", ErrCodeOffsetOutOfRange, fr.Err)
+	}
+
+	// At logStart (valid)
+	fr = pd.Fetch(2, 1024*1024)
+	if fr.Err != 0 {
+		t.Errorf("fetch at logStart: want err=0, got err=%d", fr.Err)
 	}
 }
