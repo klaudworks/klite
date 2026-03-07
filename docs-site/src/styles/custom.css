@@ -82,6 +82,25 @@
 }
 
 /* Hero Section Refinements */
+@media (max-width: 49.99rem) {
+	.hero {
+		display: flex !important;
+		flex-direction: column !important;
+	}
+
+	.hero>.hero-html {
+		order: 2 !important;
+		width: 100% !important;
+		max-width: 100% !important;
+		margin-top: 2rem !important;
+		margin-bottom: 0 !important;
+	}
+
+	.hero>.stack {
+		order: 1 !important;
+	}
+}
+
 @media (min-width: 50rem) {
 	.hero {
 		grid-template-columns: 4fr 6fr !important;
@@ -99,6 +118,10 @@
 	font-size: 0.85rem;
 	line-height: 1.7;
 	white-space: nowrap;
+	overflow-x: auto;
+	/* Allow horizontal scroll on small screens */
+	box-sizing: border-box;
+	max-width: 100%;
 	border-radius: 8px !important;
 	border: 1px solid var(--sl-color-hairline-shade) !important;
 
