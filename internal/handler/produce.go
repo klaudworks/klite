@@ -212,7 +212,8 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 		// Phase 2: wait for fsync and commit all batches.
 		// All pending entries share the same fsync cycle in the WAL writer,
 		// so this is effectively one fsync wait regardless of partition count.
-		for _, pc := range pendingCommits {
+		for i := range pendingCommits {
+			pc := &pendingCommits[i]
 			sp := &resp.Topics[pc.topicIdx].Partitions[pc.partIdx]
 
 			if walErr := produceCommitWAL(pc.pending); walErr != nil {

@@ -60,15 +60,14 @@ func HandleOffsetForLeaderEpoch(state *cluster.State) server.Handler {
 
 				// For single-broker pre-WAL, all requests for epoch 0
 				// return the current HW. Future epochs return -1/-1.
-				if rp.LeaderEpoch == currentEpoch {
+				switch {
+				case rp.LeaderEpoch == currentEpoch:
 					sp.LeaderEpoch = currentEpoch
 					sp.EndOffset = pd.HW()
-				} else if rp.LeaderEpoch > currentEpoch {
+				case rp.LeaderEpoch > currentEpoch:
 					sp.LeaderEpoch = -1
 					sp.EndOffset = -1
-				} else {
-					// Requested epoch < current: return the HW
-					// (for single-broker, all data is in epoch 0)
+				default:
 					sp.LeaderEpoch = currentEpoch
 					sp.EndOffset = pd.HW()
 				}

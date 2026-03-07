@@ -216,7 +216,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 			timer.Stop()
 
 			// Re-fetch ALL partitions (not just the one that woke us)
-			results, totalBytes = doFetch()
+			results, _ = doFetch()
 		}
 
 		// Apply response-level MaxBytes across all partitions.

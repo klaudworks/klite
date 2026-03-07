@@ -480,8 +480,7 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 				return true
 			}
 
-			key := string(rec.Key)
-			latestOffset, inMap := offsetMap[key]
+			latestOffset, inMap := offsetMap[string(rec.Key)]
 
 			// Keep if this is the latest offset for this key
 			if !inMap || absOffset >= latestOffset {

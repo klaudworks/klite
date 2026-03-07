@@ -89,7 +89,7 @@ func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 			}
 
 			// Filter by requested config names if specified
-			if rr.ConfigNames != nil && len(rr.ConfigNames) > 0 {
+			if len(rr.ConfigNames) > 0 {
 				names := make(map[string]struct{})
 				for _, n := range rr.ConfigNames {
 					names[n] = struct{}{}
