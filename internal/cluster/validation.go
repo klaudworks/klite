@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"strings"
 	"unicode/utf8"
 )
 
@@ -24,11 +23,6 @@ func ValidateTopicName(name string) string {
 		if !isValidTopicChar(c) {
 			return "topic name contains invalid character: " + string(c)
 		}
-	}
-	if strings.HasPrefix(name, "__") {
-		// Internal topics like __consumer_offsets are allowed
-		// but user creation is generally discouraged.
-		// We allow it for now (matches Kafka behavior).
 	}
 	return ""
 }

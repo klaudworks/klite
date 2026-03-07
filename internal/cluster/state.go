@@ -691,13 +691,3 @@ type FlushablePartition struct {
 	HW          int64
 	Partition_  *PartData // reference to the partition for watermark update
 }
-
-// countPartitions returns the total number of partitions across all topics.
-// Caller must hold s.mu.RLock() or s.mu.Lock().
-func (s *State) countPartitions() int {
-	total := 0
-	for _, td := range s.topics {
-		total += len(td.Partitions)
-	}
-	return total
-}

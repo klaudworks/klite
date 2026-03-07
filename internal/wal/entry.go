@@ -19,9 +19,6 @@ import (
 // Fixed header overhead: 4 + 4 + 8 + 16 + 4 + 8 = 44 bytes (before record batch)
 
 const (
-	// entryHeaderSize is the fixed overhead per WAL entry (length + crc + seq + topicID + partition + baseOffset).
-	entryHeaderSize = 4 + 4 + 8 + 16 + 4 + 8 // 44 bytes
-
 	// entryFixedPayload is the fixed payload portion after CRC (seq + topicID + partition + baseOffset).
 	entryFixedPayload = 8 + 16 + 4 + 8 // 36 bytes
 )
@@ -40,9 +37,7 @@ type Entry struct {
 // MarshalEntry serializes a WAL entry into the on-disk format.
 // Returns the complete entry bytes including length prefix and CRC.
 func MarshalEntry(e *Entry) []byte {
-	// payload = seq + topicID + partition + baseOffset + data
 	payloadLen := entryFixedPayload + len(e.Data)
-	// total = length(4) + crc(4) + payload
 	total := 4 + 4 + payloadLen
 	buf := make([]byte, total)
 
