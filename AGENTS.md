@@ -38,8 +38,7 @@ Follow the **testing pyramid**: test at the lowest layer that can verify the beh
 - **Do not duplicate** coverage across layers — if a unit test already covers a behavior, do not add an integration test for it.
 - **Unit tests are the primary test layer** — they cover handler logic, wire encoding/decoding, offset assignment, state machine transitions, and error paths.
 - **Integration tests** start the broker in-process on a random port and exercise the real Kafka wire protocol with franz-go clients. Use these for end-to-end API behavior that crosses multiple handlers or requires a real TCP connection.
-- **For S3 (Phase 4)**, use LocalStack with testcontainers. No real AWS credentials should ever be needed to run tests.
-- **No E2E / Kubernetes tests** — everything in this project is testable with unit tests or in-process integration tests.
+- **E2E tests** live in `test/e2e/`, gated behind `//go:build e2e`. They exercise real infrastructure via testcontainers: LocalStack for S3, k3s for Kubernetes (Helm deploys, pod labeling, leader election, failover). Use these for behavior that can't be tested at lower layers — S3 flush on shutdown, multi-broker replication failover with real pod deletion, Helm chart correctness. Keep them few and focused. No real AWS or K8s credentials should ever be needed.
 - **Do not test third-party library behavior** — e.g., do not write tests that verify franz-go's client encoding. That's their responsibility, not ours.
 - When adding a new feature, ask: "What is the cheapest test that can verify this?" — prefer unit over integration.
 - **`-race` is deterministic** — running `go test -race -count=5` does not catch more race conditions than `-count=1`. The race detector instruments every memory access; repeating runs only helps catch timing-dependent _logic_ flakiness, not data races. A single `-race -count=1` pass is sufficient.
