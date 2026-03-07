@@ -21,3 +21,6 @@ spec:
       {{- end }}
   selector:
     {{- include "klite.selectorLabels" . | nindent 4 }}
+    {{- if .Values.replication.enabled }}
+    klite.io/role: primary
+    {{- end }}

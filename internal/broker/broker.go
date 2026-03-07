@@ -445,6 +445,9 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 
 	// If we're primary, do graceful shutdown
 	if b.replRole.Load() == 1 {
+		if b.cfg.RoleChangeHook != nil {
+			b.cfg.RoleChangeHook.ClearPrimary()
+		}
 		b.shutdownPrimary()
 
 		// Release lease for fast failover
@@ -484,6 +487,10 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	b.logger.Info("klite promoted to primary")
 	b.replRole.Store(1)
+
+	if b.cfg.RoleChangeHook != nil {
+		b.cfg.RoleChangeHook.SetPrimary()
+	}
 
 	// Stop any running receiver (was standby before)
 	b.stopReceiver()
@@ -535,6 +542,10 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 func (b *Broker) onDemoted() {
 	b.logger.Warn("klite demoted to standby")
 	b.shutdownPrimary()
+
+	if b.cfg.RoleChangeHook != nil {
+		b.cfg.RoleChangeHook.ClearPrimary()
+	}
 
 	// Start receiver to connect to new primary
 	b.startReceiverFromLease()
@@ -628,7 +639,9 @@ func (b *Broker) acceptReplicationConns(ctx context.Context, ln net.Listener) {
 			continue
 		}
 
-		go b.handleStandbyConn(ctx, conn)
+		// Handle inline (not in a goroutine) to avoid races on broker
+		// state (replSender, walWriter.SetReplicator, metaLog hooks).
+		b.handleStandbyConn(ctx, conn)
 	}
 }
 
@@ -715,24 +728,59 @@ func (b *Broker) keepaliveLoop(ctx context.Context, sender *repl.Sender) {
 			if !sender.Connected() {
 				return
 			}
-			// Send empty WAL_BATCH as keepalive
-			sender.Send(nil, 0, 0)
+			sender.SendKeepalive()
 		}
 	}
 }
 
-// currentEpoch returns the current lease epoch. Returns 0 if not using S3 lease.
+// currentEpoch returns the current lease epoch.
 func (b *Broker) currentEpoch() uint64 {
-	// For memlease tests, epoch is not tracked — return 0 to always trigger SNAPSHOT
-	return 0
+	if b.elector == nil {
+		return 0
+	}
+	return b.elector.Epoch()
 }
 
 // startReceiverFromLease reads the primary address from the lease and starts a receiver.
 func (b *Broker) startReceiverFromLease() {
-	// The receiver needs access to the primary's address. In a real S3 lease,
-	// this would come from the lease body. For memlease tests, we don't have
-	// a direct mechanism. The receiver connection loop is handled externally.
-	// For now, this is a placeholder that will be wired up by integration tests.
+	if b.elector == nil {
+		return
+	}
+	primaryAddr := b.elector.PrimaryAddr()
+	if primaryAddr == "" {
+		b.logger.Info("repl receiver: no primary address in lease, will retry on next poll")
+		return
+	}
+
+	epoch := b.elector.Epoch()
+	receiver := repl.NewReceiver(b.walWriter, b.metaLog, epoch, b.logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b.replCancel = cancel
+	b.replReceiver = receiver
+
+	go func() {
+		for {
+			b.logger.Info("repl receiver: connecting to primary", "addr", primaryAddr)
+			err := receiver.Run(ctx, primaryAddr, b.replTLSConfig)
+			if ctx.Err() != nil {
+				return
+			}
+			b.logger.Warn("repl receiver: disconnected from primary, retrying in 2s", "err", err)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+
+			// Re-read primary address in case it changed
+			if addr := b.elector.PrimaryAddr(); addr != "" {
+				primaryAddr = addr
+			}
+			receiver.SetEpoch(b.elector.Epoch())
+		}
+	}()
 }
 
 // stopReceiver stops the replication receiver if it's running.

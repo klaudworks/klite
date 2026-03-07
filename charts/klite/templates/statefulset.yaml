@@ -39,7 +39,7 @@ spec:
         {{- end }}
       {{- end }}
       serviceAccountName: {{ include "klite.serviceAccountName" . }}
-      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      automountServiceAccountToken: true
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -104,6 +104,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KLITE_LABEL_SELECTOR
+              value: {{ include "klite.selectorLabels" . | trim | replace "\n" "," | replace ": " "=" | quote }}
             {{- if .Values.s3.existingSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:

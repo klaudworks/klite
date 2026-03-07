@@ -11,6 +11,12 @@ import (
 	"github.com/klaudworks/klite/internal/clock"
 )
 
+// RoleHook is called when the broker's replication role changes.
+type RoleHook interface {
+	SetPrimary()
+	ClearPrimary()
+}
+
 type Config struct {
 	Listen            string
 	AdvertisedAddr    string
@@ -67,6 +73,10 @@ type Config struct {
 	LeaseDuration             time.Duration // How long the lease is valid without renewal (default 15s)
 	LeaseRenewInterval        time.Duration // How often the primary renews the lease (default 5s)
 	LeaseRetryInterval        time.Duration // How often the standby polls the lease (default 2s)
+
+	// RoleChangeHook is called on primary promotion/demotion.
+	// Used by the k8s pod labeler to update Service routing labels.
+	RoleChangeHook RoleHook
 
 	// LeaseElector allows injecting a lease.Elector for tests.
 	LeaseElector interface{} // lease.Elector when set

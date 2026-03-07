@@ -26,7 +26,10 @@ NOTE: Persistence is disabled. The broker will recover from S3 on restart.
 
 Streaming replication is enabled (synchronous).
   Two pods will start: one becomes primary (accepts Kafka traffic),
-  the other runs as a standby replica.
+  the other runs as a standby replica. Both pods show as Ready.
+
+  The primary labels itself with klite.io/role=primary so the Service
+  routes Kafka traffic only to the active broker.
 
   Failover is automatic:
     Graceful (SIGTERM): ~2s
