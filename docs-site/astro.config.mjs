@@ -1,10 +1,12 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import astroMermaid from 'astro-mermaid';
 
 // https://astro.build/config
 export default defineConfig({
 	integrations: [
+		astroMermaid(),
 		starlight({
 			title: 'klite',
 			customCss: ['./src/styles/custom.css'],
@@ -31,8 +33,9 @@ export default defineConfig({
 					items: [
 						{ label: 'Design Philosophy', slug: 'concepts/design-philosophy' },
 						{ label: 'Storage', slug: 'concepts/storage' },
-						{ label: 'Durability', slug: 'concepts/durability' },
-					{ label: 'Testing', slug: 'concepts/testing' },
+					{ label: 'Durability', slug: 'concepts/durability' },
+					{ label: 'Replication', slug: 'concepts/replication' },
+				{ label: 'Testing', slug: 'concepts/testing' },
 					],
 				},
 		{

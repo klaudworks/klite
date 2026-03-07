@@ -25,5 +25,5 @@ Running Kafka on a single server has a few advantages, but it also comes with tr
 
 **Hardware and network.** klite gets the most out of your hardware, but it is still designed for a single server. It won't replace a full Kafka cluster doing millions of messages per second across a fleet of machines. If you need that, use Kafka. It's great at it.
 
-**No failover yet.** There is currently no failover mechanism for zero-downtime upgrades, server reboots, or failures. On SIGTERM, klite flushes all data to S3 and shuts down cleanly. Restarts take 1-2 seconds, and Kafka clients retry by default, so upgrades cause only a brief interruption rather than data loss. Failover for Kubernetes and other multi-server setups is on the roadmap and will be tackled in the next few weeks.
+**Single-server by default.** klite runs as a single process. For high availability, an optional [standby replica](/concepts/replication/) provides automatic failover with zero data loss. The standby streams the primary's WAL in real time and promotes automatically on crashes or rolling updates. Failover takes ~2 seconds on graceful shutdown, ~17 seconds on a crash.
 

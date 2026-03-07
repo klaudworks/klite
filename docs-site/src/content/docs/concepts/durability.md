@@ -36,3 +36,5 @@ At most `--s3-flush-interval` of data is lost per partition (default 60 seconds)
 **Bare metal with RAID-1.** Mirror your drives. This gives you redundancy with the best latency and throughput since writes go directly to local NVMe without a network hop.
 
 **Lower the flush interval.** Set `--s3-flush-interval` to 10s or 5s to reduce the window of data at risk during a disk loss. This increases S3 PUT requests slightly but S3 PUTs are cheap ($0.005 per 1,000 requests).
+
+**Run a standby replica.** For zero data loss even on total disk failure, enable [replication](/concepts/replication/). The primary streams every WAL entry to a standby in real time and only acknowledges produces after both nodes have fsync'd. If the primary's disk dies, every acknowledged record exists on the standby.
