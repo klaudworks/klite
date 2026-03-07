@@ -110,19 +110,19 @@ func HandleAlterUserScramCredentials(store *sasl.Store, metaLog *metadata.Log) s
 				store.AddScram512(u.Name, auth)
 			}
 
-		if metaLog != nil {
-			entry := metadata.MarshalScramCredential(&metadata.ScramCredentialEntry{
-				Username:   u.Name,
-				Mechanism:  u.Mechanism,
-				Iterations: u.Iterations,
-				Salt:       u.Salt,
-				SaltedPass: u.SaltedPassword,
-			})
-			if err := metaLog.AppendSync(entry); err != nil {
-				slog.Warn("metadata.log: failed to persist SCRAM credential upsert",
-					"user", u.Name, "err", err)
+			if metaLog != nil {
+				entry := metadata.MarshalScramCredential(&metadata.ScramCredentialEntry{
+					Username:   u.Name,
+					Mechanism:  u.Mechanism,
+					Iterations: u.Iterations,
+					Salt:       u.Salt,
+					SaltedPass: u.SaltedPassword,
+				})
+				if err := metaLog.AppendSync(entry); err != nil {
+					slog.Warn("metadata.log: failed to persist SCRAM credential upsert",
+						"user", u.Name, "err", err)
+				}
 			}
-		}
 
 			sr := kmsg.NewAlterUserSCRAMCredentialsResponseResult()
 			sr.User = u.Name

@@ -193,10 +193,10 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 					TopicID:        td.ID,
 					Configs:        td.Configs,
 				})
-			if err := ml.AppendSync(entry); err != nil {
-				slog.Warn("metadata.log: failed to persist CreateTopic (topic will be lost on restart)",
-					"topic", td.Name, "err", err)
-			}
+				if err := ml.AppendSync(entry); err != nil {
+					slog.Warn("metadata.log: failed to persist CreateTopic (topic will be lost on restart)",
+						"topic", td.Name, "err", err)
+				}
 			}
 
 			// 9. Populate response

@@ -69,9 +69,9 @@ func HandleDeleteTopics(state *cluster.State) server.Handler {
 							TopicID:   topicID,
 						})
 						if err := ml.AppendSync(entry); err != nil {
-						slog.Warn("metadata.log: failed to persist DeleteTopic",
-							"topic", topicName, "err", err)
-					}
+							slog.Warn("metadata.log: failed to persist DeleteTopic",
+								"topic", topicName, "err", err)
+						}
 					}
 				}
 			}

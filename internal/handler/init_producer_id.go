@@ -45,8 +45,8 @@ func HandleInitProducerID(state *cluster.State) server.Handler {
 				NextProducerID: state.PIDManager().NextPID(),
 			})
 			if err := ml.Append(entry); err != nil {
-			slog.Warn("metadata.log: failed to persist ProducerID", "err", err)
-		}
+				slog.Warn("metadata.log: failed to persist ProducerID", "err", err)
+			}
 		}
 
 		return resp, nil

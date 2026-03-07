@@ -45,10 +45,10 @@ func HandleIncrementalAlterConfigs(state *cluster.State) server.Handler {
 										Key:       rc.Name,
 										Value:     *rc.Value,
 									})
-								if err := ml.Append(entry); err != nil {
-									slog.Warn("metadata.log: failed to persist AlterConfig",
-										"topic", rr.ResourceName, "key", rc.Name, "err", err)
-								}
+									if err := ml.Append(entry); err != nil {
+										slog.Warn("metadata.log: failed to persist AlterConfig",
+											"topic", rr.ResourceName, "key", rc.Name, "err", err)
+									}
 								}
 							}
 						case kmsg.IncrementalAlterConfigOpDelete:
@@ -109,9 +109,9 @@ func HandleAlterConfigs(state *cluster.State) server.Handler {
 									Value:     *c.Value,
 								})
 								if err := ml.Append(entry); err != nil {
-								slog.Warn("metadata.log: failed to persist AlterConfig",
-									"topic", rr.ResourceName, "key", c.Name, "err", err)
-							}
+									slog.Warn("metadata.log: failed to persist AlterConfig",
+										"topic", rr.ResourceName, "key", c.Name, "err", err)
+								}
 							}
 						}
 					}
