@@ -50,8 +50,8 @@ SSH_OPTS = [
     "-o", "LogLevel=ERROR",
 ]
 
-# klite server-side flags (stable across benchmark runs)
-KLITE_SERVER_FLAGS = {
+# klite server-side defaults (overridable via run command flags)
+KLITE_SERVER_DEFAULTS = {
     "s3-flush-interval": "60s",
     "wal-max-disk-size": "32212254720",   # 30 GiB
     "chunk-pool-memory": "4294967296",    # 4 GiB
@@ -235,11 +235,37 @@ def up(
     ssh_key: Annotated[str, typer.Option(
         help="SSH public key file or literal key. Default: ~/.ssh/id_ed25519.pub",
     )] = "",
+    klite_instance: Annotated[str, typer.Option(
+        help="EC2 instance type for klite (e.g. m7g.xlarge, m7g.2xlarge, m7g.4xlarge)",
+    )] = "",
+    bench_instance: Annotated[str, typer.Option(
+        help="EC2 instance type for bench client",
+    )] = "",
+    ebs_size: Annotated[int, typer.Option(
+        help="EBS root volume size in GB for klite instance",
+    )] = 0,
+    ebs_iops: Annotated[int, typer.Option(
+        help="Provisioned IOPS for klite gp3 volume (baseline 3000 free)",
+    )] = 0,
+    ebs_throughput: Annotated[int, typer.Option(
+        help="Provisioned throughput in MiB/s for klite gp3 volume (baseline 125 free, max 1000)",
+    )] = 0,
+    no_spot: Annotated[bool, typer.Option(
+        help="Use on-demand instances instead of spot",
+    )] = False,
 ) -> None:
     """Provision infrastructure, build & push Docker images."""
     total = 7
 
     pubkey = get_ssh_pubkey(ssh_key)
+    extra_vars = _build_extra_tf_vars(
+        klite_instance=klite_instance,
+        bench_instance=bench_instance,
+        ebs_size=ebs_size,
+        ebs_iops=ebs_iops,
+        ebs_throughput=ebs_throughput,
+        no_spot=no_spot,
+    )
 
     # 1. Terraform init
     step(1, total, "Initializing terraform...")
@@ -251,11 +277,12 @@ def up(
 
     # 2. Terraform plan + confirm + apply
     step(2, total, "Planning infrastructure changes...")
-    run_local(
-        ["terraform", "plan", "-var-file=bench.tfvars",
-         f"-var=ssh_public_key={pubkey}", "-out=tfplan"],
-        cwd=TF_DIR,
-    )
+    plan_cmd = [
+        "terraform", "plan", "-var-file=bench.tfvars",
+        f"-var=ssh_public_key={pubkey}",
+        *extra_vars, "-out=tfplan",
+    ]
+    run_local(plan_cmd, cwd=TF_DIR)
     if not typer.confirm("\nApply this plan?"):
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(0)
@@ -381,6 +408,18 @@ def run_bench(
     max_buffered_records: Annotated[int, typer.Option(help="Max records buffered in client (backpressure)")] = 2048,
     warmup_records: Annotated[int, typer.Option(help="Warmup records (excluded from stats)")] = 50_000,
     reporting_interval: Annotated[int, typer.Option(help="Report interval in ms")] = 60_000,
+    wal_max_disk_size: Annotated[str, typer.Option(
+        help="WAL max disk size in bytes (default: 30 GiB = 32212254720)",
+    )] = "",
+    chunk_pool_memory: Annotated[str, typer.Option(
+        help="Chunk pool memory budget in bytes (default: 4 GiB = 4294967296)",
+    )] = "",
+    s3_flush_interval: Annotated[str, typer.Option(
+        help="S3 flush interval (default: 60s)",
+    )] = "",
+    wal_sync_interval: Annotated[int, typer.Option(
+        help="WAL fsync batch window in ms (default: 2)",
+    )] = 0,
     label: Annotated[str, typer.Option(help="Label appended to output filename")] = "",
 ) -> None:
     """Start klite, run a benchmark, poll until done, fetch results."""
@@ -396,7 +435,7 @@ def run_bench(
     ecr_klite = outputs["ecr_klite"]
     ecr_bench = outputs["ecr_klite_bench"]
     region = get_region()
-    total = 8
+    total = 10
 
     # Single run ID ties data dir, S3 prefix, and output file together
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -411,6 +450,17 @@ def run_bench(
         console.print(f"  label={label}")
     console.print()
 
+    # Build server flags from defaults + CLI overrides
+    server_flags = dict(KLITE_SERVER_DEFAULTS)
+    if wal_max_disk_size:
+        server_flags["wal-max-disk-size"] = wal_max_disk_size
+    if chunk_pool_memory:
+        server_flags["chunk-pool-memory"] = chunk_pool_memory
+    if s3_flush_interval:
+        server_flags["s3-flush-interval"] = s3_flush_interval
+    if wal_sync_interval:
+        server_flags["wal-sync-interval"] = str(wal_sync_interval)
+
     # 1. Start klite with unique data dir and S3 prefix
     step(1, total, "Starting klite on broker instance...")
     klite_flags = (
@@ -420,7 +470,7 @@ def run_bench(
         f" -s3-region {region}"
         f" -s3-prefix {run_id}"
     )
-    for flag, val in KLITE_SERVER_FLAGS.items():
+    for flag, val in server_flags.items():
         klite_flags += f" -{flag} {val}"
 
     ssh(klite_pub, (
@@ -453,8 +503,18 @@ def run_bench(
     ))
     ok("topic created")
 
-    # 4. Start benchmark
-    step(4, total, f"Starting benchmark ({mode})...")
+    # 4. Start system metrics collection on klite instance
+    step(4, total, "Starting system metrics collection (sar) on klite instance...")
+    ssh(klite_pub, "pkill sar 2>/dev/null || true", check=False)
+    ssh(klite_pub, (
+        f"nohup sar -o /tmp/sar-{run_id}.bin -u -r -d -n DEV -b 5 999999"
+        f" > /tmp/sar-{run_id}.log 2>&1 &"
+        f" sleep 3 && test -f /tmp/sar-{run_id}.bin"
+    ))
+    ok("sar metrics collection started (5s interval)")
+
+    # 5. Start benchmark
+    step(5, total, f"Starting benchmark ({mode})...")
     bench_flags = (
         f"-bootstrap-server {klite_priv}:9092"
         f" -topic {topic}"
@@ -483,7 +543,7 @@ def run_bench(
     ok("benchmark container started")
 
     # 5. Poll until done
-    step(5, total, "Waiting for benchmark to finish (polling every 30s)...")
+    step(6, total, "Waiting for benchmark to finish (polling every 30s)...")
     console.print()
     poll_start = time.monotonic()
 
@@ -514,31 +574,48 @@ def run_bench(
         else:
             die(f"Unexpected container state: {state}")
 
-    # 6. Fetch results
-    step(6, total, "Downloading results...")
+    # 7. Stop sar and convert to JSON
+    step(7, total, "Stopping metrics collection...")
+    ssh(klite_pub, "kill $(cat /tmp/sar.pid 2>/dev/null) 2>/dev/null || true", check=False)
+    ssh(klite_pub, (
+        f"sadf -j /tmp/sar-{run_id}.bin -- -u -r -d -n DEV -b"
+        f" > /tmp/sar-{run_id}.json 2>/dev/null || true"
+    ), check=False)
+    ok("sar stopped and converted to JSON")
+
+    # 8. Fetch results
+    step(8, total, "Downloading results...")
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{run_id}-{mode}"
     if label:
         filename += f"-{label}"
-    filename += ".jsonl"
-    local_path = RESULTS_DIR / filename
 
-    scp(bench_ip, "/tmp/results/bench.jsonl", local_path)
-    ok(f"results saved to {local_path.relative_to(REPO_ROOT)}")
+    local_bench = RESULTS_DIR / f"{filename}.jsonl"
+    scp(bench_ip, "/tmp/results/bench.jsonl", local_bench)
+    ok(f"bench results saved to {local_bench.relative_to(REPO_ROOT)}")
 
-    # 7. Stop klite (graceful shutdown flushes WAL to S3)
-    step(7, total, "Stopping klite (graceful shutdown flushes to S3)...")
+    local_sar = RESULTS_DIR / f"{filename}-sar.json"
+    try:
+        scp(klite_pub, f"/tmp/sar-{run_id}.json", local_sar)
+        ok(f"sar metrics saved to {local_sar.relative_to(REPO_ROOT)}")
+    except SystemExit:
+        console.print("  [yellow]WARN[/] sar metrics not available")
+
+    # 9. Stop klite (graceful shutdown flushes WAL to S3)
+    step(9, total, "Stopping klite (graceful shutdown flushes to S3)...")
     ssh(klite_pub, "docker stop -t 120 klite", check=False)
     ok("klite stopped")
 
-    # 8. Verify S3 record count
+    # 10. Verify S3 record count
     # Warmup records are produced on top of num_records, so total = both.
     expected_total = num_records + warmup_records
-    step(8, total, "Verifying S3 record count...")
+    step(10, total, "Verifying S3 record count...")
     s3_count = _verify_s3_count(bench_ip, ecr_bench, s3_bucket, region, run_id, expected_total)
 
     console.print(f"\n[green bold]Benchmark complete.[/]")
-    console.print(f"  Results: [bold]{local_path.relative_to(REPO_ROOT)}[/]")
+    console.print(f"  Results: [bold]{local_bench.relative_to(REPO_ROOT)}[/]")
+    if local_sar.exists():
+        console.print(f"  Metrics: [bold]{local_sar.relative_to(REPO_ROOT)}[/]")
     if s3_count is not None:
         console.print(f"  S3 records: {s3_count:,} / {expected_total:,} expected")
 
@@ -548,15 +625,41 @@ def down(
     ssh_key: Annotated[str, typer.Option(
         help="SSH public key file or literal key. Default: ~/.ssh/id_ed25519.pub",
     )] = "",
+    klite_instance: Annotated[str, typer.Option(
+        help="EC2 instance type for klite (must match what was used in 'up')",
+    )] = "",
+    bench_instance: Annotated[str, typer.Option(
+        help="EC2 instance type for bench client (must match what was used in 'up')",
+    )] = "",
+    ebs_size: Annotated[int, typer.Option(
+        help="EBS root volume size in GB (must match what was used in 'up')",
+    )] = 0,
+    ebs_iops: Annotated[int, typer.Option(
+        help="Provisioned IOPS (must match what was used in 'up')",
+    )] = 0,
+    ebs_throughput: Annotated[int, typer.Option(
+        help="Provisioned throughput in MiB/s (must match what was used in 'up')",
+    )] = 0,
+    no_spot: Annotated[bool, typer.Option(
+        help="Use on-demand instances (must match what was used in 'up')",
+    )] = False,
 ) -> None:
     """Tear down all AWS infrastructure."""
     pubkey = get_ssh_pubkey(ssh_key)
+    extra_vars = _build_extra_tf_vars(
+        klite_instance=klite_instance,
+        bench_instance=bench_instance,
+        ebs_size=ebs_size,
+        ebs_iops=ebs_iops,
+        ebs_throughput=ebs_throughput,
+        no_spot=no_spot,
+    )
     console.print("[cyan]Planning destroy...[/]")
     if not TFVARS.exists():
         die(f"Missing {TFVARS}")
     run_local(
         ["terraform", "plan", "-destroy", "-var-file=bench.tfvars",
-         f"-var=ssh_public_key={pubkey}", "-out=tfplan"],
+         f"-var=ssh_public_key={pubkey}", *extra_vars, "-out=tfplan"],
         cwd=TF_DIR,
     )
     if not typer.confirm("\nDestroy these resources?"):
@@ -653,6 +756,32 @@ def _verify_s3_count(
         console.print(f"  Per-partition: {', '.join(f'p{k}={v:,}' for k, v in sorted(partitions.items(), key=lambda x: int(x[0])))}")
 
     return s3_records
+
+
+def _build_extra_tf_vars(
+    *,
+    klite_instance: str,
+    bench_instance: str,
+    ebs_size: int,
+    ebs_iops: int,
+    ebs_throughput: int,
+    no_spot: bool = False,
+) -> list[str]:
+    """Build extra -var flags for terraform from CLI overrides (0/empty = use tfvars default)."""
+    args: list[str] = []
+    if klite_instance:
+        args += ["-var", f"klite_instance_type={klite_instance}"]
+    if bench_instance:
+        args += ["-var", f"bench_instance_type={bench_instance}"]
+    if ebs_size:
+        args += ["-var", f"klite_ebs_size_gb={ebs_size}"]
+    if ebs_iops:
+        args += ["-var", f"klite_ebs_iops={ebs_iops}"]
+    if ebs_throughput:
+        args += ["-var", f"klite_ebs_throughput={ebs_throughput}"]
+    if no_spot:
+        args += ["-var", "use_spot=false"]
+    return args
 
 
 def _ecr_login_local(region: str, profile: str, registry: str) -> None:
