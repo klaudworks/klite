@@ -14,37 +14,37 @@ import (
 
 // ProducerConfig holds producer benchmark configuration.
 type ProducerConfig struct {
-	Brokers           []string
-	Topic             string
-	NumRecords        int64
-	RecordSize        int
-	Throughput        float64 // records/sec, <0 means unlimited
-	Acks              int     // -1 (all), 0, 1
-	BatchMaxBytes     int32
-	LingerMs          int
+	Brokers            []string
+	Topic              string
+	NumRecords         int64
+	RecordSize         int
+	Throughput         float64 // records/sec, <0 means unlimited
+	Acks               int     // -1 (all), 0, 1
+	BatchMaxBytes      int32
+	LingerMs           int
 	MaxBufferedRecords int
-	NumProducers      int // number of concurrent producer clients
-	WarmupRecords     int64
-	ReportingInterval time.Duration
-	Out               io.Writer
-	JSONOut           io.Writer // JSON Lines time-series output (nil = disabled)
+	NumProducers       int // number of concurrent producer clients
+	WarmupRecords      int64
+	ReportingInterval  time.Duration
+	Out                io.Writer
+	JSONOut            io.Writer // JSON Lines time-series output (nil = disabled)
 }
 
 // DefaultProducerConfig returns sensible defaults.
 func DefaultProducerConfig() ProducerConfig {
 	return ProducerConfig{
-		Brokers:           []string{"localhost:9092"},
-		Topic:             "bench",
-		NumRecords:        1_000_000,
-		RecordSize:        1000,
-		Throughput:        -1,
-		Acks:              1,
+		Brokers:            []string{"localhost:9092"},
+		Topic:              "bench",
+		NumRecords:         1_000_000,
+		RecordSize:         1000,
+		Throughput:         -1,
+		Acks:               1,
 		BatchMaxBytes:      1_048_576, // 1 MiB
 		LingerMs:           0,
 		MaxBufferedRecords: 8192,
 		NumProducers:       1,
-		ReportingInterval: 5 * time.Second,
-		Out:               os.Stdout,
+		ReportingInterval:  5 * time.Second,
+		Out:                os.Stdout,
 	}
 }
 
@@ -119,7 +119,7 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 	result.Errors = totalErrors.Load()
 
 	if result.Errors > 0 {
-		fmt.Fprintf(cfg.Out, "%d records failed to produce.\n", result.Errors)
+		_, _ = fmt.Fprintf(cfg.Out, "%d records failed to produce.\n", result.Errors)
 		return result, fmt.Errorf("%d records failed", result.Errors)
 	}
 
@@ -133,8 +133,8 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 }
 
 func runSingleProducer(ctx context.Context, cfg ProducerConfig,
-	numRecords, warmupRecords int64, throughput float64, stats *Stats, errorCount *atomic.Int64) error {
-
+	numRecords, warmupRecords int64, throughput float64, stats *Stats, errorCount *atomic.Int64,
+) error {
 	gen := NewPayloadGenerator(cfg.RecordSize)
 
 	opts := []kgo.Opt{
@@ -150,11 +150,9 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig,
 
 	switch cfg.Acks {
 	case 0:
-		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()))
-		opts = append(opts, kgo.DisableIdempotentWrite())
+		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()), kgo.DisableIdempotentWrite())
 	case 1:
-		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()))
-		opts = append(opts, kgo.DisableIdempotentWrite())
+		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()), kgo.DisableIdempotentWrite())
 	default: // -1 / all
 		opts = append(opts, kgo.RequiredAcks(kgo.AllISRAcks()))
 	}
@@ -198,6 +196,6 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig,
 		}
 	}
 
-	client.Flush(ctx)
+	_ = client.Flush(ctx)
 	return nil
 }

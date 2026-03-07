@@ -176,10 +176,10 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 	produced := result.Records
 	consumed := pcResult.Consumed
 	if consumed == produced {
-		fmt.Fprintf(cfg.Out, "OK: produced == consumed (%d records)\n", produced)
+		_, _ = fmt.Fprintf(cfg.Out, "OK: produced == consumed (%d records)\n", produced)
 	} else {
 		diff := produced - consumed
-		fmt.Fprintf(cfg.Out, "WARNING: produced %d but consumed %d (%d missing, %.2f%%)\n",
+		_, _ = fmt.Fprintf(cfg.Out, "WARNING: produced %d but consumed %d (%d missing, %.2f%%)\n",
 			produced, consumed, diff, 100.0*float64(diff)/float64(produced))
 	}
 
@@ -195,8 +195,8 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 }
 
 func runPCProducer(ctx context.Context, cfg ProduceConsumeConfig, epoch time.Time,
-	stats *Stats, numRecords int64, warmupRecords int64, throughput float64, errorCount *atomic.Int64) error {
-
+	stats *Stats, numRecords, warmupRecords int64, throughput float64, errorCount *atomic.Int64,
+) error {
 	gen := NewPayloadGenerator(cfg.RecordSize)
 
 	opts := []kgo.Opt{
@@ -212,11 +212,9 @@ func runPCProducer(ctx context.Context, cfg ProduceConsumeConfig, epoch time.Tim
 
 	switch cfg.Acks {
 	case 0:
-		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()))
-		opts = append(opts, kgo.DisableIdempotentWrite())
+		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()), kgo.DisableIdempotentWrite())
 	case 1:
-		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()))
-		opts = append(opts, kgo.DisableIdempotentWrite())
+		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()), kgo.DisableIdempotentWrite())
 	default:
 		opts = append(opts, kgo.RequiredAcks(kgo.AllISRAcks()))
 	}
@@ -276,13 +274,13 @@ func runPCProducer(ctx context.Context, cfg ProduceConsumeConfig, epoch time.Tim
 		}
 	}
 
-	client.Flush(ctx)
+	_ = client.Flush(ctx)
 	return nil
 }
 
 func consumeLoop(ctx context.Context, client *kgo.Client, epoch time.Time,
-	stats *Stats, produceDone *atomic.Bool, expectedRecords int64, drainTimeout time.Duration) {
-
+	stats *Stats, produceDone *atomic.Bool, expectedRecords int64, drainTimeout time.Duration,
+) {
 	var drainDeadline time.Time
 
 	for {

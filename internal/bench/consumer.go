@@ -68,7 +68,7 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 	startTime := time.Now()
 
 	if !cfg.ShowDetailedStats {
-		fmt.Fprintf(cfg.Out, "start.time, end.time, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec\n")
+		_, _ = fmt.Fprintf(cfg.Out, "start.time, end.time, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec\n")
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -164,7 +164,7 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 
 		lastTs := time.Unix(0, lastConsumedAt.Load())
 		if now.Sub(lastTs) > cfg.Timeout {
-			fmt.Fprintf(cfg.Out, "WARNING: Exiting before consuming the expected number of records: "+
+			_, _ = fmt.Fprintf(cfg.Out, "WARNING: Exiting before consuming the expected number of records: "+
 				"timeout (%v) exceeded. You can use the --timeout option to increase the timeout.\n", cfg.Timeout)
 			cancel()
 			goto done
@@ -195,7 +195,7 @@ done:
 	totalMB := float64(totalBytes) / (1024.0 * 1024.0)
 
 	if !cfg.ShowDetailedStats {
-		fmt.Fprintf(cfg.Out, "%s, %s, %.4f, %.4f, %d, %.4f, %d, %d, %.4f, %.4f\n",
+		_, _ = fmt.Fprintf(cfg.Out, "%s, %s, %.4f, %.4f, %d, %.4f, %d, %d, %.4f, %.4f\n",
 			startTime.Format("2006-01-02 15:04:05.000"),
 			endTime.Format("2006-01-02 15:04:05.000"),
 			totalMB,
@@ -219,7 +219,8 @@ done:
 }
 
 func printConsumerWindow(out io.Writer, bytesRead, lastBytesRead, recordsRead, lastRecordsRead int64,
-	startTime, endTime time.Time) {
+	startTime, endTime time.Time,
+) {
 	elapsedMs := endTime.Sub(startTime).Milliseconds()
 	if elapsedMs == 0 {
 		elapsedMs = 1
@@ -229,7 +230,7 @@ func printConsumerWindow(out io.Writer, bytesRead, lastBytesRead, recordsRead, l
 	recsPerSec := 1000.0 * float64(recordsRead-lastRecordsRead) / float64(elapsedMs)
 	totalMB := float64(bytesRead) / (1024.0 * 1024.0)
 
-	fmt.Fprintf(out, "%s, %.4f, %.4f, %d, %.4f\n",
+	_, _ = fmt.Fprintf(out, "%s, %.4f, %.4f, %d, %.4f\n",
 		endTime.Format("2006-01-02 15:04:05.000"),
 		totalMB, mbPerSec, recordsRead, recsPerSec)
 }

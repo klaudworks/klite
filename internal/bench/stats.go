@@ -145,7 +145,7 @@ func (s *Stats) RecordE2E(latencyMs int) {
 
 // Record records a single completed send.
 // Callers must NOT call this for warmup records.
-func (s *Stats) Record(latencyMs int, bytes int, now time.Time) {
+func (s *Stats) Record(latencyMs, bytes int, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -154,7 +154,7 @@ func (s *Stats) Record(latencyMs int, bytes int, now time.Time) {
 		s.windowStart = now
 		s.measurementStarted = true
 		if s.out != nil {
-			fmt.Fprintf(s.out, "Warmup complete (%d records), starting measurement.\n", s.warmupTotal)
+			_, _ = fmt.Fprintf(s.out, "Warmup complete (%d records), starting measurement.\n", s.warmupTotal)
 		}
 	}
 
@@ -232,7 +232,7 @@ func (s *Stats) emitWindow(now time.Time) {
 
 	// Print human-readable.
 	if s.e2eEnabled {
-		fmt.Fprintf(s.out, "%d records sent, %.1f records/sec (%.2f MB/sec), "+
+		_, _ = fmt.Fprintf(s.out, "%d records sent, %.1f records/sec (%.2f MB/sec), "+
 			"produce %d/%d/%d/%d ms (p50/p95/p99/p999), "+
 			"e2e %d/%d/%d/%d ms, consumed %d.\n",
 			s.windowCount, wRecsPerSec, wMBPerSec,
@@ -240,7 +240,7 @@ func (s *Stats) emitWindow(now time.Time) {
 			e2ePercs[0], e2ePercs[1], e2ePercs[2], e2ePercs[3],
 			wConsumed)
 	} else {
-		fmt.Fprintf(s.out, "%d records sent, %.1f records/sec (%.2f MB/sec), "+
+		_, _ = fmt.Fprintf(s.out, "%d records sent, %.1f records/sec (%.2f MB/sec), "+
 			"%.1f ms avg latency, %d ms p50, %d ms p95, %d ms p99, %d ms p999, %d ms max.\n",
 			s.windowCount, wRecsPerSec, wMBPerSec, wAvgLatency,
 			percs[0], percs[1], percs[2], percs[3], s.windowMaxLatency)
@@ -277,7 +277,7 @@ func (s *Stats) emitWindow(now time.Time) {
 			snap.CumConsumed = cConsumed
 		}
 		data, _ := json.Marshal(snap)
-		fmt.Fprintf(s.jsonOut, "%s\n", data)
+		_, _ = fmt.Fprintf(s.jsonOut, "%s\n", data)
 	}
 }
 
@@ -318,7 +318,7 @@ func (s *Stats) PrintTotal() {
 		consumed := s.cumConsumed
 		s.e2eMu.Unlock()
 
-		fmt.Fprintf(s.out, "%d records sent, %f records/sec (%.2f MB/sec), "+
+		_, _ = fmt.Fprintf(s.out, "%d records sent, %f records/sec (%.2f MB/sec), "+
 			"produce %d/%d/%d/%d ms (p50/p95/p99/p999), "+
 			"e2e %d/%d/%d/%d ms, consumed %d.\n",
 			s.count, recsPerSec, mbPerSec,
@@ -326,7 +326,7 @@ func (s *Stats) PrintTotal() {
 			e2eP50, e2eP95, e2eP99, e2eP999,
 			consumed)
 	} else {
-		fmt.Fprintf(s.out, "%d records sent, %f records/sec (%.2f MB/sec), "+
+		_, _ = fmt.Fprintf(s.out, "%d records sent, %f records/sec (%.2f MB/sec), "+
 			"%.2f ms avg latency, %d ms max latency, "+
 			"%d ms 50th, %d ms 95th, %d ms 99th, %d ms 99.9th.\n",
 			s.count, recsPerSec, mbPerSec,
@@ -363,7 +363,7 @@ func (s *Stats) PrintTotal() {
 			s.e2eMu.Unlock()
 		}
 		data, _ := json.Marshal(snap)
-		fmt.Fprintf(s.jsonOut, "%s\n", data)
+		_, _ = fmt.Fprintf(s.jsonOut, "%s\n", data)
 	}
 }
 
@@ -438,13 +438,6 @@ func medianInt(vals []int) int {
 	copy(sorted, vals)
 	sort.Ints(sorted)
 	return sorted[n/2]
-}
-
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func max64(a, b int64) int64 {

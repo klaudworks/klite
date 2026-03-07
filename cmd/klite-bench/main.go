@@ -102,7 +102,9 @@ func runProduce(args []string) error {
 	reportingMs := fs.Int64("reporting-interval", 5000, "Reporting interval in milliseconds")
 	fs.StringVar(&jsonOut, "json-output", "", "Path to write JSON results (optional)")
 
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
 
 	cfg.Brokers = splitBrokers(brokers)
 	cfg.BatchMaxBytes = int32(*batchMax)
@@ -114,16 +116,14 @@ func runProduce(args []string) error {
 		if err != nil {
 			return fmt.Errorf("creating json output file: %w", err)
 		}
-		defer f.Close()
+		defer f.Close() //nolint:errcheck // best-effort close
 		cfg.JSONOut = f
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	result, err := bench.RunProducer(ctx, cfg)
-	_ = result
-
+	_, err := bench.RunProducer(ctx, cfg)
 	return err
 }
 
@@ -143,7 +143,9 @@ func runConsume(args []string) error {
 	fs.BoolVar(&cfg.ShowDetailedStats, "show-detailed-stats", false, "Print per-interval stats")
 	fs.StringVar(&jsonOut, "json-output", "", "Path to write JSON results (optional)")
 
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
 
 	cfg.Brokers = splitBrokers(brokers)
 	cfg.FetchMaxBytes = int32(*fetchMax)
@@ -184,7 +186,9 @@ func runProduceConsume(args []string) error {
 	drainMs := fs.Int64("drain-timeout", 30000, "Max ms to wait for consumers after produce finishes")
 	fs.StringVar(&jsonOut, "json-output", "", "Path to write JSON Lines results")
 
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
 
 	cfg.Brokers = splitBrokers(brokers)
 	cfg.BatchMaxBytes = int32(*batchMax)
@@ -196,7 +200,7 @@ func runProduceConsume(args []string) error {
 		if err != nil {
 			return fmt.Errorf("creating json output file: %w", err)
 		}
-		defer f.Close()
+		defer f.Close() //nolint:errcheck // best-effort close
 		cfg.JSONOut = f
 	}
 
@@ -213,7 +217,9 @@ func runCreateTopic(args []string) error {
 	fs.StringVar(&brokers, "bootstrap-server", "localhost:9092", "Broker address(es), comma-separated")
 	topic := fs.String("topic", "bench", "Topic to create")
 	partitions := fs.Int("partitions", 6, "Number of partitions")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -226,7 +232,9 @@ func runDeleteTopic(args []string) error {
 	var brokers string
 	fs.StringVar(&brokers, "bootstrap-server", "localhost:9092", "Broker address(es), comma-separated")
 	topic := fs.String("topic", "bench", "Topic to delete")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -240,7 +248,9 @@ func runS3Count(args []string) error {
 	prefix := fs.String("prefix", "", "S3 key prefix (e.g. <run_id>/)")
 	region := fs.String("region", "eu-west-1", "AWS region")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
 
 	if *bucket == "" {
 		return fmt.Errorf("flag -bucket is required")
@@ -375,7 +385,7 @@ func s3RangeRead(ctx context.Context, client *s3.Client, bucket, key string, obj
 	if err != nil {
 		return nil, fmt.Errorf("GetObject range read: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // best-effort close
 	return io.ReadAll(resp.Body)
 }
 
@@ -389,33 +399,6 @@ func splitBrokers(s string) []string {
 		}
 	}
 	return result
-}
-
-// JSON output helpers
-
-type produceJSON struct {
-	Type       string  `json:"type"`
-	Brokers    string  `json:"brokers"`
-	Topic      string  `json:"topic"`
-	Producers  int     `json:"producers"`
-	RecordSize int     `json:"record_size"`
-	Acks       int     `json:"acks"`
-	BatchMax           int     `json:"batch_max_bytes"`
-	LingerMs           int     `json:"linger_ms"`
-	MaxBufferedRecords int     `json:"max_buffered_records"`
-	Throughput         float64 `json:"throughput_cap"`
-
-	Records     int64   `json:"records"`
-	Errors      int64   `json:"errors"`
-	ElapsedMs   int64   `json:"elapsed_ms"`
-	RecsPerSec  float64 `json:"records_per_sec"`
-	MBPerSec    float64 `json:"mb_per_sec"`
-	AvgLatency  float64 `json:"avg_latency_ms"`
-	MaxLatency  float64 `json:"max_latency_ms"`
-	P50Latency  int     `json:"p50_latency_ms"`
-	P95Latency  int     `json:"p95_latency_ms"`
-	P99Latency  int     `json:"p99_latency_ms"`
-	P999Latency int     `json:"p999_latency_ms"`
 }
 
 type consumeJSON struct {
@@ -432,34 +415,6 @@ type consumeJSON struct {
 	MBPerSec   float64 `json:"mb_per_sec"`
 }
 
-func writeProducerJSON(path string, cfg bench.ProducerConfig, r *bench.ProducerResult) {
-	out := produceJSON{
-		Type:        "produce",
-		Brokers:     strings.Join(cfg.Brokers, ","),
-		Topic:       cfg.Topic,
-		Producers:   cfg.NumProducers,
-		RecordSize:  cfg.RecordSize,
-		Acks:        cfg.Acks,
-		BatchMax:           int(cfg.BatchMaxBytes),
-		LingerMs:           cfg.LingerMs,
-		MaxBufferedRecords: cfg.MaxBufferedRecords,
-		Throughput:         cfg.Throughput,
-		Records:     r.Records,
-		Errors:      r.Errors,
-		ElapsedMs:   r.ElapsedMs,
-		RecsPerSec:  r.RecsPerSec,
-		MBPerSec:    r.MBPerSec,
-		AvgLatency:  r.AvgLatency,
-		MaxLatency:  r.MaxLatency,
-		P50Latency:  r.P50Latency,
-		P95Latency:  r.P95Latency,
-		P99Latency:  r.P99Latency,
-		P999Latency: r.P999Latency,
-	}
-	data, _ := json.MarshalIndent(out, "", "  ")
-	os.WriteFile(path, data, 0644)
-}
-
 func writeConsumerJSON(path string, cfg bench.ConsumerConfig, r *bench.ConsumerResult) {
 	out := consumeJSON{
 		Type:       "consume",
@@ -474,5 +429,5 @@ func writeConsumerJSON(path string, cfg bench.ConsumerConfig, r *bench.ConsumerR
 		MBPerSec:   r.MBPerSec,
 	}
 	data, _ := json.MarshalIndent(out, "", "  ")
-	os.WriteFile(path, data, 0644)
+	_ = os.WriteFile(path, data, 0o644)
 }
