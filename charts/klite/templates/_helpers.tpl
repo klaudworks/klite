@@ -66,6 +66,18 @@ Create the name of the service account to use.
 {{- end }}
 
 {{/*
+Return the advertised address for Kafka Metadata responses.
+Defaults to the service FQDN if not explicitly set.
+*/}}
+{{- define "klite.advertisedAddr" -}}
+{{- if .Values.broker.advertisedAddr }}
+{{- .Values.broker.advertisedAddr }}
+{{- else }}
+{{- printf "%s.%s.svc.cluster.local:%v" (include "klite.fullname" .) .Release.Namespace (.Values.service.port | default 9092) }}
+{{- end }}
+{{- end }}
+
+{{/*
 Return the proper image name.
 */}}
 {{- define "klite.image" -}}

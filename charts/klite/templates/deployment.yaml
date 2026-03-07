@@ -56,9 +56,7 @@ spec:
             - --default-partitions={{ .Values.broker.defaultPartitions }}
             - --auto-create-topics={{ .Values.broker.autoCreateTopics }}
             - --log-level={{ .Values.broker.logLevel }}
-            {{- if .Values.broker.advertisedAddr }}
-            - --advertised-addr={{ .Values.broker.advertisedAddr }}
-            {{- end }}
+            - --advertised-addr={{ include "klite.advertisedAddr" . }}
             {{- if .Values.broker.clusterID }}
             - --cluster-id={{ .Values.broker.clusterID }}
             {{- end }}

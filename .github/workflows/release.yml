@@ -42,3 +42,35 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  helm-publish:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp Chart.yaml with release version
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          sed -i "s/^version:.*/version: $VERSION/" charts/klite/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" charts/klite/Chart.yaml
+
+      - name: Lint chart
+        run: helm lint ./charts/klite
+
+      - name: Package chart
+        run: helm package ./charts/klite
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push to GHCR
+        run: helm push klite-${{ steps.version.outputs.version }}.tgz oci://ghcr.io/klaudworks/charts

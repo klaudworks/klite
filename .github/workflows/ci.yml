@@ -68,6 +68,35 @@ jobs:
       - name: Verify binary runs
         run: bin/klite --version
 
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for chart changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            charts:
+              - 'charts/**'
+
+      - uses: azure/setup-helm@v4
+        if: steps.filter.outputs.charts == 'true'
+
+      - name: Lint chart
+        if: steps.filter.outputs.charts == 'true'
+        run: helm lint ./charts/klite
+
+      - name: Template chart (dry-run)
+        if: steps.filter.outputs.charts == 'true'
+        run: helm template test-release ./charts/klite
+
+      - name: Skip
+        if: steps.filter.outputs.charts != 'true'
+        run: echo "No chart changes, skipping lint"
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
