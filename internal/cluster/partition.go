@@ -795,10 +795,10 @@ func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chun
 			pd.chunkCurrent = spare
 			spare = nil
 		} else {
-			// Fallback: caller didn't provide a spare (e.g. tests).
-			// This path still calls Acquire() but should only happen when
-			// the pool has free chunks (no contention risk in practice).
 			pd.chunkCurrent = pd.chunkPool.Acquire()
+			if pd.chunkCurrent == nil {
+				return spare // pool closed during shutdown
+			}
 		}
 	}
 
@@ -811,6 +811,9 @@ func (pd *PartData) appendToChunk(raw []byte, meta chunk.ChunkBatch, spare *chun
 			spare = nil
 		} else {
 			pd.chunkCurrent = pd.chunkPool.Acquire()
+			if pd.chunkCurrent == nil {
+				return spare // pool closed during shutdown
+			}
 		}
 	}
 

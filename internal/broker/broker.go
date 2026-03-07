@@ -322,25 +322,30 @@ func (b *Broker) Run(ctx context.Context) error {
 		<-errCh
 	}
 
-	// 12. Wait for all connections to drain
+	// 12. Close chunk pool to unblock any producers stuck in Acquire
+	if b.chunkPool != nil {
+		b.chunkPool.Close()
+	}
+
+	// 13. Wait for all connections to drain
 	b.server.Wait()
 
-	// 13. Stop all group goroutines
+	// 14. Stop all group goroutines
 	b.state.StopAllGroups()
 
-	// 14. Run unified S3 sync (flush all partitions + upload metadata.log)
+	// 15. Run unified S3 sync (flush all partitions + upload metadata.log)
 	if b.s3Flusher != nil {
 		b.s3Flusher.Stop() // Stop triggers a final flush
 	}
 
-	// 15. Stop WAL writer (flush pending writes)
+	// 16. Stop WAL writer (flush pending writes)
 	if b.walWriter != nil {
 		b.walWriter.Stop()
 	}
 
-	// 16. Close metadata log
+	// 17. Close metadata log
 	if b.metaLog != nil {
-		b.metaLog.Close()
+		_ = b.metaLog.Close()
 	}
 
 	b.logger.Info("klite stopped")

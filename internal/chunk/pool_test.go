@@ -242,6 +242,42 @@ func TestPoolChunkCreatedAt(t *testing.T) {
 	p.Release(c)
 }
 
+func TestPoolCloseUnblocksAcquire(t *testing.T) {
+	t.Parallel()
+
+	p := NewPool(1024*1024, 1024*1024) // 1 chunk
+
+	// Exhaust the pool.
+	held := p.Acquire()
+	_ = held
+
+	// Block a goroutine on Acquire.
+	result := make(chan *Chunk, 1)
+	go func() {
+		result <- p.Acquire()
+	}()
+
+	// Verify it's actually blocked.
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-result:
+		t.Fatal("Acquire should be blocking")
+	default:
+	}
+
+	// Close the pool — blocked Acquire must unblock and return nil.
+	p.Close()
+
+	select {
+	case c := <-result:
+		if c != nil {
+			t.Error("Acquire after Close should return nil, got non-nil chunk")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Acquire did not unblock after Close — shutdown would hang")
+	}
+}
+
 func TestPoolMinChunks(t *testing.T) {
 	t.Parallel()
 

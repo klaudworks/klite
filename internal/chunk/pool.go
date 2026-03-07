@@ -45,9 +45,10 @@ type Pool struct {
 	chunkSize int // bytes per chunk (= max.message.bytes)
 	maxChunks int // total chunks = budget / chunkSize
 
-	mu   sync.Mutex
-	cond *sync.Cond
-	free []*Chunk // available chunks (stack, LIFO for cache warmth)
+	mu     sync.Mutex
+	cond   *sync.Cond
+	free   []*Chunk // available chunks (stack, LIFO for cache warmth)
+	closed bool
 
 	allocated atomic.Int64 // number of chunks currently out on loan
 
@@ -90,15 +91,17 @@ func (p *Pool) SetTriggerCh(ch chan struct{}) {
 	p.triggerCh = ch
 }
 
-// Acquire returns a chunk from the pool. If the pool is exhausted
-// (pressure >= 90%), this blocks until a chunk is freed. At 75% pressure,
-// an emergency flush is signaled.
+// Acquire returns a chunk from the pool. If the pool is exhausted,
+// this blocks until a chunk is freed. Returns nil if the pool has been
+// closed (shutdown). At 75% pressure, an emergency flush is signaled.
 func (p *Pool) Acquire() *Chunk {
 	p.mu.Lock()
 
-	// Check pressure thresholds before trying to pop
 	for len(p.free) == 0 {
-		// Pool exhausted — block (backpressure on producer)
+		if p.closed {
+			p.mu.Unlock()
+			return nil
+		}
 		p.signalEmergencyFlushLocked()
 		p.cond.Wait()
 	}
@@ -223,11 +226,11 @@ func (p *Pool) signalEmergencyFlush() {
 	}
 }
 
-// Close wakes all blocked Acquire callers. After Close, Acquire will panic
-// if the pool is empty. Callers should ensure no goroutines are blocked
-// before calling Close.
+// Close marks the pool as closed and wakes all blocked Acquire callers.
+// After Close, Acquire returns nil immediately.
 func (p *Pool) Close() {
 	p.mu.Lock()
+	p.closed = true
 	p.cond.Broadcast()
 	p.mu.Unlock()
 }
