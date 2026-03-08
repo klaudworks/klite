@@ -12,13 +12,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/klaudworks/klite/internal/bench"
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tclog "github.com/testcontainers/testcontainers-go/log"
@@ -401,10 +407,9 @@ func (c *cluster) waitForProducerAcked(n int64, timeout time.Duration) {
 // updates c.proxyAddr. Must only be called when no producer is running.
 func (c *cluster) newPortForward() {
 	c.t.Helper()
-	pfCtx, pfCancel := context.WithCancel(c.ctx)
-	localPort := portForward(c.t, pfCtx, c.kubeconfigPath, "pod/kafka-proxy", 9092)
-	c.proxyAddr = fmt.Sprintf("127.0.0.1:%d", localPort)
-	c.pfCancel = pfCancel
+	pf := portForward(c.t, c.ctx, c.kubeconfigPath, "pod/kafka-proxy", 9092)
+	c.proxyAddr = pf.Addr
+	c.pfCancel = pf.Cancel
 	waitForPortReady(c.t, c.ctx, c.proxyAddr, 10*time.Second)
 	logf("proxy port-forward: %s -> pod/kafka-proxy:9092", c.proxyAddr)
 }
@@ -500,6 +505,131 @@ func (c *cluster) logPartitionHW() {
 				t.Topic, p.Partition, p.Offset, p.ErrorCode)
 		}
 	}
+}
+
+// verifyS3Continuity port-forwards to the in-cluster LocalStack, lists all
+// S3 objects for the test topic, downloads their footers, and verifies:
+//   - at least one object exists
+//   - first object starts at offset 0
+//   - no gaps between consecutive objects (obj[i].lastOffset+1 == obj[i+1].firstOffset)
+//   - last object's lastOffset+1 >= expectedHW
+//
+// This is a strong invariant: if the flusher missed data, this check catches it.
+func (c *cluster) verifyS3Continuity(label string, expectedHW int64) {
+	c.t.Helper()
+
+	pf := portForward(c.t, c.ctx, c.kubeconfigPath, "pod/localstack", 4566)
+	defer pf.Cancel()
+	waitForPortReady(c.t, c.ctx, pf.Addr, 10*time.Second)
+
+	endpoint := fmt.Sprintf("http://%s", pf.Addr)
+	awsCfg, err := awsconfig.LoadDefaultConfig(c.ctx,
+		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
+	)
+	require.NoError(c.t, err)
+	s3Client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+		o.BaseEndpoint = &endpoint
+		o.UsePathStyle = true
+	})
+
+	// List all objects in the bucket.
+	var allObjects []s3Object
+	var continuationToken *string
+	bucket := "klite-e2e"
+	for {
+		out, err := s3Client.ListObjectsV2(c.ctx, &awss3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			ContinuationToken: continuationToken,
+		})
+		require.NoError(c.t, err)
+		for _, obj := range out.Contents {
+			key := aws.ToString(obj.Key)
+			if strings.HasSuffix(key, ".obj") && strings.Contains(key, c.topic+"-") {
+				allObjects = append(allObjects, s3Object{
+					Key:  key,
+					Size: aws.ToInt64(obj.Size),
+				})
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+
+	require.NotEmpty(c.t, allObjects, "%s: no S3 objects found for topic %s", label, c.topic)
+	sort.Slice(allObjects, func(i, j int) bool { return allObjects[i].Key < allObjects[j].Key })
+	logf("%s: found %d S3 objects for topic %s", label, len(allObjects), c.topic)
+
+	// Download each object's footer and build offset ranges.
+	type objRange struct {
+		key      string
+		firstOff int64
+		lastOff  int64
+		records  int64
+	}
+	var ranges []objRange
+	var totalRecords int64
+
+	for _, obj := range allObjects {
+		// Read the full object (these are small in e2e — a few MB each).
+		getOut, err := s3Client.GetObject(c.ctx, &awss3.GetObjectInput{
+			Bucket: &bucket,
+			Key:    &obj.Key,
+		})
+		require.NoError(c.t, err, "%s: GetObject %s", label, obj.Key)
+		data, err := io.ReadAll(getOut.Body)
+		getOut.Body.Close()
+		require.NoError(c.t, err, "%s: reading %s", label, obj.Key)
+
+		footer, err := s3store.ParseFooter(data, int64(len(data)))
+		require.NoError(c.t, err, "%s: ParseFooter %s", label, obj.Key)
+		require.NotEmpty(c.t, footer.Entries, "%s: empty footer in %s", label, obj.Key)
+
+		r := objRange{
+			key:      obj.Key,
+			firstOff: footer.FirstOffset(),
+			lastOff:  footer.LastOffset(),
+			records:  footer.TotalRecordCount(),
+		}
+		ranges = append(ranges, r)
+		totalRecords += r.records
+	}
+
+	logf("%s: S3 coverage: %d objects, offsets [%d..%d], %d records",
+		label, len(ranges), ranges[0].firstOff, ranges[len(ranges)-1].lastOff, totalRecords)
+
+	// Check: first object starts at offset 0.
+	require.Equal(c.t, int64(0), ranges[0].firstOff,
+		"%s: first S3 object should start at offset 0, got %d (key=%s)",
+		label, ranges[0].firstOff, ranges[0].key)
+
+	// Check: no gaps between consecutive objects.
+	for i := 1; i < len(ranges); i++ {
+		prev := ranges[i-1]
+		curr := ranges[i]
+		expectedStart := prev.lastOff + 1
+		require.Equal(c.t, expectedStart, curr.firstOff,
+			"%s: S3 offset gap between objects: %s ends at %d, %s starts at %d (gap of %d offsets)",
+			label, prev.key, prev.lastOff, curr.key, curr.firstOff, curr.firstOff-expectedStart)
+	}
+
+	// Check: S3 covers up to expected HW (if provided).
+	s3HW := ranges[len(ranges)-1].lastOff + 1
+	if expectedHW > 0 {
+		require.GreaterOrEqual(c.t, s3HW, expectedHW,
+			"%s: S3 data ends at offset %d but expected HW is %d (missing %d offsets)",
+			label, s3HW-1, expectedHW, expectedHW-s3HW)
+	}
+
+	logf("%s: S3 continuity verified: %d objects, offsets [0..%d], s3HW=%d, expectedHW=%d, %d records",
+		label, len(ranges), ranges[len(ranges)-1].lastOff, s3HW, expectedHW, totalRecords)
+}
+
+type s3Object struct {
+	Key  string
+	Size int64
 }
 
 // disrupt transitions:
@@ -689,11 +819,14 @@ func (c *cluster) heal() {
 	})
 
 	// Wait for the S3 flusher to persist any WAL data that was written while
-	// the standby was disconnected. After this sleep, all pre-reconnection
-	// data is in S3 and all post-reconnection data is WAL-synced to the
-	// standby — so a subsequent disrupt() cannot lose acked records.
-	logf("%s: waiting %s for S3 flush", tr, s3FlushInterval)
-	time.Sleep(s3FlushInterval)
+	// the standby was disconnected. We use 2× the flush interval to ensure
+	// the flusher has completed at least one full cycle after reconnection.
+	// After this sleep, all pre-reconnection data is in S3 and all
+	// post-reconnection data is WAL-synced to the standby — so a subsequent
+	// disrupt() cannot lose acked records.
+	s3Wait := 2 * s3FlushInterval
+	logf("%s: waiting %s for S3 flush", tr, s3Wait)
+	time.Sleep(s3Wait)
 
 	// Log broker HW after heal to verify replication caught up.
 	c.logPartitionHW()
@@ -1061,9 +1194,17 @@ func removeNetworkPolicy(t *testing.T, client *kubernetes.Clientset, name string
 // Port-forward + misc
 // ---------------------------------------------------------------------------
 
-func portForward(t *testing.T, ctx context.Context, kubeconfigPath, target string, remotePort int) int {
+// portForwardHandle holds a kubectl port-forward session.
+type portForwardHandle struct {
+	LocalPort int
+	Addr      string // "127.0.0.1:<port>"
+	Cancel    context.CancelFunc
+}
+
+func portForward(t *testing.T, ctx context.Context, kubeconfigPath, target string, remotePort int) *portForwardHandle {
 	t.Helper()
-	cmd := exec.CommandContext(ctx, "kubectl",
+	pfCtx, pfCancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(pfCtx, "kubectl",
 		"--kubeconfig", kubeconfigPath,
 		"port-forward", target,
 		fmt.Sprintf(":%d", remotePort),
@@ -1084,7 +1225,11 @@ func portForward(t *testing.T, ctx context.Context, kubeconfigPath, target strin
 	_, err = fmt.Sscanf(extractForwardingLine(line), "Forwarding from 127.0.0.1:%d", &localPort)
 	require.NoError(t, err, "failed to parse port-forward output: %q", line)
 	require.Greater(t, localPort, 0)
-	return localPort
+	return &portForwardHandle{
+		LocalPort: localPort,
+		Addr:      fmt.Sprintf("127.0.0.1:%d", localPort),
+		Cancel:    pfCancel,
+	}
 }
 
 func extractForwardingLine(s string) string {
