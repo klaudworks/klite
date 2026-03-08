@@ -171,11 +171,13 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	}
 
 	// Stop any running receiver (was standby before)
+	b.stepHook("stop-receiver")
 	b.stopReceiver()
 
 	// Rebuild high watermarks from WAL index. The receiver advances HW as
 	// entries arrive, but WAL replay at startup does not set HW for entries
 	// that predate the receiver (e.g. local WAL from a previous primary tenure).
+	b.stepHook("rebuild-hw")
 	b.rebuildHWFromWAL()
 
 	// Probe S3 for the actual flush watermark BEFORE rebuilding chunks.
@@ -187,6 +189,10 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// WAL entry — data the old primary had in chunks/WAL and flushed to S3
 	// but never replicated the watermark for.
 	if b.s3Client != nil {
+		b.stepHook("probe-s3")
+		// The listing cache was populated at startup and is stale — the old
+		// primary flushed additional objects while this node was a standby.
+		b.s3Reader.InvalidateAll()
 		b.probeS3Watermarks()
 	}
 
@@ -216,6 +222,7 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// only flush chunk data (from startup replay + new produces), advancing
 	// the S3 watermark past replicated-but-unchunked data. When WAL segments
 	// are then cleaned, that data is permanently lost.
+	b.stepHook("rebuild-chunks")
 	b.rebuildChunksFromWAL()
 
 	// Log partition state after rebuild for diagnostics.
@@ -240,12 +247,15 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// reconstructs partition-level openTxnPIDs but not PIDManager txn state,
 	// so the timeout sweep cannot find them. Sweep them now before accepting
 	// connections.
+	b.stepHook("abort-orphan-txns")
 	b.abortOrphanedTransactions()
 
 	// Set up replication sender: start replication listener
+	b.stepHook("start-repl-listener")
 	b.startReplicationListener(primaryCtx)
 
 	// Start Kafka listener
+	b.stepHook("start-kafka-listener")
 	var err error
 	ln := b.cfg.Listener
 	if ln == nil {
@@ -285,6 +295,7 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	b.logger.Info("kafka listener started", "addr", b.listener.Addr().String())
 
 	// Start primary-only background tasks
+	b.stepHook("start-background")
 	go b.retentionLoop(primaryCtx)
 	go b.txnTimeoutLoop(primaryCtx)
 	if b.s3Client != nil {
@@ -329,6 +340,7 @@ func (b *Broker) shutdownPrimary() {
 	}
 
 	// 1. Close Kafka listener (MUST be first — no new connections)
+	b.stepHook("close-listener")
 	if b.listener != nil {
 		_ = b.listener.Close()
 		b.listener = nil
@@ -338,30 +350,36 @@ func (b *Broker) shutdownPrimary() {
 	// broker, so on demotion zero partitions remain on this node — there's
 	// nothing useful a client can do on this connection. This also stops
 	// readLoops from dispatching new Fetch handlers.
+	b.stepHook("close-conns")
 	b.server.CloseConns()
 
 	// 3. Wake all Fetch long-poll waiters so in-flight Fetch handlers return
 	// immediately. This MUST happen after CloseConns — otherwise the Fetch
 	// handler returns, the client sends a new Fetch, and the readLoop
 	// dispatches a new handler with a fresh waiter that missed the wake.
+	b.stepHook("wake-fetch-waiters")
 	b.state.WakeAllFetchWaiters()
 
 	// 4. Drain in-flight requests
+	b.stepHook("drain-requests")
 	b.server.Wait()
 	b.state.StopAllGroups()
 
 	// 5. Clear WAL Replicator
+	b.stepHook("clear-replicator")
 	if b.walWriter != nil {
 		b.walWriter.SetReplicator(nil)
 	}
 
 	// 6. Clear metadata.log hooks
+	b.stepHook("clear-metalog")
 	if b.metaLog != nil {
 		b.metaLog.SetReplicateHook(nil)
 		b.metaLog.SetCompactHook(nil)
 	}
 
 	// 7. Close replication listener and sender
+	b.stepHook("close-repl")
 	if b.replListener != nil {
 		_ = b.replListener.Close()
 		b.replListener = nil
@@ -372,6 +390,7 @@ func (b *Broker) shutdownPrimary() {
 	}
 
 	// 8. Stop S3 flusher (final flush)
+	b.stepHook("stop-s3-flusher")
 	if b.s3Flusher != nil {
 		b.s3Flusher.Stop()
 	}

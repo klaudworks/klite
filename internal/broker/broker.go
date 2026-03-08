@@ -61,6 +61,16 @@ type Broker struct {
 	replSender    *repl.Sender
 	replRole      atomic.Int32       // 0 = single-node/standby, 1 = primary
 	replCancel    context.CancelFunc // protected by mu
+
+	// testStepHook, when non-nil, is called at each major step boundary in
+	// onElected and shutdownPrimary. Test-only; nil in production.
+	testStepHook func(string)
+}
+
+func (b *Broker) stepHook(name string) {
+	if b.testStepHook != nil {
+		b.testStepHook(name)
+	}
 }
 
 func New(cfg Config) *Broker {
