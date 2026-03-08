@@ -1,0 +1,156 @@
+package broker
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/metadata"
+	s3store "github.com/klaudworks/klite/internal/s3"
+)
+
+func (b *Broker) compactionLoop(ctx context.Context) {
+	interval := b.cfg.CompactionCheckInterval
+	if interval == 0 {
+		interval = 30 * time.Second
+	}
+	minDirty := b.cfg.CompactionMinDirtyObjects
+	if minDirty == 0 {
+		minDirty = 4
+	}
+
+	compactor := s3store.NewCompactor(s3store.CompactorConfig{
+		Client: b.s3Client,
+		Reader: b.s3Reader,
+		Logger: b.logger,
+		PersistWatermark: func(topic string, partition int32, cleanedUpTo int64) error {
+			if b.metaLog == nil {
+				return nil
+			}
+			entry := metadata.MarshalCompactionWatermark(&metadata.CompactionWatermarkEntry{
+				TopicName:   topic,
+				Partition:   partition,
+				CleanedUpTo: cleanedUpTo,
+			})
+			return b.metaLog.AppendSync(entry)
+		},
+		WindowBytes:   b.cfg.CompactionWindowBytes,
+		S3Concurrency: b.cfg.CompactionS3Concurrency,
+		ReadRateLimit: b.cfg.CompactionReadRate,
+	})
+
+	ticker := b.cfg.Clock.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.compactOneDirtyPartition(ctx, compactor, int32(minDirty))
+		}
+	}
+}
+
+func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32) {
+	topics := b.state.GetAllTopics()
+
+	var bestPD *cluster.PartData
+	var bestTD *cluster.TopicData
+	var bestDirty int32
+
+	for _, td := range topics {
+		policy, ok := td.GetConfig("cleanup.policy")
+		if !ok {
+			policy = "delete"
+		}
+		if !strings.Contains(policy, "compact") {
+			continue
+		}
+
+		for _, pd := range td.Partitions {
+			dirty := pd.DirtyObjects()
+
+			// Eligibility check
+			if dirty < minDirty {
+				// Check staleness guarantee
+				lc := pd.LastCompacted()
+				switch {
+				case lc.IsZero() && dirty > 0:
+					// Never compacted and has dirty objects — eligible
+				case dirty <= 0:
+					continue
+				default:
+					// Check max.compaction.lag.ms
+					maxLagMs := int64(9223372036854775807) // math.MaxInt64
+					if v, ok := td.GetConfig("max.compaction.lag.ms"); ok {
+						if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+							maxLagMs = parsed
+						}
+					}
+					if maxLagMs < 9223372036854775807 && b.cfg.Clock.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
+						// Stale — eligible
+					} else {
+						continue
+					}
+				}
+			}
+
+			if dirty > bestDirty || bestPD == nil {
+				bestPD = pd
+				bestTD = td
+				bestDirty = dirty
+			}
+		}
+	}
+
+	if bestPD == nil {
+		return
+	}
+
+	minCompactionLagMs := int64(0)
+	if v, ok := bestTD.GetConfig("min.compaction.lag.ms"); ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			minCompactionLagMs = parsed
+		}
+	}
+
+	deleteRetentionMs := int64(86400000) // 24h default
+	if v, ok := bestTD.GetConfig("delete.retention.ms"); ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			deleteRetentionMs = parsed
+		}
+	}
+	compactor.SetDeleteRetentionMs(deleteRetentionMs)
+
+	bestPD.RLock()
+	cleanedUpTo := bestPD.CleanedUpTo()
+	bestPD.RUnlock()
+
+	newWatermark, err := compactor.CompactPartition(
+		ctx,
+		bestTD.Name,
+		bestTD.ID,
+		bestPD.Index,
+		cleanedUpTo,
+		minCompactionLagMs,
+		func() { bestPD.CompactionMu.Lock() },
+		func() { bestPD.CompactionMu.Unlock() },
+	)
+	if err != nil {
+		b.logger.Warn("compaction failed",
+			"topic", bestTD.Name, "partition", bestPD.Index, "err", err)
+		return
+	}
+
+	if newWatermark > cleanedUpTo {
+		bestPD.Lock()
+		bestPD.SetCleanedUpTo(newWatermark)
+		bestPD.ResetDirtyObjects(b.cfg.Clock.Now())
+		bestPD.Unlock()
+		b.logger.Info("compaction complete",
+			"topic", bestTD.Name, "partition", bestPD.Index,
+			"cleaned_up_to", newWatermark)
+	}
+}
