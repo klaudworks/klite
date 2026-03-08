@@ -765,9 +765,9 @@ func TestCleanSegments_NoS3DeletesAll(t *testing.T) {
 	idx := NewIndex()
 	cfg := DefaultWriterConfig()
 	cfg.Dir = dir
-	cfg.SegmentMaxBytes = 200  // small segments to force rotation
-	cfg.MaxDiskSize = 500      // small max to trigger disk pressure
-	cfg.S3Configured = false   // no S3 — all segments are eligible
+	cfg.SegmentMaxBytes = 200 // small segments to force rotation
+	cfg.MaxDiskSize = 500     // small max to trigger disk pressure
+	cfg.S3Configured = false  // no S3 — all segments are eligible
 	cfg.FsyncEnabled = false
 	cfg.Clock = &clock.FakeClock{}
 

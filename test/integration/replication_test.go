@@ -767,11 +767,11 @@ func TestReplicationPromotionWithWALPressure(t *testing.T) {
 	t.Parallel()
 
 	const (
-		walSegmentSize = 32 * 1024  // 32 KiB segments
-		walMaxDisk     = 64 * 1024  // 64 KiB total WAL — only 2 segments
-		s3ObjSize      = 16 * 1024  // 16 KiB S3 objects — flush often
-		totalRecords   = 200        // enough to overflow WAL multiple times
-		valuePadding   = 256        // ~256 bytes per record to fill WAL faster
+		walSegmentSize = 32 * 1024 // 32 KiB segments
+		walMaxDisk     = 64 * 1024 // 64 KiB total WAL — only 2 segments
+		s3ObjSize      = 16 * 1024 // 16 KiB S3 objects — flush often
+		totalRecords   = 200       // enough to overflow WAL multiple times
+		valuePadding   = 256       // ~256 bytes per record to fill WAL faster
 	)
 
 	pair := StartReplicaPair(t,

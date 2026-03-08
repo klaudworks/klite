@@ -36,12 +36,12 @@ type TLSStore interface {
 
 // TLSConfig configures EnsureTLS.
 type TLSConfig struct {
-	Store     TLSStore     // S3 storage for certs
-	Prefix    string       // S3 key prefix (e.g. "klite-<clusterID>")
-	CacheDir  string       // Local cache directory (e.g. "<data-dir>/repl-tls/")
-	ExtraSANs []string     // Additional DNS SANs for the node certificate
+	Store     TLSStore // S3 storage for certs
+	Prefix    string   // S3 key prefix (e.g. "klite-<clusterID>")
+	CacheDir  string   // Local cache directory (e.g. "<data-dir>/repl-tls/")
+	ExtraSANs []string // Additional DNS SANs for the node certificate
 	Logger    *slog.Logger
-	Clock     clock.Clock  // If nil, uses clock.RealClock{}
+	Clock     clock.Clock // If nil, uses clock.RealClock{}
 }
 
 // EnsureTLS ensures TLS certificates exist for replication mTLS. It checks

@@ -306,18 +306,18 @@ func makeTestBatchPID(baseOffset int64, numRecords int32, pid int64, epoch int16
 	raw := make([]byte, 61)
 	binary.BigEndian.PutUint64(raw[0:8], uint64(baseOffset))
 	binary.BigEndian.PutUint32(raw[8:12], 49) // batchLength
-	raw[16] = 2                                // magic
+	raw[16] = 2                               // magic
 	binary.BigEndian.PutUint32(raw[17:21], 0xDEADBEEF)
 	lastDelta := numRecords - 1
 	if lastDelta < 0 {
 		lastDelta = 0
 	}
 	binary.BigEndian.PutUint32(raw[23:27], uint32(lastDelta))
-	binary.BigEndian.PutUint64(raw[27:35], 1000)                    // baseTimestamp
-	binary.BigEndian.PutUint64(raw[35:43], 2000)                    // maxTimestamp
-	binary.BigEndian.PutUint64(raw[43:51], uint64(pid))             // producerID
-	binary.BigEndian.PutUint16(raw[51:53], uint16(epoch))           // producerEpoch
-	binary.BigEndian.PutUint32(raw[53:57], uint32(baseSeq))         // baseSequence
+	binary.BigEndian.PutUint64(raw[27:35], 1000)            // baseTimestamp
+	binary.BigEndian.PutUint64(raw[35:43], 2000)            // maxTimestamp
+	binary.BigEndian.PutUint64(raw[43:51], uint64(pid))     // producerID
+	binary.BigEndian.PutUint16(raw[51:53], uint16(epoch))   // producerEpoch
+	binary.BigEndian.PutUint32(raw[53:57], uint32(baseSeq)) // baseSequence
 	binary.BigEndian.PutUint32(raw[57:61], uint32(numRecords))
 	return raw
 }

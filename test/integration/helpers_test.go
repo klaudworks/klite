@@ -225,30 +225,6 @@ func ProduceN(t *testing.T, cl *kgo.Client, topic string, n int) []*kgo.Record {
 	return records
 }
 
-// waitEndOffset polls ListEndOffsets on the broker until the end offset for the
-// given topic/partition reaches at least minOffset. This replaces fixed
-// time.Sleep calls for replication catch-up.
-func waitEndOffset(t *testing.T, addr, topic string, partition int32, minOffset int64, timeout time.Duration) {
-	t.Helper()
-	cl := NewClient(t, addr)
-	defer cl.Close()
-	admin := kadm.NewClient(cl)
-	deadline := time.After(timeout)
-	for {
-		offsets, err := admin.ListEndOffsets(context.Background(), topic)
-		if err == nil {
-			if lo, ok := offsets.Lookup(topic, partition); ok && lo.Err == nil && lo.Offset >= minOffset {
-				return
-			}
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("end offset for %s/%d did not reach %d within %s", topic, partition, minOffset, timeout)
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-}
-
 // waitGroupState polls DescribeGroups until the group reaches the desired
 // state. This replaces fixed time.Sleep calls for group stabilization.
 func waitGroupState(t *testing.T, addr, group, wantState string, timeout time.Duration) {
