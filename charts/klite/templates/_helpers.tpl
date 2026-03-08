@@ -78,6 +78,15 @@ Defaults to the service FQDN if not explicitly set.
 {{- end }}
 
 {{/*
+Return the Kafka cluster ID. Uses broker.clusterID if set, otherwise derives
+a stable ID from the release fullname so all pods in a StatefulSet share the
+same cluster ID without requiring manual configuration.
+*/}}
+{{- define "klite.clusterID" -}}
+{{- default .Release.Name .Values.broker.clusterID }}
+{{- end }}
+
+{{/*
 Return the proper image name.
 */}}
 {{- define "klite.image" -}}

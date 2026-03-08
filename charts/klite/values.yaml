@@ -164,7 +164,7 @@ serviceAccount:
   ## @param serviceAccount.annotations ServiceAccount annotations (e.g. IRSA role ARN)
   annotations: {}
   ## @param serviceAccount.automountServiceAccountToken Mount the token into pods
-  automountServiceAccountToken: false
+  automountServiceAccountToken: true
 
 ## @section Replication
 ## Enable active-passive streaming replication with automatic failover.

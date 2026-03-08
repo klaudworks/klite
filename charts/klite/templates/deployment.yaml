@@ -58,9 +58,7 @@ spec:
             - --auto-create-topics={{ .Values.broker.autoCreateTopics }}
             - --log-level={{ .Values.broker.logLevel }}
             - --advertised-addr={{ include "klite.advertisedAddr" . }}
-            {{- if .Values.broker.clusterID }}
-            - --cluster-id={{ .Values.broker.clusterID }}
-            {{- end }}
+            - --cluster-id={{ include "klite.clusterID" . }}
             {{- if .Values.health.enabled }}
             - --health-addr=:{{ .Values.health.port }}
             {{- end }}

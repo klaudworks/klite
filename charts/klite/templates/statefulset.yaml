@@ -60,9 +60,7 @@ spec:
             - --auto-create-topics={{ .Values.broker.autoCreateTopics }}
             - --log-level={{ .Values.broker.logLevel }}
             - --advertised-addr={{ include "klite.advertisedAddr" . }}
-            {{- if .Values.broker.clusterID }}
-            - --cluster-id={{ .Values.broker.clusterID }}
-            {{- end }}
+            - --cluster-id={{ include "klite.clusterID" . }}
             {{- if .Values.health.enabled }}
             - --health-addr=:{{ .Values.health.port }}
             {{- end }}
@@ -78,6 +76,7 @@ spec:
             {{- end }}
             - --replication-addr=:{{ .Values.replication.port }}
             - --replication-advertised-addr=$(POD_NAME).{{ include "klite.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.replication.port }}
+            - --replication-tls-san=*.{{ include "klite.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
             - --replication-id=$(POD_NAME)
             - --replication-ack-timeout={{ .Values.replication.ackTimeout }}
             - --lease-duration={{ .Values.replication.leaseDuration }}
