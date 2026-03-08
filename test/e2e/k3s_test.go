@@ -462,7 +462,60 @@ func (c *cluster) consumeAll(expected int64) int64 {
 	if err != nil {
 		logf("consume warning: consumed %d/%d records: %v", result.Records, expected, err)
 	}
+	if result.Records != expected {
+		// Diagnostic: do a raw sequential consume to find the gap.
+		c.diagnoseConsumeGap(expected)
+	}
 	return result.Records
+}
+
+// diagnoseConsumeGap uses a raw franz-go client to consume from offset 0 and
+// log any offset gaps or jumps.
+func (c *cluster) diagnoseConsumeGap(expected int64) {
+	c.t.Helper()
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(c.proxyAddr),
+		kgo.ConsumeTopics(c.topic),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			c.topic: {0: kgo.NewOffset().AtStart()},
+		}),
+		kgo.Dialer(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", c.proxyAddr)
+		}),
+	)
+	if err != nil {
+		logf("diagnose: client error: %v", err)
+		return
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(c.ctx, 15*time.Second)
+	defer cancel()
+
+	var count int64
+	var lastOffset int64 = -1
+	var gaps []string
+	for ctx.Err() == nil {
+		fetches := client.PollFetches(ctx)
+		fetches.EachRecord(func(r *kgo.Record) {
+			if lastOffset >= 0 && r.Offset != lastOffset+1 {
+				gap := fmt.Sprintf("gap: offset %d → %d (missing %d)",
+					lastOffset, r.Offset, r.Offset-lastOffset-1)
+				if len(gaps) < 10 {
+					gaps = append(gaps, gap)
+				}
+			}
+			lastOffset = r.Offset
+			count++
+		})
+		if lastOffset+1 >= expected {
+			break
+		}
+	}
+	logf("diagnose: consumed %d records, last offset=%d, gaps=%d", count, lastOffset, len(gaps))
+	for _, g := range gaps {
+		logf("diagnose: %s", g)
+	}
 }
 
 // logPartitionHW queries the broker for the current high watermark via ListOffsets.
