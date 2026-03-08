@@ -114,6 +114,8 @@ Both nodes are alive but can't see each other. The primary attempts lease renewa
 
 The primary's next replication attempt fails. In sync mode, produces fail until the standby reconnects. In async mode, produces continue with local fsync only. When the standby restarts, it reconnects and catches up automatically.
 
+**Reconnection catch-up gap:** when the standby reconnects, the primary streams new WAL entries forward from that point. It does _not_ backfill entries written during the disconnection window. Those entries reach the standby only after the primary flushes them to S3 and the standby (if later promoted) discovers them via S3 probe. This means a failover immediately after standby reconnection could lose the local-only window. In practice, the S3 flusher runs every few seconds, so the window is small.
+
 ### Both nodes restart
 
 Both start as standbys and compete for the S3 lease. Exactly one wins and becomes primary. The other connects as standby and catches up.
