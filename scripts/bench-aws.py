@@ -465,13 +465,13 @@ def run_bench(
     step(1, total, "Starting klite on broker instance...")
     klite_flags = (
         f"--data-dir /data"
-        f" -advertised-addr {klite_priv}:9092"
-        f" -s3-bucket {s3_bucket}"
-        f" -s3-region {region}"
-        f" -s3-prefix {run_id}"
+        f" --advertised-addr {klite_priv}:9092"
+        f" --s3-bucket {s3_bucket}"
+        f" --s3-region {region}"
+        f" --s3-prefix {run_id}"
     )
     for flag, val in server_flags.items():
-        klite_flags += f" -{flag} {val}"
+        klite_flags += f" --{flag} {val}"
 
     ssh(klite_pub, (
         "docker rm -f klite 2>/dev/null;"
@@ -498,8 +498,8 @@ def run_bench(
     step(3, total, f"Creating topic '{topic}' with {partitions} partitions...")
     ssh(bench_ip, (
         f"docker run --rm --net host {ecr_bench}:latest"
-        f" create-topic -bootstrap-server {klite_priv}:9092"
-        f" -topic {topic} -partitions {partitions}"
+        f" create-topic --bootstrap-server {klite_priv}:9092"
+        f" --topic {topic} --partitions {partitions}"
     ))
     ok("topic created")
 
@@ -516,22 +516,22 @@ def run_bench(
     # 5. Start benchmark
     step(5, total, f"Starting benchmark ({mode})...")
     bench_flags = (
-        f"-bootstrap-server {klite_priv}:9092"
-        f" -topic {topic}"
-        f" -num-records {num_records}"
-        f" -record-size {record_size}"
-        f" -acks {acks}"
-        f" -throughput {throughput}"
-        f" -warmup-records {warmup_records}"
-        f" -reporting-interval {reporting_interval}"
-        f" -json-output /results/bench.jsonl"
+        f"--bootstrap-server {klite_priv}:9092"
+        f" --topic {topic}"
+        f" --num-records {num_records}"
+        f" --reporting-interval {reporting_interval}"
+        f" --json-output /results/bench.jsonl"
     )
     if mode in ("produce-consume", "produce"):
-        bench_flags += f" -producers {producers}"
-        bench_flags += f" -batch-max-bytes 1048576 -linger-ms 5"
-        bench_flags += f" -max-buffered-records {max_buffered_records}"
+        bench_flags += f" --record-size {record_size}"
+        bench_flags += f" --acks {acks}"
+        bench_flags += f" --throughput {throughput}"
+        bench_flags += f" --warmup-records {warmup_records}"
+        bench_flags += f" --producers {producers}"
+        bench_flags += f" --batch-max-bytes 1048576 --linger-ms 5"
+        bench_flags += f" --max-buffered-records {max_buffered_records}"
     if mode in ("produce-consume", "consume"):
-        bench_flags += f" -consumers {consumers}"
+        bench_flags += f" --consumers {consumers}"
 
     ssh(bench_ip, (
         "docker rm -f bench-run 2>/dev/null;"
@@ -727,7 +727,7 @@ def _verify_s3_count(
     """Run s3-count on the bench instance and compare against expected records."""
     r = ssh(bench_ip, (
         f"docker run --rm --net host {ecr_bench}:latest"
-        f" s3-count -bucket {s3_bucket} -prefix {run_id}/ -region {region} -json"
+        f" s3-count --bucket {s3_bucket} --prefix {run_id}/ --region {region} --json"
     ), capture=True, check=False)
 
     if r.returncode != 0:
