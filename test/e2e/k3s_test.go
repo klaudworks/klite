@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,6 +152,7 @@ type cluster struct {
 	producerDone   chan struct{}
 	producerAcked  atomic.Int64
 	producerErrors atomic.Int64
+	producerWG     sync.WaitGroup // tracks in-flight produce callbacks
 
 	// Port-forward to socat proxy.
 	proxyAddr string
@@ -359,7 +361,9 @@ func (c *cluster) runProducer(ctx context.Context) {
 
 	for ctx.Err() == nil {
 		rec := &kgo.Record{Value: append([]byte(nil), payload...)}
+		c.producerWG.Add(1)
 		client.Produce(ctx, rec, func(_ *kgo.Record, err error) {
+			defer c.producerWG.Done()
 			if err != nil {
 				c.producerErrors.Add(1)
 				return
@@ -420,6 +424,10 @@ func (c *cluster) stopProducer() int64 {
 	c.t.Helper()
 	c.producerCancel()
 	<-c.producerDone
+	// Wait for all produce callbacks to complete. franz-go's Close() does
+	// not guarantee callbacks have fired; the WaitGroup ensures we count
+	// every ack before reading the counter.
+	c.producerWG.Wait()
 	acked := c.producerAcked.Load()
 	errors := c.producerErrors.Load()
 	logf("producer stopped: %d acked, %d errors", acked, errors)

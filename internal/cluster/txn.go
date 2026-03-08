@@ -149,6 +149,10 @@ type ProducerIDManager struct {
 	producers map[int64]*ProducerState  // PID -> state
 	byTxnID   map[string]*ProducerState // txnID -> state
 	clk       clock.Clock
+
+	// Rate-limiting for "unknown PID" log messages.
+	unknownPIDLogTime  time.Time
+	unknownPIDLogCount int64
 }
 
 func NewProducerIDManager() *ProducerIDManager {
@@ -250,10 +254,31 @@ func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPar
 
 	ps, ok := m.producers[pid]
 	if !ok {
-		slog.Info("ValidateAndDedup: unknown PID, accepting as new producer",
-			"pid", pid, "epoch", epoch, "topic", tp.Topic, "partition", tp.Partition,
-			"firstSeq", firstSeq, "numRecords", numRecords)
-		return 0, false, 0 // unknown PID — likely idempotent producer that restarted
+		now := m.clk.Now()
+		m.unknownPIDLogCount++
+		if now.Sub(m.unknownPIDLogTime) >= 5*time.Second {
+			slog.Info("ValidateAndDedup: unknown PID, accepting as new producer",
+				"pid", pid, "epoch", epoch, "topic", tp.Topic, "partition", tp.Partition,
+				"firstSeq", firstSeq, "numRecords", numRecords,
+				"occurrences_since_last_log", m.unknownPIDLogCount)
+			m.unknownPIDLogTime = now
+			m.unknownPIDLogCount = 0
+		}
+		// Register the PID so subsequent batches get dedup protection.
+		// After failover the new primary doesn't know PIDs allocated by
+		// the old primary; we accept the first batch and track state from
+		// here so retries are properly deduped. Use Replay (not
+		// PushAndValidate) because the sequence may be non-zero.
+		ps = &ProducerState{
+			ProducerID: pid,
+			Epoch:      epoch,
+			Sequences:  make(map[TopicPartition]*SequenceWindow),
+		}
+		m.producers[pid] = ps
+		w := &SequenceWindow{}
+		ps.Sequences[tp] = w
+		w.Replay(epoch, firstSeq, numRecords, baseOffset)
+		return 0, false, 0
 	}
 
 	if epoch != ps.Epoch {

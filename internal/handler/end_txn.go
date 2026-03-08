@@ -1,13 +1,18 @@
 package handler
 
 import (
+	"log/slog"
+
+	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
+	"github.com/klaudworks/klite/internal/wal"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func HandleEndTxn(state *cluster.State, clk clock.Clock) server.Handler {
+func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.EndTxnRequest)
 		resp := r.ResponseKind().(*kmsg.EndTxnResponse)
@@ -24,11 +29,21 @@ func HandleEndTxn(state *cluster.State, clk clock.Clock) server.Handler {
 		}
 
 		if endState.TxnPartitions == nil {
-			// Retry case or empty transaction
 			return resp, nil
 		}
 
 		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, endState.Commit, clk.Now().UnixMilli())
+
+		// Phase 1: Reserve offsets and submit WAL writes for all partitions.
+		type pendingControl struct {
+			pd         *cluster.PartData
+			baseOffset int64
+			meta       cluster.BatchMeta
+			stored     []byte
+			errCh      <-chan error
+			tp         cluster.TopicPartition
+		}
+		var pending []pendingControl
 
 		for tp := range endState.TxnPartitions {
 			td := state.GetTopic(tp.Topic)
@@ -45,22 +60,82 @@ func HandleEndTxn(state *cluster.State, clk clock.Clock) server.Handler {
 			raw := make([]byte, len(controlBatch))
 			copy(raw, controlBatch)
 
-			spare := pd.AcquireSpareChunk(len(raw))
 			pd.Lock()
-			baseOffset, spare := pd.PushBatch(raw, meta, spare)
-			pd.RemoveOpenTxn(endState.ProducerID)
+			baseOffset := pd.ReserveOffset(meta)
+			cluster.AssignOffset(raw, baseOffset)
+
+			walEntry := &wal.Entry{
+				TopicID:   pd.TopicID,
+				Partition: pd.Index,
+				Offset:    baseOffset,
+				Data:      raw,
+			}
+			errCh, walErr := walWriter.AppendAsync(walEntry)
+			if walErr != nil {
+				pd.RollbackReserve(baseOffset)
+				pd.Unlock()
+				slog.Error("EndTxn WAL submit failed",
+					"topic", tp.Topic, "partition", tp.Partition, "err", walErr)
+				resp.ErrorCode = kerr.KafkaStorageError.Code
+				return resp, nil
+			}
+			pd.Unlock()
+
+			pending = append(pending, pendingControl{
+				pd:         pd,
+				baseOffset: baseOffset,
+				meta:       meta,
+				stored:     raw,
+				errCh:      errCh,
+				tp:         tp,
+			})
+		}
+
+		// Phase 2: Wait for WAL fsync, then commit to chunks.
+		for i := range pending {
+			pc := &pending[i]
+
+			walErr := <-pc.errCh
+			if walErr != nil {
+				slog.Error("EndTxn WAL write failed",
+					"topic", pc.tp.Topic, "partition", pc.tp.Partition,
+					"baseOffset", pc.baseOffset, "err", walErr)
+				pc.pd.Lock()
+				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
+				pc.pd.Unlock()
+				resp.ErrorCode = kerr.KafkaStorageError.Code
+				continue
+			}
+
+			spare := pc.pd.AcquireSpareChunk(len(pc.stored))
+
+			pc.pd.Lock()
+			spare = pc.pd.AppendToChunk(pc.stored, chunk.ChunkBatch{
+				BaseOffset:      pc.baseOffset,
+				LastOffsetDelta: pc.meta.LastOffsetDelta,
+				MaxTimestamp:    pc.meta.MaxTimestamp,
+				NumRecords:      pc.meta.NumRecords,
+			}, spare)
+			pc.pd.CommitBatch(cluster.StoredBatch{
+				BaseOffset:      pc.baseOffset,
+				LastOffsetDelta: pc.meta.LastOffsetDelta,
+				RawBytes:        pc.stored,
+				MaxTimestamp:    pc.meta.MaxTimestamp,
+				NumRecords:      pc.meta.NumRecords,
+			})
+			pc.pd.RemoveOpenTxn(endState.ProducerID)
 			if !endState.Commit {
-				if firstOffset, ok := endState.TxnFirstOffsets[tp]; ok {
-					pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+				if firstOffset, ok := endState.TxnFirstOffsets[pc.tp]; ok {
+					pc.pd.AddAbortedTxn(cluster.AbortedTxnEntry{
 						ProducerID:  endState.ProducerID,
 						FirstOffset: firstOffset,
-						LastOffset:  baseOffset,
+						LastOffset:  pc.baseOffset,
 					})
 				}
 			}
-			pd.Unlock()
-			pd.ReleaseSpareChunk(spare)
-			pd.NotifyWaiters()
+			pc.pd.Unlock()
+			pc.pd.ReleaseSpareChunk(spare)
+			pc.pd.NotifyWaiters()
 		}
 
 		if endState.Commit {

@@ -369,6 +369,87 @@ func TestIsCommitControlBatchTooShort(t *testing.T) {
 	}
 }
 
+// TestValidateAndDedupRegistersUnknownPID verifies that when a produce arrives
+// for an unknown PID (e.g., after failover), the PID is registered and
+// subsequent duplicate batches are detected.
+func TestValidateAndDedupRegistersUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	// PID 42 was never registered via InitProducerID or ReplayBatch.
+	// First batch should be accepted.
+	errCode, isDup, _ := m.ValidateAndDedup(42, 0, tp, 100, 5, 500)
+	if errCode != 0 {
+		t.Fatalf("first batch: errCode=%d, want 0", errCode)
+	}
+	if isDup {
+		t.Fatal("first batch should not be a duplicate")
+	}
+
+	// Verify PID was registered.
+	ps := m.GetProducer(42)
+	if ps == nil {
+		t.Fatal("PID 42 should be registered after first ValidateAndDedup")
+	}
+	if ps.Epoch != 0 {
+		t.Fatalf("Epoch = %d, want 0", ps.Epoch)
+	}
+
+	// Retry of the same batch should be detected as duplicate.
+	errCode, isDup, dupOff := m.ValidateAndDedup(42, 0, tp, 100, 5, 999)
+	if errCode != 0 {
+		t.Fatalf("retry batch: errCode=%d, want 0", errCode)
+	}
+	if !isDup {
+		t.Fatal("retry batch should be detected as duplicate")
+	}
+	if dupOff != 500 {
+		t.Fatalf("dupOffset = %d, want 500", dupOff)
+	}
+
+	// Next sequence should be accepted.
+	errCode, isDup, _ = m.ValidateAndDedup(42, 0, tp, 105, 5, 505)
+	if errCode != 0 {
+		t.Fatalf("next batch: errCode=%d, want 0", errCode)
+	}
+	if isDup {
+		t.Fatal("next batch should not be a duplicate")
+	}
+}
+
+// TestValidateAndDedupUnknownPIDDifferentPartitions verifies that an unknown
+// PID producing to a second partition gets a new SequenceWindow for that
+// partition without interfering with the first.
+func TestValidateAndDedupUnknownPIDDifferentPartitions(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp0 := TopicPartition{Topic: "t", Partition: 0}
+	tp1 := TopicPartition{Topic: "t", Partition: 1}
+
+	// First produce on tp0 — registers PID.
+	errCode, isDup, _ := m.ValidateAndDedup(10, 0, tp0, 50, 5, 0)
+	if errCode != 0 || isDup {
+		t.Fatalf("tp0 first: errCode=%d isDup=%v", errCode, isDup)
+	}
+
+	// First produce on tp1 — PID exists now but no window for tp1.
+	// Should be accepted and create a new window.
+	errCode, isDup, _ = m.ValidateAndDedup(10, 0, tp1, 0, 3, 100)
+	if errCode != 0 || isDup {
+		t.Fatalf("tp1 first: errCode=%d isDup=%v", errCode, isDup)
+	}
+
+	// Retry on tp0 should be deduped.
+	errCode, isDup, _ = m.ValidateAndDedup(10, 0, tp0, 50, 5, 999)
+	if errCode != 0 {
+		t.Fatalf("tp0 retry: errCode=%d", errCode)
+	}
+	if !isDup {
+		t.Fatal("tp0 retry should be detected as duplicate")
+	}
+}
+
 func TestExpiredTransactionsReturnsExpired(t *testing.T) {
 	t.Parallel()
 

@@ -3,6 +3,7 @@ package repl
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -93,6 +94,7 @@ type mockMetaAppender struct {
 	rawEntries      [][]byte
 	replayedEntries [][]byte
 	snapshotData    []byte
+	appendRawErr    error
 	replayErr       error
 }
 
@@ -108,6 +110,9 @@ func (m *mockMetaAppender) ReplayEntry(frame []byte) error {
 func (m *mockMetaAppender) AppendRaw(frame []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.appendRawErr != nil {
+		return m.appendRawErr
+	}
 	cp := make([]byte, len(frame))
 	copy(cp, frame)
 	m.rawEntries = append(m.rawEntries, cp)
@@ -799,5 +804,74 @@ func TestWatermarkPiggyback(t *testing.T) {
 
 	if wm := wa.getS3FlushWatermark(); wm != 1500 {
 		t.Errorf("s3FlushWatermark after keepalive: got %d, want 1500", wm)
+	}
+}
+
+func TestReceiverMetaEntryError_TerminatesReadLoop(t *testing.T) {
+	primary, standby := net.Pipe()
+	defer primary.Close() //nolint:errcheck
+
+	wa := &mockWALAppender{nextSeq: 0}
+	ma := &mockMetaAppender{appendRawErr: fmt.Errorf("disk I/O error")}
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.RunOnConn(context.Background(), standby)
+	}()
+
+	// Read HELLO
+	if _, _, err := ReadFrame(primary); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send a MsgMetaEntry that will fail on AppendRaw
+	if err := WriteFrame(primary, MsgMetaEntry, []byte("meta-entry-data")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The readLoop must terminate with an error — not silently continue
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected readLoop to return error on meta entry failure, got nil")
+		}
+		t.Logf("readLoop terminated with: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: readLoop did not terminate after meta entry error")
+	}
+}
+
+func TestReceiverMetaReplayError_TerminatesReadLoop(t *testing.T) {
+	primary, standby := net.Pipe()
+	defer primary.Close() //nolint:errcheck
+
+	wa := &mockWALAppender{nextSeq: 0}
+	ma := &mockMetaAppender{replayErr: fmt.Errorf("decode error")}
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.RunOnConn(context.Background(), standby)
+	}()
+
+	// Read HELLO
+	if _, _, err := ReadFrame(primary); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send a MsgMetaEntry that will succeed on AppendRaw but fail on ReplayEntry
+	if err := WriteFrame(primary, MsgMetaEntry, []byte("meta-entry-data")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected readLoop to return error on meta replay failure, got nil")
+		}
+		t.Logf("readLoop terminated with: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: readLoop did not terminate after meta replay error")
 	}
 }

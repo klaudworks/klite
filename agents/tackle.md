@@ -20,12 +20,11 @@ fulfills the plan's intent.
    - `go build ./...`
    - `go vet ./...`
    - `go test ./... -count=1`
-   - **If the change touches replication, leader election, WAL, S3 flushing,
-     failover paths, or anything that could affect behavior of a streaming
-     replica setup**, also run the e2e tests:
-     `go test -tags e2e -run TestK3sHelmReplicationFailover -timeout 10m -v ./test/e2e/`
-     These deploy klite into k3s with a standby replica and exercise failover
-     cycles. They require Docker and take several minutes.
+   - **All tests must pass** — not just the ones related to your change.
+     If a pre-existing test fails, investigate and fix it. Do not skip,
+     disable, or mark tests as expected-fail to work around breakage.
+     A "passing" build with suppressed failures is worse than a red build.
+   - **Do NOT run e2e tests** (`test/e2e/`). They are not stable yet.
    - Any additional verification from the plan
 7. If all green:
    - Commit: `improve(<scope>): <description>`
@@ -77,3 +76,5 @@ Do NOT fix them now. File and move on.
 - Leave uncommitted changes
 - Add new user-facing functionality
 - Gold-plate — implement what the plan asks for, elegantly, then stop
+- Skip or disable failing tests to make the suite "pass" — find and fix
+  the root cause, even if the failure seems unrelated to your change

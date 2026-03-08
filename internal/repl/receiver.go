@@ -146,7 +146,7 @@ func (r *Receiver) readLoop(conn net.Conn) error {
 
 		case MsgMetaEntry:
 			if err := r.handleMetaEntry(payload); err != nil {
-				r.logger.Warn("repl receiver: meta entry error", "err", err)
+				return fmt.Errorf("repl receiver: handle meta entry: %w", err)
 			}
 
 		default:

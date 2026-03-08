@@ -13,7 +13,9 @@ import (
 	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/wal"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func testHealthListener(t *testing.T) net.Listener {
@@ -589,6 +591,182 @@ func TestAbortOrphanedTransactions_NoOrphans(t *testing.T) {
 	}
 	if lso != 100 {
 		t.Fatalf("LSO = %d, want 100", lso)
+	}
+}
+
+// TestEndTxnControlBatchDurability verifies that EndTxn commit/abort control
+// batches are written to the WAL and survive replay. This is the regression
+// test for the bug where HandleEndTxn used PushBatch (in-memory only) instead
+// of routing through the WAL, causing committed transactions to be silently
+// re-aborted on restart.
+func TestEndTxnControlBatchDurability(t *testing.T) {
+	t.Parallel()
+	walDir := t.TempDir()
+	topicID := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	logger := slog.Default()
+
+	// Create WAL writer.
+	idx := wal.NewIndex()
+	walCfg := wal.DefaultWriterConfig()
+	walCfg.Dir = walDir
+	walCfg.S3Configured = true
+	walCfg.Logger = logger
+	w, err := wal.NewWriter(walCfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Stop() })
+
+	pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td.ID = topicID
+
+	pd := td.Partitions[0]
+	pd.Lock()
+	pd.TopicID = topicID
+	pd.InitWAL(pool, w, idx)
+	pd.Unlock()
+
+	// Set up a transactional producer with an open transaction.
+	const pid int64 = 42
+	const txnTimeoutMs int32 = 30000
+	allocPID, allocEpoch, errCode := state.PIDManager().InitProducerID("test-txn", txnTimeoutMs)
+	if errCode != 0 {
+		t.Fatalf("InitProducerID errCode=%d", errCode)
+	}
+
+	// Produce a transactional batch to set up HW and open txn state.
+	tp := cluster.TopicPartition{Topic: "test-topic", Partition: 0}
+	if ec := state.PIDManager().AddPartitionsToTxn(allocPID, allocEpoch, []cluster.TopicPartition{tp}); ec != 0 {
+		t.Fatalf("AddPartitionsToTxn errCode=%d", ec)
+	}
+
+	// Write a data batch through the WAL (simulating a produce).
+	batch := makeTestBatchPID(0, 5, pid, allocEpoch, 0)
+	// Set transactional attribute (bit 4)
+	binary.BigEndian.PutUint16(batch[17:19], binary.BigEndian.Uint16(batch[17:19])|0x0010)
+	entry := &wal.Entry{
+		TopicID:   topicID,
+		Partition: 0,
+		Offset:    0,
+		Data:      batch,
+	}
+	errCh, walErr := w.AppendAsync(entry)
+	if walErr != nil {
+		t.Fatal(walErr)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance HW and record the txn batch.
+	pd.Lock()
+	pd.SetHW(5)
+	pd.AddOpenTxn(allocPID, 0)
+	pd.Unlock()
+	state.PIDManager().RecordTxnBatch(allocPID, "test-topic", 0, 0)
+
+	// Now commit the transaction via HandleEndTxn.
+	h := handler.HandleEndTxn(state, w, clock.RealClock{})
+	endReq := &kmsg.EndTxnRequest{
+		TransactionalID: "test-txn",
+		ProducerID:      allocPID,
+		ProducerEpoch:   allocEpoch,
+		Commit:          true,
+	}
+	resp, err := h(endReq)
+	if err != nil {
+		t.Fatalf("HandleEndTxn error: %v", err)
+	}
+	endResp := resp.(*kmsg.EndTxnResponse)
+	if endResp.ErrorCode != 0 {
+		t.Fatalf("HandleEndTxn errCode=%d", endResp.ErrorCode)
+	}
+
+	// Verify the partition state: no open txns, HW advanced.
+	pd.RLock()
+	openPIDs := pd.OpenTxnPIDs()
+	hwAfter := pd.HW()
+	pd.RUnlock()
+	if len(openPIDs) != 0 {
+		t.Fatalf("expected no open txns after commit, got %d", len(openPIDs))
+	}
+	if hwAfter <= 5 {
+		t.Fatalf("HW should have advanced past 5 after control batch, got %d", hwAfter)
+	}
+
+	// KEY ASSERTION: Stop WAL, create a fresh state, replay the WAL, and
+	// verify the commit control batch survived (i.e. no orphaned open txns).
+	w.Stop()
+
+	// Create fresh state for replay.
+	idx2 := wal.NewIndex()
+	walCfg2 := wal.DefaultWriterConfig()
+	walCfg2.Dir = walDir
+	walCfg2.S3Configured = true
+	walCfg2.Logger = logger
+	w2, err := wal.NewWriter(walCfg2, idx2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w2.Stop() })
+
+	state2 := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+	td2, _, err := state2.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td2.ID = topicID
+	pd2 := td2.Partitions[0]
+	pd2.Lock()
+	pd2.TopicID = topicID
+	pd2.InitWAL(pool, w2, idx2)
+	pd2.Unlock()
+
+	b2 := &Broker{
+		walWriter: w2,
+		walIndex:  idx2,
+		chunkPool: pool,
+		state:     state2,
+		logger:    logger,
+		cfg:       Config{Clock: clock.RealClock{}},
+	}
+
+	if err := b2.replayWAL(w2); err != nil {
+		t.Fatalf("replayWAL: %v", err)
+	}
+
+	// After replay: the commit control batch should have been replayed,
+	// so no open transactions should exist.
+	pd2.RLock()
+	openPIDs2 := pd2.OpenTxnPIDs()
+	hw2 := pd2.HW()
+	pd2.RUnlock()
+
+	if len(openPIDs2) != 0 {
+		t.Fatalf("after WAL replay: expected no open txns (commit was durable), got %d open PIDs: %v", len(openPIDs2), openPIDs2)
+	}
+	if hw2 != hwAfter {
+		t.Fatalf("after WAL replay: HW = %d, want %d", hw2, hwAfter)
 	}
 }
 

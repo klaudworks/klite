@@ -26,7 +26,10 @@ You are reviewing a change made by a previous iteration.
      Large diffs are fine — judge the change by whether it improves klite,
      not by how many files it touches.
 8. `go build ./...` and `go vet ./...`
-9. `go test ./... -count=1`
+9. `go test ./... -count=1` — **all tests must pass**, not just those
+   related to the change. If an unrelated test fails, the change is not
+   approved until it is fixed (either by the reviewer as a fixup, or by
+   reverting).
 10. **If good**: `br close <review-issue-id> --reason "Approved"`
 11. **If minor issues** (typo, missed error wrap, off-by-one — things that
     don't change the approach):
@@ -63,4 +66,6 @@ br create "title" -d "description" -p 1 -l needs-plan --deps discovered-from:<re
 - Make improvements — review only
 - Refactor code touched by the commit
 - Add unrelated tests
-- Approve changes that fail build or tests
+- Approve changes that fail build or tests — even if the failure looks
+  unrelated, the suite must be green before approval
+- Skip, disable, or weaken tests to make the suite pass

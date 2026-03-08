@@ -396,11 +396,13 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	if len(coldBatches) > 0 {
 		coldBatches = filterBatchesByHW(coldBatches, hw)
 		if len(coldBatches) > 0 {
-			// Diagnostic: cold path returned data starting after the requested offset.
 			if coldBatches[0].BaseOffset > fetchOffset {
+				// Cold path returned data starting after the requested
+				// offset — suppress to avoid the consumer skipping the
+				// gap. Return empty so the consumer retries.
 				if now := time.Now().UnixNano(); now-lastColdGapLog.Load() > int64(time.Second) {
 					lastColdGapLog.Store(now)
-					slog.Warn("fetch: cold path gap",
+					slog.Warn("fetch: suppressing cold path gap",
 						"topic", topic, "partition", partIdx,
 						"fetch_offset", fetchOffset,
 						"cold_base_offset", coldBatches[0].BaseOffset,
@@ -408,8 +410,9 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 						"hw", hw, "s3_watermark", s3WM,
 						"chunk_first_offset", chunkFirstOffset)
 				}
+			} else {
+				return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: coldBatches}
 			}
-			return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: coldBatches}
 		}
 	}
 
@@ -425,17 +428,21 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 			"wal_index_nil", walIdx == nil, "s3_fetch_nil", s3Fetch == nil)
 	}
 
-	// Diagnostic: falling back to chunk batches that start after the requested offset.
+	// Never return chunk batches that start after the requested offset —
+	// this would cause the consumer to skip records in the gap. Return an
+	// empty response so the consumer retries (and triggers the long-poll
+	// wait path). The data should eventually appear via S3 listing refresh.
 	if len(chunkBatches) > 0 && chunkBatches[0].BaseOffset > fetchOffset {
 		if now := time.Now().UnixNano(); now-lastChunkFallbackLog.Load() > int64(time.Second) {
 			lastChunkFallbackLog.Store(now)
-			slog.Warn("fetch: chunk fallback gap",
+			slog.Warn("fetch: suppressing chunk fallback gap",
 				"topic", topic, "partition", partIdx,
 				"fetch_offset", fetchOffset,
 				"chunk_base_offset", chunkBatches[0].BaseOffset,
 				"gap", chunkBatches[0].BaseOffset-fetchOffset,
 				"hw", hw, "s3_watermark", s3WM)
 		}
+		return FetchResponse{HW: hw, LogStart: logStart, LSO: lso}
 	}
 
 	return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: chunkBatches}

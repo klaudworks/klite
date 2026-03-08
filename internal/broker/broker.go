@@ -198,7 +198,7 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 	b.handlers.Register(22, handler.HandleInitProducerID(b.state))
 	b.handlers.Register(24, handler.HandleAddPartitionsToTxn(b.state))
 	b.handlers.Register(25, handler.HandleAddOffsetsToTxn(b.state))
-	b.handlers.Register(26, handler.HandleEndTxn(b.state, b.cfg.Clock))
+	b.handlers.Register(26, handler.HandleEndTxn(b.state, b.walWriter, b.cfg.Clock))
 	b.handlers.Register(28, handler.HandleTxnOffsetCommit(b.state))
 	b.handlers.Register(61, handler.HandleDescribeProducers(b.state))
 	b.handlers.Register(65, handler.HandleDescribeTransactions(b.state))
@@ -525,6 +525,18 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// that predate the receiver (e.g. local WAL from a previous primary tenure).
 	b.rebuildHWFromWAL()
 
+	// Probe S3 for the actual flush watermark BEFORE rebuilding chunks.
+	// The standby's s3FlushWatermark lags the actual S3 state because the
+	// old primary may have flushed more data after the last watermark update
+	// was replicated. Without this probe, rebuildChunksFromWAL may skip WAL
+	// entries that it assumes are in S3 (based on the stale watermark) but
+	// whose offsets fall in a gap between the stale watermark and the first
+	// WAL entry — data the old primary had in chunks/WAL and flushed to S3
+	// but never replicated the watermark for.
+	if b.s3Client != nil {
+		b.probeS3Watermarks()
+	}
+
 	// Log partition state at promotion time for diagnostics.
 	if b.walIndex != nil {
 		for _, tp := range b.walIndex.AllPartitions() {
@@ -576,14 +588,6 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// so the timeout sweep cannot find them. Sweep them now before accepting
 	// connections.
 	b.abortOrphanedTransactions()
-
-	// Probe S3 for partition HW. The replication snapshot may skip WAL entries
-	// that were already flushed to S3 by the old primary, leaving the standby
-	// with no WAL data for those offsets. This probe discovers the S3 HW and
-	// ensures nextReserve starts past any data already in S3.
-	if b.s3Client != nil {
-		b.probeS3Watermarks()
-	}
 
 	// Set up replication sender: start replication listener
 	b.startReplicationListener(primaryCtx)
@@ -1042,12 +1046,6 @@ func (b *Broker) rebuildChunksFromWAL() {
 		// Track open txns per-producer to reconstruct abortedTxns index.
 		openTxnFirstOffset := make(map[int64]int64) // producerID -> first data offset
 		for _, e := range entries {
-			// Skip entries already flushed to S3.
-			if e.LastOffset < s3WM {
-				skippedS3++
-				continue
-			}
-
 			data, err := b.walWriter.ReadBatch(e)
 			if err != nil {
 				skippedRead++
@@ -1065,9 +1063,17 @@ func (b *Broker) rebuildChunksFromWAL() {
 				continue
 			}
 
+			// Replay dedup state for ALL entries so the PIDManager knows
+			// about producers whose batches were already flushed to S3.
 			if meta.ProducerID >= 0 && meta.BaseSequence >= 0 {
 				ctp := cluster.TopicPartition{Topic: td.Name, Partition: int32(tp.Partition)}
 				b.state.PIDManager().ReplayBatch(ctp, meta, e.BaseOffset)
+			}
+
+			// Skip chunk rebuild for entries already flushed to S3.
+			if e.LastOffset < s3WM {
+				skippedS3++
+				continue
 			}
 
 			spare := pd.AcquireSpareChunk(len(data))
@@ -1896,10 +1902,11 @@ func (b *Broker) rehydrateDirtyCounters() {
 }
 
 // probeS3Watermarks discovers high-water marks from S3 for each partition
-// and updates the cluster state. For partitions with no WAL data (disaster
-// recovery), both HW and S3 flush watermark are set from S3. For partitions
-// with WAL data, only the S3 flush watermark is set to avoid re-flushing
-// objects that already exist in S3.
+// and updates the cluster state. Always probes, even when a watermark already
+// exists, because the standby's watermark may lag the actual S3 state — the
+// old primary may have flushed more data after the last watermark was
+// replicated. For partitions with no WAL data (disaster recovery), both HW
+// and S3 flush watermark are set from S3.
 func (b *Broker) probeS3Watermarks() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1908,14 +1915,6 @@ func (b *Broker) probeS3Watermarks() {
 	updated := 0
 	for _, td := range topics {
 		for _, pd := range td.Partitions {
-			pd.RLock()
-			flushWM := pd.S3FlushWatermark()
-			pd.RUnlock()
-
-			if flushWM > 0 {
-				continue // already has S3 flush watermark
-			}
-
 			s3HW, err := b.s3Reader.DiscoverHW(ctx, td.Name, td.ID, pd.Index)
 			if err != nil {
 				b.logger.Debug("S3 HW probe failed", "topic", td.Name, "partition", pd.Index, "err", err)
@@ -2224,6 +2223,17 @@ func (b *Broker) abortExpiredTransactions() {
 
 		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, false, b.cfg.Clock.Now().UnixMilli())
 
+		// Two-phase WAL write: submit all entries first, then commit after fsync.
+		type pendingAbort struct {
+			pd         *cluster.PartData
+			baseOffset int64
+			meta       cluster.BatchMeta
+			stored     []byte
+			errCh      <-chan error
+			tp         cluster.TopicPartition
+		}
+		var pending []pendingAbort
+
 		for tp := range endState.TxnPartitions {
 			td := b.state.GetTopic(tp.Topic)
 			if td == nil || int(tp.Partition) >= len(td.Partitions) {
@@ -2239,20 +2249,75 @@ func (b *Broker) abortExpiredTransactions() {
 			raw := make([]byte, len(controlBatch))
 			copy(raw, controlBatch)
 
-			spare := pd.AcquireSpareChunk(len(raw))
 			pd.Lock()
-			baseOffset, spare := pd.PushBatch(raw, meta, spare)
-			pd.RemoveOpenTxn(endState.ProducerID)
-			if firstOffset, ok := endState.TxnFirstOffsets[tp]; ok {
-				pd.AddAbortedTxn(cluster.AbortedTxnEntry{
-					ProducerID:  endState.ProducerID,
-					FirstOffset: firstOffset,
-					LastOffset:  baseOffset,
-				})
+			baseOffset := pd.ReserveOffset(meta)
+			cluster.AssignOffset(raw, baseOffset)
+
+			walEntry := &wal.Entry{
+				TopicID:   pd.TopicID,
+				Partition: pd.Index,
+				Offset:    baseOffset,
+				Data:      raw,
+			}
+			errCh, walErr := b.walWriter.AppendAsync(walEntry)
+			if walErr != nil {
+				pd.RollbackReserve(baseOffset)
+				pd.Unlock()
+				b.logger.Error("abortExpiredTransactions: WAL submit failed",
+					"topic", tp.Topic, "partition", tp.Partition, "err", walErr)
+				continue
 			}
 			pd.Unlock()
-			pd.ReleaseSpareChunk(spare)
-			pd.NotifyWaiters()
+
+			pending = append(pending, pendingAbort{
+				pd:         pd,
+				baseOffset: baseOffset,
+				meta:       meta,
+				stored:     raw,
+				errCh:      errCh,
+				tp:         tp,
+			})
+		}
+
+		for i := range pending {
+			pc := &pending[i]
+
+			walErr := <-pc.errCh
+			if walErr != nil {
+				b.logger.Error("abortExpiredTransactions: WAL write failed",
+					"topic", pc.tp.Topic, "partition", pc.tp.Partition, "err", walErr)
+				pc.pd.Lock()
+				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
+				pc.pd.Unlock()
+				continue
+			}
+
+			spare := pc.pd.AcquireSpareChunk(len(pc.stored))
+			pc.pd.Lock()
+			spare = pc.pd.AppendToChunk(pc.stored, chunk.ChunkBatch{
+				BaseOffset:      pc.baseOffset,
+				LastOffsetDelta: pc.meta.LastOffsetDelta,
+				MaxTimestamp:    pc.meta.MaxTimestamp,
+				NumRecords:      pc.meta.NumRecords,
+			}, spare)
+			pc.pd.CommitBatch(cluster.StoredBatch{
+				BaseOffset:      pc.baseOffset,
+				LastOffsetDelta: pc.meta.LastOffsetDelta,
+				RawBytes:        pc.stored,
+				MaxTimestamp:    pc.meta.MaxTimestamp,
+				NumRecords:      pc.meta.NumRecords,
+			})
+			pc.pd.RemoveOpenTxn(endState.ProducerID)
+			if firstOffset, ok := endState.TxnFirstOffsets[pc.tp]; ok {
+				pc.pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+					ProducerID:  endState.ProducerID,
+					FirstOffset: firstOffset,
+					LastOffset:  pc.baseOffset,
+				})
+			}
+			pc.pd.Unlock()
+			pc.pd.ReleaseSpareChunk(spare)
+			pc.pd.NotifyWaiters()
 		}
 
 		b.logger.Info("aborted expired transaction",
