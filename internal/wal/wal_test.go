@@ -1029,3 +1029,204 @@ func TestWALCleanupAfterPrune(t *testing.T) {
 		t.Errorf("diskUsage should decrease after cleanup: before=%d, after=%d", usageBefore, usageAfter)
 	}
 }
+
+func TestWriterReplayCorruptedTailTruncation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	topicID := [16]byte{1, 2, 3}
+
+	// Phase 1: Write 5 valid entries and stop cleanly.
+	{
+		idx := NewIndex()
+		w, err := NewWriter(WriterConfig{
+			Dir:             walDir,
+			SyncInterval:    1 * time.Millisecond,
+			SegmentMaxBytes: 64 * 1024 * 1024,
+			FsyncEnabled:    false,
+			Clock:           clock.RealClock{},
+		}, idx)
+		if err != nil {
+			t.Fatalf("NewWriter: %v", err)
+		}
+		if err := w.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		for i := 0; i < 5; i++ {
+			entry := &Entry{
+				TopicID:   topicID,
+				Partition: 0,
+				Offset:    int64(i * 3),
+				Data:      makeTestBatch(3, int64(1000+i)),
+			}
+			if err := w.Append(entry); err != nil {
+				t.Fatalf("Append %d: %v", i, err)
+			}
+		}
+		w.Stop()
+	}
+
+	// Phase 2: Append garbage bytes to the data-bearing segment to simulate
+	// a crash mid-write.
+	files, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	// Find the segment with the actual data (largest file size).
+	var segPath string
+	var maxSize int64
+	for _, f := range files {
+		if filepath.Ext(f.Name()) != ".wal" {
+			continue
+		}
+		info, _ := f.Info()
+		if info != nil && info.Size() > maxSize {
+			maxSize = info.Size()
+			segPath = filepath.Join(walDir, f.Name())
+		}
+	}
+	if segPath == "" {
+		t.Fatal("no .wal segment found")
+	}
+	// Remove any empty pre-created segments so they don't interfere.
+	for _, f := range files {
+		if filepath.Ext(f.Name()) != ".wal" {
+			continue
+		}
+		p := filepath.Join(walDir, f.Name())
+		if p == segPath {
+			continue
+		}
+		info, _ := f.Info()
+		if info != nil && info.Size() == 0 {
+			_ = os.Remove(p)
+		}
+	}
+
+	origStat, err := os.Stat(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origSize := origStat.Size()
+
+	// Append 50 bytes of garbage (simulates partial write + crash).
+	f, err := os.OpenFile(segPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	garbage := make([]byte, 50)
+	for i := range garbage {
+		garbage[i] = 0xDE
+	}
+	if _, err := f.Write(garbage); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	corruptStat, _ := os.Stat(segPath)
+	if corruptStat.Size() != origSize+50 {
+		t.Fatalf("expected corrupted file size %d, got %d", origSize+50, corruptStat.Size())
+	}
+
+	// Phase 3: Replay should recover all 5 valid entries and truncate the garbage.
+	{
+		idx := NewIndex()
+		w, err := NewWriter(WriterConfig{
+			Dir:             walDir,
+			SyncInterval:    1 * time.Millisecond,
+			SegmentMaxBytes: 64 * 1024 * 1024,
+			FsyncEnabled:    false,
+			Clock:           clock.RealClock{},
+		}, idx)
+		if err != nil {
+			t.Fatalf("NewWriter (replay): %v", err)
+		}
+
+		var replayed []Entry
+		if err := w.Replay(func(entry Entry, segmentSeq uint64, fileOffset int64) error {
+			replayed = append(replayed, entry)
+			return nil
+		}); err != nil {
+			t.Fatalf("Replay: %v", err)
+		}
+
+		if len(replayed) != 5 {
+			t.Fatalf("replayed entries: got %d, want 5", len(replayed))
+		}
+
+		// Verify the segment file was truncated back to the valid size.
+		truncStat, err := os.Stat(segPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if truncStat.Size() != origSize {
+			t.Errorf("segment should be truncated to %d, got %d", origSize, truncStat.Size())
+		}
+
+		// Verify NextSequence is correct (entries 0-4 → next = 5).
+		if w.NextSequence() != 5 {
+			t.Errorf("NextSequence: got %d, want 5", w.NextSequence())
+		}
+	}
+}
+
+func TestIndexConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	idx := NewIndex()
+	tp := TopicPartition{TopicID: [16]byte{1, 2, 3}, Partition: 0}
+
+	const numWriters = 4
+	const entriesPerWriter = 100
+
+	var wg sync.WaitGroup
+
+	// Concurrent writers
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			for i := 0; i < entriesPerWriter; i++ {
+				offset := int64(writerID*entriesPerWriter + i)
+				idx.Add(tp, IndexEntry{
+					BaseOffset:  offset,
+					LastOffset:  offset,
+					BatchSize:   100,
+					WALSequence: uint64(offset),
+				})
+			}
+		}(w)
+	}
+
+	// Concurrent readers
+	for r := 0; r < numWriters; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < entriesPerWriter; i++ {
+				_ = idx.Lookup(tp, int64(i), 1024*1024)
+				_ = idx.MaxOffset(tp)
+				_ = idx.UnflushedBytes(tp, 0)
+				_ = idx.AllPartitions()
+			}
+		}()
+	}
+
+	// Concurrent prune
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			idx.PruneBefore(tp, int64(i*10))
+		}
+	}()
+
+	wg.Wait()
+
+	// Sanity check: MaxOffset should be positive (entries were added).
+	if idx.MaxOffset(tp) == 0 {
+		t.Error("MaxOffset should be > 0 after concurrent adds")
+	}
+}
