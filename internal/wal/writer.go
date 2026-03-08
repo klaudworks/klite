@@ -108,7 +108,7 @@ type Writer struct {
 	stopped bool
 
 	// noStandbyWarned tracks whether we've logged the no-standby warning
-	noStandbyWarned bool
+	noStandbyWarned atomic.Bool
 
 	// replicator stores the current Replicator behind an atomic.Value
 	// so SetReplicator (called from the broker goroutine) and run()
@@ -307,7 +307,7 @@ func (w *Writer) SetNextSequence(seq uint64) {
 // Safe to call from any goroutine.
 func (w *Writer) SetReplicator(r Replicator) {
 	w.replicator.Store(wrappedReplicator{inner: r})
-	w.noStandbyWarned = false
+	w.noStandbyWarned.Store(false)
 }
 
 // getReplicator returns the current Replicator, or nil if none is set.
@@ -568,9 +568,9 @@ func parseSequence(entry []byte) uint64 {
 }
 
 func (w *Writer) logNoStandbyOnce() {
-	if !w.noStandbyWarned {
+	if !w.noStandbyWarned.Load() {
 		w.logger.Warn("replicator configured but no standby connected, proceeding with local fsync only")
-		w.noStandbyWarned = true
+		w.noStandbyWarned.Store(true)
 	}
 }
 

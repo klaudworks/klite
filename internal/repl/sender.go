@@ -67,6 +67,19 @@ func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 
 	payload := MarshalWALBatch(firstSeq, lastSeq, countEntries(batch), batch)
 
+	// Register the pending ACK entry BEFORE writing to the wire.
+	// If the write succeeds, the ackReader may receive the ACK
+	// immediately (especially on net.Pipe); registering after the
+	// write would race and lose the ACK.
+	s.mu.Lock()
+	if s.pending == nil {
+		s.mu.Unlock()
+		ch <- errDisconnected
+		return ch
+	}
+	s.pending[lastSeq] = ch
+	s.mu.Unlock()
+
 	s.writeMu.Lock()
 	if s.conn != nil {
 		_ = s.conn.SetWriteDeadline(time.Now().Add(s.ackTimeout))
@@ -76,18 +89,15 @@ func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 
 	if writeErr != nil {
 		s.logger.Warn("repl sender: WAL_BATCH write failed", "err", writeErr)
+		// Clean up the pending entry we just registered.
+		s.mu.Lock()
+		if s.pending != nil {
+			delete(s.pending, lastSeq)
+		}
+		s.mu.Unlock()
 		ch <- fmt.Errorf("repl: send WAL_BATCH: %w", writeErr)
 		return ch
 	}
-
-	s.mu.Lock()
-	if s.pending == nil {
-		s.mu.Unlock()
-		ch <- errDisconnected
-		return ch
-	}
-	s.pending[lastSeq] = ch
-	s.mu.Unlock()
 
 	// Start ACK timeout timer
 	time.AfterFunc(s.ackTimeout, func() {

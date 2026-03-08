@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -60,6 +61,37 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
 		return fmt.Errorf("s3 put %s: %w", key, err)
 	}
 	return nil
+}
+
+// PutObjectIfAbsent writes data only if the key does not already exist.
+// Returns ErrPreconditionFailed if the key exists.
+func (c *Client) PutObjectIfAbsent(ctx context.Context, key string, data []byte) error {
+	star := "*"
+	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      &c.bucket,
+		Key:         &key,
+		Body:        bytes.NewReader(data),
+		IfNoneMatch: &star,
+	})
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return ErrPreconditionFailed
+		}
+		return fmt.Errorf("s3 put-if-absent %s: %w", key, err)
+	}
+	return nil
+}
+
+// ErrPreconditionFailed is returned when a conditional write fails.
+var ErrPreconditionFailed = fmt.Errorf("precondition failed")
+
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		return code == "PreconditionFailed" || code == "ConditionalRequestConflict"
+	}
+	return false
 }
 
 func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {

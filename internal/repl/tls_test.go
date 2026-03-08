@@ -36,6 +36,18 @@ func (m *memTLSStore) Put(_ context.Context, key string, data []byte) error {
 	return nil
 }
 
+func (m *memTLSStore) PutIfAbsent(_ context.Context, key string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.data[key]; exists {
+		return ErrAlreadyExists
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	m.data[key] = cp
+	return nil
+}
+
 func (m *memTLSStore) Get(_ context.Context, key string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -75,9 +87,9 @@ func TestEnsureTLSGenerates(t *testing.T) {
 		t.Fatal("expected non-nil tls.Config")
 	}
 
-	// Verify 4 objects uploaded to S3
-	if store.count() != 4 {
-		t.Fatalf("expected 4 S3 objects, got %d", store.count())
+	// Verify single bundle object uploaded to S3
+	if store.count() != 1 {
+		t.Fatalf("expected 1 S3 object (bundle), got %d", store.count())
 	}
 
 	// Verify certs are cached locally
@@ -280,5 +292,68 @@ func TestEnsureTLSRejectsRogue(t *testing.T) {
 
 	if !handshakeFailed {
 		t.Fatal("expected rogue handshake to fail")
+	}
+}
+
+func TestEnsureTLSConcurrentRace(t *testing.T) {
+	t.Parallel()
+
+	store := newMemTLSStore()
+	ctx := context.Background()
+	prefix := "race-test"
+
+	// Two "nodes" call EnsureTLS concurrently on the same store.
+	// Both should get a valid TLS config using the same CA.
+	const n = 2
+	configs := make([]*tls.Config, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			cfg := TLSConfig{
+				Store:    store,
+				Prefix:   prefix,
+				CacheDir: t.TempDir(),
+			}
+			configs[idx], errs[idx] = EnsureTLS(ctx, cfg)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("node %d: EnsureTLS failed: %v", i, errs[i])
+		}
+		if configs[i] == nil {
+			t.Fatalf("node %d: nil tls.Config", i)
+		}
+	}
+
+	// Both configs must share the same CA — verify mTLS handshake succeeds.
+	serverCfg := configs[0].Clone()
+	clientCfg := configs[1].Clone()
+	clientCfg.InsecureSkipVerify = true
+
+	server, client := net.Pipe()
+	defer server.Close() //nolint:errcheck
+	defer client.Close() //nolint:errcheck
+
+	errCh := make(chan error, 2)
+	go func() {
+		tlsServer := tls.Server(server, serverCfg)
+		errCh <- tlsServer.Handshake()
+	}()
+	go func() {
+		tlsClient := tls.Client(client, clientCfg)
+		errCh <- tlsClient.Handshake()
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("mTLS handshake between concurrently-initialized nodes failed: %v", err)
+		}
 	}
 }

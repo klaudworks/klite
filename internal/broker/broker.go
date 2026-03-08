@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -58,14 +59,15 @@ type Broker struct {
 	mu   sync.Mutex
 	quit bool
 
+	kafkaListenAddr string // actual Kafka listen address (set on first promotion)
+
 	// Replication state
 	elector       lease.Elector
 	replTLSConfig *crypto_tls.Config
 	replListener  net.Listener
 	replSender    *repl.Sender
-	replReceiver  *repl.Receiver
-	replRole      atomic.Int32 // 0 = single-node/standby, 1 = primary
-	replCancel    context.CancelFunc
+	replRole      atomic.Int32       // 0 = single-node/standby, 1 = primary
+	replCancel    context.CancelFunc // protected by mu
 }
 
 func New(cfg Config) *Broker {
@@ -105,8 +107,13 @@ func New(cfg Config) *Broker {
 
 func (b *Broker) initSASLStore() {
 	if b.cfg.SASLStore != nil {
-		b.saslStore = b.cfg.SASLStore.(*sasl.Store)
-		return
+		store, ok := b.cfg.SASLStore.(*sasl.Store)
+		if !ok {
+			b.logger.Error("SASLStore has unexpected type, using empty store", "type", fmt.Sprintf("%T", b.cfg.SASLStore))
+		} else {
+			b.saslStore = store
+			return
+		}
 	}
 	b.saslStore = sasl.NewStore()
 
@@ -357,24 +364,19 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 		}
 	}
 
-	// Ensure TLS certificates exist
-	var s3api s3store.S3API
-	if b.cfg.S3API != nil {
-		s3api = b.cfg.S3API.(s3store.S3API)
-	}
-
-	// Build TLS store adapter
-	if s3api != nil {
+	// Ensure TLS certificates exist (requires S3 for cert storage)
+	if b.s3Client != nil {
 		prefix := "klite-" + b.clusterID
 		if b.cfg.S3Prefix != "" {
 			prefix = b.cfg.S3Prefix + "/" + prefix
 		}
 
 		tlsCfg, err := repl.EnsureTLS(ctx, repl.TLSConfig{
-			Store:    &s3TLSStore{s3Client: b.s3Client},
-			Prefix:   prefix,
-			CacheDir: filepath.Join(b.cfg.DataDir, "repl-tls"),
-			Logger:   b.logger,
+			Store:     &s3TLSStore{s3Client: b.s3Client},
+			Prefix:    prefix,
+			CacheDir:  filepath.Join(b.cfg.DataDir, "repl-tls"),
+			ExtraSANs: b.cfg.ReplicationTLSSANs,
+			Logger:    b.logger,
 		})
 		if err != nil {
 			return fmt.Errorf("ensure TLS: %w", err)
@@ -384,9 +386,17 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 
 	// Create the lease elector
 	if b.cfg.LeaseElector != nil {
-		b.elector = b.cfg.LeaseElector.(lease.Elector)
+		elector, ok := b.cfg.LeaseElector.(lease.Elector)
+		if !ok {
+			return fmt.Errorf("LeaseElector has unexpected type %T", b.cfg.LeaseElector)
+		}
+		b.elector = elector
 	} else {
-		b.elector = b.createS3Elector()
+		elector, err := b.createS3Elector()
+		if err != nil {
+			return fmt.Errorf("create S3 lease elector: %w", err)
+		}
+		b.elector = elector
 	}
 
 	b.logger.Info("klite started (replication mode)",
@@ -414,6 +424,12 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 	// Primary-only context for background tasks
 	var primaryCtx context.Context
 	var primaryCancel context.CancelFunc
+
+	// Start receiver eagerly so a born-standby connects to the primary as
+	// soon as one is elected. onElected will call stopReceiver before
+	// becoming primary. The retry loop inside startReceiverFromLease
+	// handles the case where no primary exists yet.
+	b.startReceiverFromLease()
 
 	electorErrCh := make(chan error, 1)
 	go func() {
@@ -495,6 +511,12 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// Stop any running receiver (was standby before)
 	b.stopReceiver()
 
+	// Rebuild high watermarks from WAL index. Replicated WAL entries are
+	// indexed but don't update the in-memory HW, so after promotion the
+	// new primary must advance HW to make replicated data visible to
+	// consumers.
+	b.rebuildHWFromWAL()
+
 	// Set up replication sender: start replication listener
 	b.startReplicationListener(primaryCtx)
 
@@ -502,13 +524,23 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	var err error
 	ln := b.cfg.Listener
 	if ln == nil {
-		ln, err = net.Listen("tcp", b.cfg.Listen)
+		listenAddr := b.kafkaListenAddr
+		if listenAddr == "" {
+			listenAddr = b.cfg.Listen
+		}
+		ln, err = net.Listen("tcp", listenAddr)
 		if err != nil {
-			b.logger.Error("failed to start Kafka listener", "err", err)
+			b.logger.Error("failed to start Kafka listener, reverting to standby", "err", err)
+			if b.cfg.RoleChangeHook != nil {
+				b.cfg.RoleChangeHook.ClearPrimary()
+			}
+			b.shutdownPrimary()
+			b.startReceiverFromLease()
 			return
 		}
 	}
 	b.cfg.Listener = nil // consume the injected listener so re-promotion creates a new one
+	b.kafkaListenAddr = ln.Addr().String()
 	b.listener = ln
 
 	// Resolve advertised address now that the listener is open
@@ -742,24 +774,34 @@ func (b *Broker) currentEpoch() uint64 {
 }
 
 // startReceiverFromLease reads the primary address from the lease and starts a receiver.
+// If the primary address is not yet known (new primary not elected), it polls
+// until the address appears or the context is cancelled.
 func (b *Broker) startReceiverFromLease() {
 	if b.elector == nil {
 		return
 	}
-	primaryAddr := b.elector.PrimaryAddr()
-	if primaryAddr == "" {
-		b.logger.Info("repl receiver: no primary address in lease, will retry on next poll")
-		return
-	}
-
-	epoch := b.elector.Epoch()
-	receiver := repl.NewReceiver(b.walWriter, b.metaLog, epoch, b.logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	b.mu.Lock()
 	b.replCancel = cancel
-	b.replReceiver = receiver
+	b.mu.Unlock()
 
 	go func() {
+		// Wait for primary address to become available
+		primaryAddr := b.elector.PrimaryAddr()
+		for primaryAddr == "" {
+			b.logger.Debug("repl receiver: no primary address in lease, polling...")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			primaryAddr = b.elector.PrimaryAddr()
+		}
+
+		epoch := b.elector.Epoch()
+		receiver := repl.NewReceiver(b.walWriter, b.metaLog, epoch, b.logger)
+
 		for {
 			b.logger.Info("repl receiver: connecting to primary", "addr", primaryAddr)
 			err := receiver.Run(ctx, primaryAddr, b.replTLSConfig)
@@ -785,11 +827,52 @@ func (b *Broker) startReceiverFromLease() {
 
 // stopReceiver stops the replication receiver if it's running.
 func (b *Broker) stopReceiver() {
-	if b.replCancel != nil {
-		b.replCancel()
-		b.replCancel = nil
+	b.mu.Lock()
+	cancel := b.replCancel
+	b.replCancel = nil
+	b.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	b.replReceiver = nil
+}
+
+// rebuildHWFromWAL scans the WAL index and advances the high watermark
+// for every partition that has replicated data. This is needed because
+// AppendReplicated writes WAL entries and indexes them, but does not
+// update the in-memory partition high watermark.
+func (b *Broker) rebuildHWFromWAL() {
+	if b.walIndex == nil {
+		return
+	}
+	allTP := b.walIndex.AllPartitions()
+	rebuilt := 0
+	for _, tp := range allTP {
+		maxOff := b.walIndex.MaxOffset(tp)
+		if maxOff == 0 {
+			continue
+		}
+		td := b.state.GetTopicByID(tp.TopicID)
+		if td == nil {
+			b.logger.Warn("rebuildHW: topic not found in state (may indicate missed metadata entry)", "topic_id", tp.TopicID, "partition", tp.Partition)
+			continue
+		}
+		if int(tp.Partition) >= len(td.Partitions) {
+			continue
+		}
+		pd := td.Partitions[tp.Partition]
+		pd.Lock()
+		if maxOff > pd.HW() {
+			b.logger.Debug("rebuildHW: advancing HW", "topic", td.Name, "partition", tp.Partition, "old_hw", pd.HW(), "new_hw", maxOff)
+			pd.SetHW(maxOff)
+			rebuilt++
+		}
+		pd.Unlock()
+	}
+	if rebuilt > 0 {
+		b.logger.Info("rebuilt high watermarks from WAL index", "partitions", rebuilt)
+	} else if len(allTP) > 0 {
+		b.logger.Debug("rebuildHW: no HW changes needed", "wal_partitions", len(allTP))
+	}
 }
 
 // s3TLSStore adapts the S3 client to the TLSStore interface.
@@ -801,15 +884,33 @@ func (s *s3TLSStore) Put(ctx context.Context, key string, data []byte) error {
 	return s.s3Client.PutObject(ctx, key, data)
 }
 
+func (s *s3TLSStore) PutIfAbsent(ctx context.Context, key string, data []byte) error {
+	err := s.s3Client.PutObjectIfAbsent(ctx, key, data)
+	if errors.Is(err, s3store.ErrPreconditionFailed) {
+		return repl.ErrAlreadyExists
+	}
+	return err
+}
+
 func (s *s3TLSStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return s.s3Client.GetObject(ctx, key)
 }
 
 // createS3Elector creates an S3 lease elector from broker config.
-func (b *Broker) createS3Elector() lease.Elector {
+func (b *Broker) createS3Elector() (lease.Elector, error) {
 	var s3api s3store.S3API
 	if b.cfg.S3API != nil {
-		s3api = b.cfg.S3API.(s3store.S3API)
+		var ok bool
+		s3api, ok = b.cfg.S3API.(s3store.S3API)
+		if !ok {
+			return nil, fmt.Errorf("S3API has unexpected type %T", b.cfg.S3API)
+		}
+	} else {
+		var err error
+		s3api, err = createAWSS3Client(b.cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create AWS S3 client for lease: %w", err)
+		}
 	}
 
 	prefix := "klite-" + b.clusterID
@@ -855,7 +956,7 @@ func (b *Broker) createS3Elector() lease.Elector {
 		RenewInterval: renewInt,
 		RetryInterval: retryInt,
 		Logger:        b.logger,
-	})
+	}), nil
 }
 
 func (b *Broker) initMetadataLog() error {
@@ -1418,7 +1519,7 @@ func (b *Broker) rehydrateDirtyCounters() {
 
 	topics := b.state.GetAllTopics()
 	for _, td := range topics {
-		policy, ok := td.Configs["cleanup.policy"]
+		policy, ok := td.GetConfig("cleanup.policy")
 		if !ok {
 			policy = "delete"
 		}
@@ -1794,7 +1895,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 	var bestDirty int32
 
 	for _, td := range topics {
-		policy, ok := td.Configs["cleanup.policy"]
+		policy, ok := td.GetConfig("cleanup.policy")
 		if !ok {
 			policy = "delete"
 		}
@@ -1817,7 +1918,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 				default:
 					// Check max.compaction.lag.ms
 					maxLagMs := int64(9223372036854775807) // math.MaxInt64
-					if v, ok := td.Configs["max.compaction.lag.ms"]; ok {
+					if v, ok := td.GetConfig("max.compaction.lag.ms"); ok {
 						if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
 							maxLagMs = parsed
 						}
@@ -1843,14 +1944,14 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 	}
 
 	minCompactionLagMs := int64(0)
-	if v, ok := bestTD.Configs["min.compaction.lag.ms"]; ok {
+	if v, ok := bestTD.GetConfig("min.compaction.lag.ms"); ok {
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
 			minCompactionLagMs = parsed
 		}
 	}
 
 	deleteRetentionMs := int64(86400000) // 24h default
-	if v, ok := bestTD.Configs["delete.retention.ms"]; ok {
+	if v, ok := bestTD.GetConfig("delete.retention.ms"); ok {
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
 			deleteRetentionMs = parsed
 		}

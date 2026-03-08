@@ -169,3 +169,16 @@ func (idx *Index) AllPartitions() []TopicPartition {
 	}
 	return result
 }
+
+// MaxOffset returns the highest (LastOffset+1) across all entries for the
+// given partition, i.e. the high watermark implied by the WAL index.
+// Returns 0 if the partition has no entries.
+func (idx *Index) MaxOffset(tp TopicPartition) int64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	entries := idx.partitions[tp]
+	if len(entries) == 0 {
+		return 0
+	}
+	return entries[len(entries)-1].LastOffset + 1
+}

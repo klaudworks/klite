@@ -20,13 +20,19 @@ func NewCluster() *MemCluster {
 }
 
 // NewElector creates an elector that participates in this cluster's
-// leader election.
-func (c *MemCluster) NewElector(id string) *MemElector {
+// leader election. replAddr is the replication address advertised to
+// standbys (e.g. "127.0.0.1:9093").
+func (c *MemCluster) NewElector(id string, replAddr ...string) *MemElector {
+	addr := ""
+	if len(replAddr) > 0 {
+		addr = replAddr[0]
+	}
 	e := &MemElector{
-		cluster: c,
-		id:      id,
-		role:    lease.RoleStandby,
-		readyCh: make(chan struct{}),
+		cluster:  c,
+		id:       id,
+		replAddr: addr,
+		role:     lease.RoleStandby,
+		readyCh:  make(chan struct{}),
 	}
 	c.mu.Lock()
 	c.electors = append(c.electors, e)
@@ -49,10 +55,27 @@ func (c *MemCluster) demoteOthers(winner *MemElector) {
 	}
 }
 
+// primaryAddr returns the replication address of the current primary.
+func (c *MemCluster) primaryAddr() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.electors {
+		e.mu.Lock()
+		role := e.role
+		addr := e.replAddr
+		e.mu.Unlock()
+		if role == lease.RolePrimary {
+			return addr
+		}
+	}
+	return ""
+}
+
 // MemElector is a deterministic lease elector for testing.
 type MemElector struct {
-	cluster *MemCluster
-	id      string
+	cluster  *MemCluster
+	id       string
+	replAddr string // replication address advertised to standbys
 
 	mu          sync.Mutex
 	role        lease.Role
@@ -161,10 +184,26 @@ func (m *MemElector) Epoch() uint64 {
 	return m.epoch
 }
 
-// PrimaryAddr returns "". The memlease doesn't track addresses;
-// integration tests wire the receiver externally.
+// PrimaryAddr returns the replication address of the current primary.
+// Returns "" if no elector in the cluster is currently primary or if
+// this elector is the primary (standbys look up the primary, primaries
+// don't need their own address).
 func (m *MemElector) PrimaryAddr() string {
-	return ""
+	m.mu.Lock()
+	role := m.role
+	m.mu.Unlock()
+	if role == lease.RolePrimary {
+		return ""
+	}
+	return m.cluster.primaryAddr()
+}
+
+// SetReplAddr updates the replication address. Used by integration tests
+// when the listener port isn't known at elector creation time.
+func (m *MemElector) SetReplAddr(addr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.replAddr = addr
 }
 
 // compile-time interface check

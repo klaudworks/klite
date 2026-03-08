@@ -106,17 +106,19 @@ func (l *Log) SetSnapshotFn(fn func() [][]byte) {
 }
 
 // SetReplicateHook sets the replication hook called after each successful
-// local append. Must be called before any writes (during broker init) or
-// after writes are drained (during demotion). Not safe for concurrent use
-// with Append/AppendSync.
+// local append. Safe for concurrent use.
 func (l *Log) SetReplicateHook(fn func(frame []byte)) {
+	l.mu.Lock()
 	l.replicateHook = fn
+	l.mu.Unlock()
 }
 
 // SetCompactHook sets the compaction hook called after a successful compaction
 // rename. The hook receives the compacted file contents. Must not block.
 func (l *Log) SetCompactHook(fn func(data []byte)) {
+	l.mu.Lock()
 	l.compactHook = fn
+	l.mu.Unlock()
 }
 
 // Append writes a serialized entry (buffered, no fsync).
@@ -455,37 +457,28 @@ func (l *Log) Path() string {
 
 // ReplayEntry processes a single framed metadata entry: [4B length][4B CRC][payload].
 // It validates the CRC, parses the entry type, and dispatches to the appropriate callback.
+// The frame format matches what appendLocked produces and the replication hook sends.
 func (l *Log) ReplayEntry(frame []byte) error {
 	if len(frame) < 4+4+1 {
 		return fmt.Errorf("metadata frame too short: %d bytes", len(frame))
 	}
 
-	// The frame has the same structure as what ScanFramedEntries yields:
-	// [4B CRC][payload] — the 4B length prefix has already been consumed by
-	// the scanner. But when called from replication, we receive the complete
-	// frame: [4B length][4B CRC][payload].
-	//
-	// Detect which format: if first 4 bytes encode a plausible length matching
-	// the frame, it's [length][CRC][payload]. Otherwise it's [CRC][payload].
-	payload := frame
-	declaredLen := binary.BigEndian.Uint32(frame[0:4])
-	if int(declaredLen) == len(frame)-4 {
-		// Full frame: [4B length][CRC + payload]
-		payload = frame[4:]
+	// Frame layout: [4B length][4B CRC][payload]
+	// Skip the 4-byte length prefix to get [CRC][payload].
+	inner := frame[4:]
+
+	if len(inner) < 4+1 {
+		return fmt.Errorf("metadata payload too short: %d bytes", len(inner))
 	}
 
-	if len(payload) < 4+1 {
-		return fmt.Errorf("metadata payload too short: %d bytes", len(payload))
-	}
-
-	storedCRC := binary.BigEndian.Uint32(payload[0:4])
-	actualCRC := crc32.Checksum(payload[4:], crc32cTable)
+	storedCRC := binary.BigEndian.Uint32(inner[0:4])
+	actualCRC := crc32.Checksum(inner[4:], crc32cTable)
 	if storedCRC != actualCRC {
 		return fmt.Errorf("metadata entry CRC mismatch")
 	}
 
-	entryType := payload[4]
-	entryData := payload[5:]
+	entryType := inner[4]
+	entryData := inner[5:]
 
 	return l.dispatchEntry(entryType, entryData)
 }
