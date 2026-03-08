@@ -7,8 +7,8 @@ fulfills the plan's intent.
 
 ## Workflow
 
-1. `bd update <issue-id> --status in_progress`
-2. `bd show <issue-id>` and `bd comments <issue-id>` — find the plan
+1. `br update <issue-id> --status in_progress`
+2. `br show <issue-id>` and `br comments <issue-id>` — find the plan
 3. Read the relevant source files. Understand the full picture — the plan
    tells you the approach, but you need to understand the code to implement
    it well. Read broadly, not just the files the plan mentions.
@@ -34,12 +34,12 @@ fulfills the plan's intent.
    - `git rev-parse HEAD` to get the hash
    - Create review issue:
      ```
-     bd create "review: <description>" \
+     br create "review: <description>" \
        -d "Review commit <hash> from <issue-id>." \
        -p 0 -l review \
        --deps discovered-from:<issue-id>
      ```
-   - `bd close <issue-id> --reason "Implemented in <hash>"`
+   - `br close <issue-id> --reason "Implemented in <hash>"`
 8. If verification fails:
    - Fix it (up to 3 attempts)
    - If unfixable: revert and defer (see "Getting Stuck" in `ralph/03-improve.md`)
@@ -65,7 +65,7 @@ Examples:
 If you notice additional problems during implementation:
 
 ```
-bd create "title" -d "description" -p 2 -l needs-plan --deps discovered-from:<issue-id>
+br create "title" -d "description" -p 2 -l needs-plan --deps discovered-from:<issue-id>
 ```
 
 Do NOT fix them now. File and move on.

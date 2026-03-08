@@ -4,16 +4,16 @@ You are reviewing a change made by a previous iteration.
 
 ## Workflow
 
-1. `bd update <review-issue-id> --status in_progress`
-2. `bd show <review-issue-id> --json` — the description contains the
+1. `br update <review-issue-id> --status in_progress`
+2. `br show <review-issue-id> --json` — the description contains the
    **commit hash**. The `discovered-from` dependency points to the
    **original issue**.
 3. `git show <commit-hash>` — read the full diff
 4. If the diff isn't enough to understand the change (large refactors,
    structural moves), read the affected files in their final state. Start
    from the diff, then read whatever you need to fully understand the result.
-5. `bd show <original-issue-id>` — understand what was being improved
-6. `bd comments <original-issue-id>` — read the plan that was executed
+5. `br show <original-issue-id>` — understand what was being improved
+6. `br comments <original-issue-id>` — read the plan that was executed
 7. Evaluate (klite is in active development with no external consumers —
    backwards compatibility is not a constraint, so renamed exports, changed
    package structure, and altered internal APIs are fine if they improve things):
@@ -27,17 +27,17 @@ You are reviewing a change made by a previous iteration.
      not by how many files it touches.
 8. `go build ./...` and `go vet ./...`
 9. `go test ./... -count=1`
-10. **If good**: `bd close <review-issue-id> --reason "Approved"`
+10. **If good**: `br close <review-issue-id> --reason "Approved"`
 11. **If minor issues** (typo, missed error wrap, off-by-one — things that
     don't change the approach):
     - Fix them directly
     - Commit: `improve(<scope>): fixup <description>`
-    - `bd close <review-issue-id> --reason "Approved with fixup <new-hash>"`
+    - `br close <review-issue-id> --reason "Approved with fixup <new-hash>"`
 12. **If fundamentally wrong** (wrong approach, regression, broken logic):
     - `git revert --no-edit <commit-hash>`
-    - `bd reopen <original-issue-id>`
-    - `bd comments add <original-issue-id> "Reverted: <what was wrong>"`
-    - `bd close <review-issue-id> --reason "Reverted: <summary>"`
+    - `br reopen <original-issue-id>`
+    - `br comments add <original-issue-id> "Reverted: <what was wrong>"`
+    - `br close <review-issue-id> --reason "Reverted: <summary>"`
 
 ## What to Look For
 
@@ -55,7 +55,7 @@ was correct but exposed a deeper structural issue — file a followup issue
 at **P1** so it gets planned in the next iteration (depth-first chaining):
 
 ```
-bd create "title" -d "description" -p 1 -l needs-plan --deps discovered-from:<review-issue-id>
+br create "title" -d "description" -p 1 -l needs-plan --deps discovered-from:<review-issue-id>
 ```
 
 ## Do NOT
