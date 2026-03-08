@@ -969,6 +969,11 @@ func (b *Broker) rebuildChunksFromWAL() {
 				continue
 			}
 
+			if meta.ProducerID >= 0 && meta.BaseSequence >= 0 {
+				ctp := cluster.TopicPartition{Topic: td.Name, Partition: int32(tp.Partition)}
+				b.state.PIDManager().ReplayBatch(ctp, meta, e.BaseOffset)
+			}
+
 			spare := pd.AcquireSpareChunk(len(data))
 			pd.Lock()
 			spare = pd.AppendToChunk(data, chunk.ChunkBatch{
@@ -1280,6 +1285,13 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 			}
 			skippedCorrupt++
 			return nil
+		}
+
+		// Reconstruct producer dedup state from committed batches so that
+		// duplicate detection works after restart or failover.
+		if meta.ProducerID >= 0 && meta.BaseSequence >= 0 {
+			ctp := cluster.TopicPartition{Topic: td.Name, Partition: entry.Partition}
+			b.state.PIDManager().ReplayBatch(ctp, meta, entry.Offset)
 		}
 
 		// Skip WAL entries whose last offset is below the persisted logStartOffset
