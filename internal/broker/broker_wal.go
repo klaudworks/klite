@@ -99,17 +99,8 @@ func (b *Broker) initWAL() error {
 	b.walIndex = idx
 
 	syncInterval := time.Duration(b.cfg.WALSyncIntervalMs) * time.Millisecond
-	if syncInterval == 0 {
-		syncInterval = 2 * time.Millisecond
-	}
 	segMaxBytes := b.cfg.WALSegmentMaxBytes
-	if segMaxBytes == 0 {
-		segMaxBytes = 64 * 1024 * 1024
-	}
 	maxDiskSize := b.cfg.WALMaxDiskSize
-	if maxDiskSize == 0 {
-		maxDiskSize = 1024 * 1024 * 1024
-	}
 
 	cfg := wal.WriterConfig{
 		Dir:             walDir,
@@ -134,11 +125,7 @@ func (b *Broker) initWAL() error {
 	// When S3 is disabled, all reads are served from the WAL.
 	var pool *chunk.Pool
 	if b.cfg.S3Bucket != "" {
-		poolMem := b.cfg.ChunkPoolMemory
-		if poolMem == 0 {
-			poolMem = 512 * 1024 * 1024 // 512 MiB
-		}
-		pool = chunk.NewPool(poolMem, cluster.DefaultMaxMessageBytes)
+		pool = chunk.NewPool(b.cfg.ChunkPoolMemory, cluster.DefaultMaxMessageBytes)
 		b.chunkPool = pool
 	}
 	b.state.SetWALConfig(w, idx, pool)

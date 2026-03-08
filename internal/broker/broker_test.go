@@ -219,6 +219,61 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.HealthAddr != "" {
 		t.Errorf("HealthAddr = %q, want %q (disabled by default)", cfg.HealthAddr, "")
 	}
+
+	// WAL defaults
+	if cfg.WALSyncIntervalMs != 2 {
+		t.Errorf("WALSyncIntervalMs = %d, want 2", cfg.WALSyncIntervalMs)
+	}
+	if cfg.WALSegmentMaxBytes != 64*1024*1024 {
+		t.Errorf("WALSegmentMaxBytes = %d, want %d", cfg.WALSegmentMaxBytes, 64*1024*1024)
+	}
+	if cfg.WALMaxDiskSize != 1024*1024*1024 {
+		t.Errorf("WALMaxDiskSize = %d, want %d", cfg.WALMaxDiskSize, 1024*1024*1024)
+	}
+	if cfg.ChunkPoolMemory != 512*1024*1024 {
+		t.Errorf("ChunkPoolMemory = %d, want %d", cfg.ChunkPoolMemory, 512*1024*1024)
+	}
+
+	// S3 defaults
+	if cfg.S3FlushInterval != 60*time.Second {
+		t.Errorf("S3FlushInterval = %v, want 60s", cfg.S3FlushInterval)
+	}
+	if cfg.S3TargetObjectSize != 64*1024*1024 {
+		t.Errorf("S3TargetObjectSize = %d, want %d", cfg.S3TargetObjectSize, 64*1024*1024)
+	}
+	if cfg.S3FlushCheckInterval != 5*time.Second {
+		t.Errorf("S3FlushCheckInterval = %v, want 5s", cfg.S3FlushCheckInterval)
+	}
+
+	// Retention defaults
+	if cfg.RetentionCheckInterval != 1*time.Hour {
+		t.Errorf("RetentionCheckInterval = %v, want 1h", cfg.RetentionCheckInterval)
+	}
+
+	// Compaction defaults
+	if cfg.CompactionCheckInterval != 30*time.Second {
+		t.Errorf("CompactionCheckInterval = %v, want 30s", cfg.CompactionCheckInterval)
+	}
+	if cfg.CompactionMinDirtyObjects != 4 {
+		t.Errorf("CompactionMinDirtyObjects = %d, want 4", cfg.CompactionMinDirtyObjects)
+	}
+	if cfg.CompactionReadRate != 50*1024*1024 {
+		t.Errorf("CompactionReadRate = %d, want %d", cfg.CompactionReadRate, 50*1024*1024)
+	}
+
+	// Replication defaults
+	if cfg.ReplicationAckTimeout != 5*time.Second {
+		t.Errorf("ReplicationAckTimeout = %v, want 5s", cfg.ReplicationAckTimeout)
+	}
+	if cfg.LeaseDuration != 15*time.Second {
+		t.Errorf("LeaseDuration = %v, want 15s", cfg.LeaseDuration)
+	}
+	if cfg.LeaseRenewInterval != 5*time.Second {
+		t.Errorf("LeaseRenewInterval = %v, want 5s", cfg.LeaseRenewInterval)
+	}
+	if cfg.LeaseRetryInterval != 2*time.Second {
+		t.Errorf("LeaseRetryInterval = %v, want 2s", cfg.LeaseRetryInterval)
+	}
 }
 
 func TestLeaseTimingValidation(t *testing.T) {

@@ -12,9 +12,6 @@ import (
 
 func (b *Broker) retentionLoop(ctx context.Context) {
 	interval := b.cfg.RetentionCheckInterval
-	if interval == 0 {
-		interval = 1 * time.Hour
-	}
 	ticker := b.cfg.Clock.NewTicker(interval)
 	defer ticker.Stop()
 	for {

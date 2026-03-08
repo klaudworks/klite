@@ -50,17 +50,8 @@ func (b *Broker) initS3() error {
 	b.state.SetS3Fetcher(fetchAdapter)
 
 	flushInterval := b.cfg.S3FlushInterval
-	if flushInterval == 0 {
-		flushInterval = 60 * time.Second
-	}
 	checkInterval := b.cfg.S3FlushCheckInterval
-	if checkInterval == 0 {
-		checkInterval = 5 * time.Second
-	}
 	targetObjSize := b.cfg.S3TargetObjectSize
-	if targetObjSize == 0 {
-		targetObjSize = 64 * 1024 * 1024 // 64 MiB
-	}
 
 	triggerCh := make(chan struct{}, 1)
 	if b.chunkPool != nil {

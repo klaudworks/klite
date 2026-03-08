@@ -533,9 +533,6 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 	b.walWriter.ResetLocalOnlyBatches()
 
 	ackTimeout := b.cfg.ReplicationAckTimeout
-	if ackTimeout == 0 {
-		ackTimeout = 5 * time.Second
-	}
 
 	// Close existing sender if any
 	if b.replSender != nil {
@@ -729,28 +726,15 @@ func (b *Broker) createS3Elector() (lease.Elector, error) {
 		holder = hostname
 	}
 
-	leaseDur := b.cfg.LeaseDuration
-	if leaseDur == 0 {
-		leaseDur = 15 * time.Second
-	}
-	renewInt := b.cfg.LeaseRenewInterval
-	if renewInt == 0 {
-		renewInt = 5 * time.Second
-	}
-	retryInt := b.cfg.LeaseRetryInterval
-	if retryInt == 0 {
-		retryInt = 2 * time.Second
-	}
-
 	return s3lease.New(s3lease.Config{
 		S3:            s3api,
 		Bucket:        b.cfg.S3Bucket,
 		Key:           prefix + "/lease",
 		Holder:        holder,
 		ReplAddr:      replAddr,
-		LeaseDuration: leaseDur,
-		RenewInterval: renewInt,
-		RetryInterval: retryInt,
+		LeaseDuration: b.cfg.LeaseDuration,
+		RenewInterval: b.cfg.LeaseRenewInterval,
+		RetryInterval: b.cfg.LeaseRetryInterval,
 		Logger:        b.logger,
 	}), nil
 }

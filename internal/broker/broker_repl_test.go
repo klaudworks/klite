@@ -40,11 +40,13 @@ func newStepRecorderBroker(t *testing.T) (*Broker, *[]string) {
 
 	var steps []string
 
+	defaultCfg := DefaultConfig()
 	b := &Broker{
 		cfg: Config{
-			Listener:        kafkaLn,
-			ReplicationAddr: "127.0.0.1:0", // triggers startReplicationListener
-			Clock:           clock.RealClock{},
+			Listener:               kafkaLn,
+			ReplicationAddr:        "127.0.0.1:0", // triggers startReplicationListener
+			Clock:                  clock.RealClock{},
+			RetentionCheckInterval: defaultCfg.RetentionCheckInterval,
 		},
 		state:      state,
 		shutdownCh: shutdownCh,

@@ -98,13 +98,38 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Listen:             ":9092",
-		DataDir:            "./data",
-		NodeID:             0,
-		DefaultPartitions:  1,
-		AutoCreateTopics:   true,
-		LogLevel:           "info",
-		CompactionReadRate: 50 * 1024 * 1024, // 50 MiB/s
+		Listen:            ":9092",
+		DataDir:           "./data",
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+		LogLevel:          "info",
+
+		// WAL defaults
+		WALSyncIntervalMs:  2,                  // 2ms fsync batch window
+		WALSegmentMaxBytes: 64 * 1024 * 1024,   // 64 MiB
+		WALMaxDiskSize:     1024 * 1024 * 1024, // 1 GiB
+		ChunkPoolMemory:    512 * 1024 * 1024,  // 512 MiB
+
+		// S3 defaults
+		S3FlushInterval:      60 * time.Second, // max age before flush
+		S3TargetObjectSize:   64 * 1024 * 1024, // 64 MiB
+		S3FlushCheckInterval: 5 * time.Second,  // flusher scan interval
+
+		// Retention defaults
+		RetentionCheckInterval: 1 * time.Hour,
+
+		// Compaction defaults
+		CompactionCheckInterval:   30 * time.Second,
+		CompactionMinDirtyObjects: 4,
+		CompactionReadRate:        50 * 1024 * 1024, // 50 MiB/s
+
+		// Replication defaults
+		ReplicationAckTimeout: 5 * time.Second,
+		LeaseDuration:         15 * time.Second,
+		LeaseRenewInterval:    5 * time.Second,
+		LeaseRetryInterval:    2 * time.Second,
+
 		// HealthAddr left empty — health server is opt-in via --health-addr.
 	}
 }

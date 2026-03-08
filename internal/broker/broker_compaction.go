@@ -4,7 +4,6 @@ import (
 	"context"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
@@ -13,13 +12,7 @@ import (
 
 func (b *Broker) compactionLoop(ctx context.Context) {
 	interval := b.cfg.CompactionCheckInterval
-	if interval == 0 {
-		interval = 30 * time.Second
-	}
 	minDirty := b.cfg.CompactionMinDirtyObjects
-	if minDirty == 0 {
-		minDirty = 4
-	}
 
 	compactor := s3store.NewCompactor(s3store.CompactorConfig{
 		Client: b.s3Client,
