@@ -943,10 +943,27 @@ func TestStandbyWALPrunePreservesS3Gap(t *testing.T) {
 		})
 	}
 
-	// Wait for S3 flush of round-2 data
-	s3KeysBefore := len(pair.S3.Keys())
+	// Wait for S3 flush of round-2 data. After promotion, B's s3Watermark
+	// resets to 0, so it re-flushes from offset 0 — overwriting the same key
+	// that round-1 wrote. We can't check key count; check content size instead.
+	s3SizeBefore := 0
+	for _, k := range pair.S3.Keys() {
+		if strings.Contains(k, topic) && strings.HasSuffix(k, ".obj") {
+			if raw, ok := pair.S3.GetRaw(k); ok {
+				s3SizeBefore += len(raw)
+			}
+		}
+	}
 	require.Eventually(t, func() bool {
-		return len(pair.S3.Keys()) > s3KeysBefore
+		total := 0
+		for _, k := range pair.S3.Keys() {
+			if strings.Contains(k, topic) && strings.HasSuffix(k, ".obj") {
+				if raw, ok := pair.S3.GetRaw(k); ok {
+					total += len(raw)
+				}
+			}
+		}
+		return total > s3SizeBefore
 	}, 10*time.Second, 200*time.Millisecond, "round 2: S3 flush did not occur")
 	cl2.Close()
 	time.Sleep(300 * time.Millisecond) // replication catch-up
