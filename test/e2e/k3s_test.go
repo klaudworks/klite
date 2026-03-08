@@ -639,6 +639,18 @@ func (c *cluster) verifyS3Continuity(label string) {
 		require.NoError(c.t, err, "%s: ParseFooter %s", label, obj.Key)
 		require.NotEmpty(c.t, footer.Entries, "%s: empty footer in %s", label, obj.Key)
 
+		// Check intra-object continuity: consecutive batches should be
+		// contiguous (no gaps within an S3 object).
+		for j := 1; j < len(footer.Entries); j++ {
+			prev := footer.Entries[j-1]
+			curr := footer.Entries[j]
+			expectedBase := prev.LastOffset() + 1
+			if curr.BaseOffset != expectedBase {
+				c.t.Fatalf("%s: intra-object gap in %s: batch %d ends at %d, batch %d starts at %d (gap of %d)",
+					label, obj.Key, j-1, prev.LastOffset(), j, curr.BaseOffset, curr.BaseOffset-expectedBase)
+			}
+		}
+
 		r := objRange{
 			key:      obj.Key,
 			firstOff: footer.FirstOffset(),

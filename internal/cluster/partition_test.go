@@ -2295,12 +2295,14 @@ func TestFetchColdPathIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("cold-path data returned when gap is below S3 watermark", func(t *testing.T) {
+	t.Run("cold-path gap suppressed regardless of S3 watermark", func(t *testing.T) {
 		t.Parallel()
 
 		// S3 returns data starting at offset 5, consumer requests offset 0.
-		// The s3FlushWatermark is 10 (all data was flushed), so the gap is
-		// below the watermark and the data should be returned.
+		// Even though s3FlushWatermark is 10 (all data flushed), the gap is
+		// suppressed unconditionally — the consumer must not skip offsets 0-4.
+		// In the compaction case, logStart would be 5 and the consumer
+		// would get OffsetOutOfRange instead of reaching this code path.
 		raw := makeSimpleBatch(3, 2000)
 		AssignOffset(raw, 5)
 		mock := &mockS3Fetcher{
@@ -2323,11 +2325,8 @@ func TestFetchColdPathIntegration(t *testing.T) {
 		if fr.Err != 0 {
 			t.Errorf("Fetch err: got %d, want 0", fr.Err)
 		}
-		if len(fr.Batches) != 1 {
-			t.Fatalf("Fetch: got %d batches, want 1", len(fr.Batches))
-		}
-		if fr.Batches[0].BaseOffset != 5 {
-			t.Errorf("BaseOffset: got %d, want 5", fr.Batches[0].BaseOffset)
+		if len(fr.Batches) != 0 {
+			t.Errorf("Fetch with cold-path gap: got %d batches, want 0 (gap suppressed)", len(fr.Batches))
 		}
 	})
 }
