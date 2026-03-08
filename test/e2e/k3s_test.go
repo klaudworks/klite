@@ -49,7 +49,7 @@ const (
 	kliteImageName  = "klite-e2e:test"
 	helmRelease     = "klite-e2e"
 	testNamespace   = "default"
-	s3FlushInterval = 5 * time.Second
+	s3FlushInterval = 3 * time.Second
 )
 
 // clusterStateName identifies the stable states of the klite cluster.
@@ -180,24 +180,40 @@ func setupCluster(t *testing.T) *cluster {
 
 	waitForK3sReady(t, k8sClient)
 
-	// --- Docker build + load ---
-	logf("building klite Docker image...")
+	// --- Parallel setup: docker build runs alongside LocalStack + socat ---
+	// Docker build + image load is the slowest step (~15s). Running it in
+	// parallel with LocalStack and socat deployment saves significant time.
 	root := projectRoot()
-	dockerBuild := exec.CommandContext(ctx, "docker", "build", "-t", kliteImageName, "-f", "Dockerfile", ".")
-	dockerBuild.Dir = root
-	dockerBuild.Stdout, dockerBuild.Stderr = os.Stderr, os.Stderr
-	require.NoError(t, dockerBuild.Run(), "docker build failed")
+	imageReady := make(chan error, 1)
+	go func() {
+		logf("building klite Docker image...")
+		dockerBuild := exec.CommandContext(ctx, "docker", "build", "-t", kliteImageName, "-f", "Dockerfile", ".")
+		dockerBuild.Dir = root
+		dockerBuild.Stdout, dockerBuild.Stderr = os.Stderr, os.Stderr
+		if err := dockerBuild.Run(); err != nil {
+			imageReady <- fmt.Errorf("docker build: %w", err)
+			return
+		}
+		logf("loading image into k3s...")
+		if err := k3sC.LoadImages(ctx, kliteImageName); err != nil {
+			imageReady <- fmt.Errorf("image load: %w", err)
+			return
+		}
+		logf("klite image loaded into k3s")
+		imageReady <- nil
+	}()
 
-	logf("loading image into k3s...")
-	require.NoError(t, k3sC.LoadImages(ctx, kliteImageName))
-
-	// --- LocalStack ---
+	// LocalStack and socat deploy sequentially (they call t.Fatal internally)
+	// but run concurrently with docker build above.
 	logf("deploying LocalStack into k3s...")
 	deployLocalStack(t, k8sClient, kubeconfigPath)
-
-	// --- Socat proxy ---
 	logf("deploying socat proxy...")
 	deploySocatProxy(t, k8sClient)
+
+	// Wait for docker build + image load to complete.
+	if err := <-imageReady; err != nil {
+		t.Fatalf("parallel setup failed: %v", err)
+	}
 
 	// --- Helm install ---
 	logf("installing klite Helm chart...")
@@ -536,29 +552,27 @@ func (c *cluster) disrupt() {
 		return err == nil && p.DeletionTimestamp == nil && p.Status.PodIP != ""
 	})
 
-	// Convergence: verify the isolated pod cannot accept Kafka connections.
-	tr.check(c.t, "isolated pod unreachable", 15*time.Second, 1*time.Second, func() bool {
-		p, err := c.k8s.CoreV1().Pods(testNamespace).Get(c.ctx, oldPrimary, metav1.GetOptions{})
-		if err != nil || p.Status.PodIP == "" {
-			return true // pod gone or no IP = unreachable
-		}
-		cmd := exec.CommandContext(c.ctx, "kubectl",
-			"--kubeconfig", c.kubeconfigPath,
-			"exec", "localstack", "--",
-			"python3", "-c", fmt.Sprintf(
-				"import socket; s=socket.socket(); s.settimeout(2)\n"+
-					"try:\n"+
-					"  r=s.connect_ex(('%s',9092)); s.close()\n"+
-					"  print('REFUSED' if r!=0 else 'CONNECTED')\n"+
-					"except socket.timeout:\n"+
-					"  print('TIMEOUT')\n", p.Status.PodIP),
-		)
-		out, err := cmd.CombinedOutput()
-		outStr := strings.TrimSpace(string(out))
+	// Convergence: verify the recreated pod is not primary (it should be
+	// a standby or not yet ready, confirming the lease is held by the new primary).
+	tr.check(c.t, "recreated pod not primary", 15*time.Second, 500*time.Millisecond, func() bool {
+		result := c.k8s.CoreV1().RESTClient().Get().
+			Namespace(testNamespace).
+			Resource("pods").
+			SubResource("proxy").
+			Name(oldPrimary + ":8080").
+			Suffix("/replz").
+			Do(c.ctx)
+		raw, err := result.Raw()
 		if err != nil {
-			return true // exec failed = unreachable
+			return false // pod not ready yet
 		}
-		return outStr == "REFUSED" || outStr == "TIMEOUT"
+		var status struct {
+			Role string `json:"role"`
+		}
+		if json.Unmarshal(raw, &status) != nil {
+			return false
+		}
+		return status.Role == "standby" || status.Role == "not_ready"
 	})
 
 	c.state = clusterState{
@@ -596,7 +610,7 @@ func (c *cluster) heal() {
 	logf("%s: starting", tr)
 
 	// Convergence: wait for pods to be running before removing isolation.
-	tr.check(c.t, "all pods running", 60*time.Second, 2*time.Second, func() bool {
+	tr.check(c.t, "all pods running", 60*time.Second, 1*time.Second, func() bool {
 		selector := fmt.Sprintf("app.kubernetes.io/instance=%s", helmRelease)
 		pods, err := c.k8s.CoreV1().Pods(testNamespace).List(c.ctx, metav1.ListOptions{
 			LabelSelector: selector,
@@ -617,7 +631,7 @@ func (c *cluster) heal() {
 	removeNetworkPolicy(c.t, c.k8s, netpolName)
 
 	// Convergence: the healed pod reconnects as standby.
-	tr.check(c.t, "standby reconnected", 60*time.Second, 2*time.Second, func() bool {
+	tr.check(c.t, "standby reconnected", 60*time.Second, 500*time.Millisecond, func() bool {
 		result := c.k8s.CoreV1().RESTClient().Get().
 			Namespace(testNamespace).
 			Resource("pods").
@@ -759,7 +773,7 @@ func deploySocatProxy(t *testing.T, client *kubernetes.Clientset) {
 		select {
 		case <-deadline:
 			t.Fatal("socat proxy pod did not become ready within 120s")
-		case <-time.After(2 * time.Second):
+		case <-time.After(1 * time.Second):
 		}
 	}
 }
@@ -884,7 +898,7 @@ func waitForPodsRunning(t *testing.T, client *kubernetes.Clientset, count int, t
 		select {
 		case <-deadline:
 			t.Fatalf("pods did not reach Running within %v", timeout)
-		case <-time.After(2 * time.Second):
+		case <-time.After(1 * time.Second):
 		}
 	}
 }
@@ -937,7 +951,7 @@ func waitForStandbyConnected(t *testing.T, client *kubernetes.Clientset, primary
 		select {
 		case <-deadline:
 			t.Fatalf("timed out waiting for standby to connect to %s", primaryPod)
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
