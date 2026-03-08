@@ -475,7 +475,6 @@ func (c *cluster) diagnoseConsumeGap(expected int64) {
 	c.t.Helper()
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(c.proxyAddr),
-		kgo.ConsumeTopics(c.topic),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 			c.topic: {0: kgo.NewOffset().AtStart()},
 		}),
