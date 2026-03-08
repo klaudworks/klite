@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+
+	"github.com/klaudworks/klite/internal/wal"
 )
 
 // WALAppender is the interface used by the receiver to write replicated WAL entries.
 type WALAppender interface {
 	// AppendReplicated writes an already-serialized WAL entry (from the primary)
-	// without assigning a new sequence number. Returns true if the entry was
-	// written, false if skipped (duplicate).
-	AppendReplicated(serialized []byte) (written bool, err error)
+	// without assigning a new sequence number. Returns entry metadata and true
+	// if written, or zero info and false if skipped (duplicate).
+	AppendReplicated(serialized []byte) (info wal.ReplicatedEntryInfo, written bool, err error)
 
 	// Sync fsyncs the current WAL segment.
 	Sync() error
@@ -23,6 +25,9 @@ type WALAppender interface {
 
 	// SetNextSequence updates the next sequence counter.
 	SetNextSequence(seq uint64)
+
+	// SetS3FlushWatermark sets the S3 flush watermark on the WAL writer.
+	SetS3FlushWatermark(seq uint64)
 }
 
 // MetaAppender is the interface used by the receiver to handle metadata entries.
@@ -38,23 +43,30 @@ type MetaAppender interface {
 	ReplaceFromSnapshot(data []byte) error
 }
 
+// HWAdvancer is called by the receiver to advance the high watermark on a
+// partition as replicated WAL entries arrive. This keeps the standby's HW
+// up to date so that promotion does not require an S3 probe.
+type HWAdvancer func(topicID [16]byte, partition int32, endOffset int64)
+
 // Receiver connects to the primary, receives WAL and metadata entries,
 // and replays them locally. Used by the standby side.
 type Receiver struct {
 	walAppender  WALAppender
 	metaAppender MetaAppender
+	hwAdvancer   HWAdvancer
 	logger       *slog.Logger
 	epoch        uint64 // current lease epoch
 }
 
 // NewReceiver creates a Receiver.
-func NewReceiver(walAppender WALAppender, metaAppender MetaAppender, epoch uint64, logger *slog.Logger) *Receiver {
+func NewReceiver(walAppender WALAppender, metaAppender MetaAppender, hwAdvancer HWAdvancer, epoch uint64, logger *slog.Logger) *Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Receiver{
 		walAppender:  walAppender,
 		metaAppender: metaAppender,
+		hwAdvancer:   hwAdvancer,
 		logger:       logger,
 		epoch:        epoch,
 	}
@@ -163,9 +175,14 @@ func (r *Receiver) handleSnapshot(payload []byte) error {
 }
 
 func (r *Receiver) handleWALBatch(payload []byte, conn net.Conn) error {
-	firstSeq, lastSeq, entryCount, entries, err := UnmarshalWALBatch(payload)
+	firstSeq, lastSeq, entryCount, s3FlushWatermark, entries, err := UnmarshalWALBatch(payload)
 	if err != nil {
 		return err
+	}
+
+	// Apply the S3 flush watermark from the primary.
+	if s3FlushWatermark > 0 {
+		r.walAppender.SetS3FlushWatermark(s3FlushWatermark)
 	}
 
 	// Keepalive: empty batch, no ACK
@@ -189,12 +206,15 @@ func (r *Receiver) handleWALBatch(payload []byte, conn net.Conn) error {
 		}
 
 		serialized := entries[offset : offset+totalLen]
-		ok, err := r.walAppender.AppendReplicated(serialized)
+		info, ok, err := r.walAppender.AppendReplicated(serialized)
 		if err != nil {
 			return fmt.Errorf("append replicated entry: %w", err)
 		}
 		if ok {
 			written++
+			if r.hwAdvancer != nil && info.EndOffset > 0 {
+				r.hwAdvancer(info.TopicID, info.Partition, info.EndOffset)
+			}
 		}
 
 		offset += totalLen

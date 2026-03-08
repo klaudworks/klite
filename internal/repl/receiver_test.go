@@ -17,29 +17,37 @@ var _ WALAppender = (*wal.Writer)(nil)
 
 // mockWALAppender is a test double for WALAppender.
 type mockWALAppender struct {
-	mu         sync.Mutex
-	entries    [][]byte
-	nextSeq    uint64
-	syncCalled int
-	syncErr    error
+	mu               sync.Mutex
+	entries          [][]byte
+	nextSeq          uint64
+	syncCalled       int
+	syncErr          error
+	s3FlushWatermark uint64
 }
 
-func (m *mockWALAppender) AppendReplicated(serialized []byte) (bool, error) {
+func (m *mockWALAppender) AppendReplicated(serialized []byte) (wal.ReplicatedEntryInfo, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Parse entry to get sequence
+	var info wal.ReplicatedEntryInfo
+
+	// Parse entry to get sequence and metadata
 	if len(serialized) > 4 {
 		entry, err := wal.UnmarshalEntry(serialized[4:])
-		if err == nil && entry.Sequence < m.nextSeq {
-			return false, nil // duplicate, skip
+		if err == nil {
+			if entry.Sequence < m.nextSeq {
+				return info, false, nil // duplicate, skip
+			}
+			info.TopicID = entry.TopicID
+			info.Partition = entry.Partition
+			info.EndOffset = entry.Offset + 1
 		}
 	}
 
 	cp := make([]byte, len(serialized))
 	copy(cp, serialized)
 	m.entries = append(m.entries, cp)
-	return true, nil
+	return info, true, nil
 }
 
 func (m *mockWALAppender) Sync() error {
@@ -59,6 +67,18 @@ func (m *mockWALAppender) SetNextSequence(seq uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nextSeq = seq
+}
+
+func (m *mockWALAppender) SetS3FlushWatermark(seq uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.s3FlushWatermark = seq
+}
+
+func (m *mockWALAppender) getS3FlushWatermark() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.s3FlushWatermark
 }
 
 func (m *mockWALAppender) EntryCount() int {
@@ -138,7 +158,7 @@ func TestReceiverHelloSendsSequenceAndEpoch(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 42}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 7, slog.Default())
+	r := NewReceiver(wa, ma, nil, 7, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -174,7 +194,7 @@ func TestReceiverSnapshot(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -219,7 +239,7 @@ func TestReceiverWALBatch(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -239,7 +259,7 @@ func TestReceiverWALBatch(t *testing.T) {
 		entriesBuf.Write(makeTestWALEntry(i))
 	}
 
-	batch := MarshalWALBatch(0, 2, 3, entriesBuf.Bytes())
+	batch := MarshalWALBatch(0, 2, 3, 0, entriesBuf.Bytes())
 	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +294,7 @@ func TestReceiverWALBatchDuplicateSkip(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 3} // Already has entries 0-2
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -294,7 +314,7 @@ func TestReceiverWALBatchDuplicateSkip(t *testing.T) {
 		entriesBuf.Write(makeTestWALEntry(i))
 	}
 
-	batch := MarshalWALBatch(0, 2, 3, entriesBuf.Bytes())
+	batch := MarshalWALBatch(0, 2, 3, 0, entriesBuf.Bytes())
 	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +340,7 @@ func TestReceiverMetaEntry(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -355,7 +375,7 @@ func TestReceiverKeepalive(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -370,7 +390,7 @@ func TestReceiverKeepalive(t *testing.T) {
 	}
 
 	// Send keepalive (empty WAL_BATCH)
-	keepalive := MarshalWALBatch(0, 0, 0, nil)
+	keepalive := MarshalWALBatch(0, 0, 0, 0, nil)
 	if err := WriteFrame(primary, MsgWALBatch, keepalive); err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +398,7 @@ func TestReceiverKeepalive(t *testing.T) {
 	// Send a real batch after keepalive to verify the receiver still works
 	var entriesBuf bytes.Buffer
 	entriesBuf.Write(makeTestWALEntry(0))
-	batch := MarshalWALBatch(0, 0, 1, entriesBuf.Bytes())
+	batch := MarshalWALBatch(0, 0, 1, 0, entriesBuf.Bytes())
 	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +419,7 @@ func TestReceiverUnknownMessageType(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -421,7 +441,7 @@ func TestReceiverUnknownMessageType(t *testing.T) {
 	// Send a real batch to verify the receiver continues
 	var entriesBuf bytes.Buffer
 	entriesBuf.Write(makeTestWALEntry(0))
-	batch := MarshalWALBatch(0, 0, 1, entriesBuf.Bytes())
+	batch := MarshalWALBatch(0, 0, 1, 0, entriesBuf.Bytes())
 	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +461,7 @@ func TestReceiverDisconnect(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -472,7 +492,7 @@ func TestReceiverDisconnect(t *testing.T) {
 func TestReceiverReconnect(t *testing.T) {
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 7, slog.Default())
+	r := NewReceiver(wa, ma, nil, 7, slog.Default())
 
 	// First session: receive some entries
 	primary1, standby1 := net.Pipe()
@@ -493,7 +513,7 @@ func TestReceiverReconnect(t *testing.T) {
 	for i := uint64(0); i < 3; i++ {
 		entriesBuf.Write(makeTestWALEntry(i))
 	}
-	batch := MarshalWALBatch(0, 2, 3, entriesBuf.Bytes())
+	batch := MarshalWALBatch(0, 2, 3, 0, entriesBuf.Bytes())
 	if err := WriteFrame(primary1, MsgWALBatch, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +588,7 @@ func TestReceiverWithRealWALWriter(t *testing.T) {
 	defer w.Stop()
 
 	ma := &mockMetaAppender{}
-	r := NewReceiver(w, ma, 0, slog.Default())
+	r := NewReceiver(w, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -601,7 +621,7 @@ func TestReceiverWithRealWALWriter(t *testing.T) {
 	for i := uint64(0); i < 3; i++ {
 		entriesBuf.Write(makeTestWALEntry(i))
 	}
-	batch := MarshalWALBatch(0, 2, 3, entriesBuf.Bytes())
+	batch := MarshalWALBatch(0, 2, 3, 0, entriesBuf.Bytes())
 	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +661,7 @@ func TestReceiverSnapshotThenImmediateWALBatch(t *testing.T) {
 
 	wa := &mockWALAppender{nextSeq: 0}
 	ma := &mockMetaAppender{}
-	r := NewReceiver(wa, ma, 0, slog.Default())
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -665,7 +685,7 @@ func TestReceiverSnapshotThenImmediateWALBatch(t *testing.T) {
 	for i := uint64(10); i < 13; i++ {
 		entriesBuf.Write(makeTestWALEntry(i))
 	}
-	if err := WriteFrame(primary, MsgWALBatch, MarshalWALBatch(10, 12, 3, entriesBuf.Bytes())); err != nil {
+	if err := WriteFrame(primary, MsgWALBatch, MarshalWALBatch(10, 12, 3, 0, entriesBuf.Bytes())); err != nil {
 		t.Fatal(err)
 	}
 
@@ -696,5 +716,88 @@ func TestReceiverSnapshotThenImmediateWALBatch(t *testing.T) {
 
 	if wa.NextSequence() != 13 {
 		t.Errorf("nextSeq: got %d, want 13", wa.NextSequence())
+	}
+}
+
+// TestWatermarkPiggyback verifies that the S3 flush watermark embedded
+// in a WAL_BATCH frame is extracted and applied to the WAL appender.
+func TestWatermarkPiggyback(t *testing.T) {
+	primary, standby := net.Pipe()
+	defer primary.Close() //nolint:errcheck
+
+	wa := &mockWALAppender{nextSeq: 0}
+	ma := &mockMetaAppender{}
+	r := NewReceiver(wa, ma, nil, 0, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = r.RunOnConn(ctx, standby)
+	}()
+
+	// Read HELLO
+	if _, _, err := ReadFrame(primary); err != nil {
+		t.Fatal(err)
+	}
+
+	// Send a WAL batch with watermark=42
+	var entriesBuf bytes.Buffer
+	entriesBuf.Write(makeTestWALEntry(0))
+
+	batch := MarshalWALBatch(0, 0, 1, 42, entriesBuf.Bytes())
+	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read ACK
+	msgType, _, err := ReadFrame(primary)
+	if err != nil {
+		t.Fatalf("ReadFrame ACK: %v", err)
+	}
+	if msgType != MsgACK {
+		t.Fatalf("expected ACK, got %#x", msgType)
+	}
+
+	// Verify the watermark was applied
+	if wm := wa.getS3FlushWatermark(); wm != 42 {
+		t.Errorf("s3FlushWatermark: got %d, want 42", wm)
+	}
+
+	// Send another batch with a higher watermark
+	entriesBuf.Reset()
+	entriesBuf.Write(makeTestWALEntry(1))
+
+	batch = MarshalWALBatch(1, 1, 1, 999, entriesBuf.Bytes())
+	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read ACK
+	msgType, _, err = ReadFrame(primary)
+	if err != nil {
+		t.Fatalf("ReadFrame ACK: %v", err)
+	}
+	if msgType != MsgACK {
+		t.Fatalf("expected ACK, got %#x", msgType)
+	}
+
+	// Verify watermark updated
+	if wm := wa.getS3FlushWatermark(); wm != 999 {
+		t.Errorf("s3FlushWatermark after second batch: got %d, want 999", wm)
+	}
+
+	// Send a keepalive (empty batch) with watermark=1500 — watermark
+	// should still be applied even for keepalives.
+	batch = MarshalWALBatch(0, 0, 0, 1500, nil)
+	if err := WriteFrame(primary, MsgWALBatch, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keepalives don't produce ACKs, so give a moment for processing.
+	time.Sleep(50 * time.Millisecond)
+
+	if wm := wa.getS3FlushWatermark(); wm != 1500 {
+		t.Errorf("s3FlushWatermark after keepalive: got %d, want 1500", wm)
 	}
 }

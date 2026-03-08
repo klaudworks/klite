@@ -14,7 +14,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	}{
 		{"HELLO", MsgHello, MarshalHello(42, 7)},
 		{"SNAPSHOT", MsgSnapshot, MarshalSnapshot(100, []byte("metadata-contents"))},
-		{"WAL_BATCH", MsgWALBatch, MarshalWALBatch(1, 5, 3, []byte("wal-entries"))},
+		{"WAL_BATCH", MsgWALBatch, MarshalWALBatch(1, 5, 3, 42, []byte("wal-entries"))},
 		{"META_ENTRY", MsgMetaEntry, []byte("meta-entry-frame")},
 		{"ACK", MsgACK, MarshalACK(99)},
 		{"empty payload", MsgHello, []byte{}},
@@ -130,13 +130,16 @@ func TestSnapshotRoundTrip(t *testing.T) {
 
 func TestWALBatchRoundTrip(t *testing.T) {
 	entries := []byte("concatenated-wal-entries")
-	payload := MarshalWALBatch(5, 10, 3, entries)
-	first, last, count, gotEntries, err := UnmarshalWALBatch(payload)
+	payload := MarshalWALBatch(5, 10, 3, 999, entries)
+	first, last, count, watermark, gotEntries, err := UnmarshalWALBatch(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first != 5 || last != 10 || count != 3 {
 		t.Errorf("got first=%d last=%d count=%d, want 5/10/3", first, last, count)
+	}
+	if watermark != 999 {
+		t.Errorf("watermark: got %d, want 999", watermark)
 	}
 	if !bytes.Equal(gotEntries, entries) {
 		t.Errorf("entries: got %q, want %q", gotEntries, entries)
@@ -165,7 +168,7 @@ func TestUnmarshalShortPayloads(t *testing.T) {
 		t.Error("expected error for short SNAPSHOT")
 	}
 
-	_, _, _, _, err = UnmarshalWALBatch([]byte{1, 2, 3})
+	_, _, _, _, _, err = UnmarshalWALBatch([]byte{1, 2, 3})
 	if err == nil {
 		t.Error("expected error for short WAL_BATCH")
 	}
@@ -183,7 +186,7 @@ func TestMultipleFramesOnWire(t *testing.T) {
 	if err := WriteFrame(&buf, MsgHello, MarshalHello(1, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteFrame(&buf, MsgWALBatch, MarshalWALBatch(1, 3, 2, []byte("data"))); err != nil {
+	if err := WriteFrame(&buf, MsgWALBatch, MarshalWALBatch(1, 3, 2, 0, []byte("data"))); err != nil {
 		t.Fatal(err)
 	}
 	if err := WriteFrame(&buf, MsgACK, MarshalACK(3)); err != nil {

@@ -114,28 +114,31 @@ func UnmarshalSnapshot(payload []byte) (walSeqAfter uint64, metadataLog []byte, 
 // --- WAL_BATCH message ---
 
 // MarshalWALBatch encodes a WAL_BATCH payload.
-func MarshalWALBatch(firstSeq, lastSeq uint64, entryCount uint32, entries []byte) []byte {
-	buf := make([]byte, 8+8+4+len(entries))
+// Format: [8B firstSeq][8B lastSeq][4B entryCount][8B s3FlushWatermark][entries...]
+func MarshalWALBatch(firstSeq, lastSeq uint64, entryCount uint32, s3FlushWatermark uint64, entries []byte) []byte {
+	buf := make([]byte, 8+8+4+8+len(entries))
 	binary.BigEndian.PutUint64(buf[0:8], firstSeq)
 	binary.BigEndian.PutUint64(buf[8:16], lastSeq)
 	binary.BigEndian.PutUint32(buf[16:20], entryCount)
-	copy(buf[20:], entries)
+	binary.BigEndian.PutUint64(buf[20:28], s3FlushWatermark)
+	copy(buf[28:], entries)
 	return buf
 }
 
 // UnmarshalWALBatch decodes a WAL_BATCH payload.
-func UnmarshalWALBatch(payload []byte) (firstSeq, lastSeq uint64, entryCount uint32, entries []byte, err error) {
-	if len(payload) < 20 {
-		return 0, 0, 0, nil, fmt.Errorf("repl: WAL_BATCH payload too short: %d", len(payload))
+func UnmarshalWALBatch(payload []byte) (firstSeq, lastSeq uint64, entryCount uint32, s3FlushWatermark uint64, entries []byte, err error) {
+	if len(payload) < 28 {
+		return 0, 0, 0, 0, nil, fmt.Errorf("repl: WAL_BATCH payload too short: %d", len(payload))
 	}
 	firstSeq = binary.BigEndian.Uint64(payload[0:8])
 	lastSeq = binary.BigEndian.Uint64(payload[8:16])
 	entryCount = binary.BigEndian.Uint32(payload[16:20])
-	if len(payload) > 20 {
-		entries = make([]byte, len(payload)-20)
-		copy(entries, payload[20:])
+	s3FlushWatermark = binary.BigEndian.Uint64(payload[20:28])
+	if len(payload) > 28 {
+		entries = make([]byte, len(payload)-28)
+		copy(entries, payload[28:])
 	}
-	return firstSeq, lastSeq, entryCount, entries, nil
+	return firstSeq, lastSeq, entryCount, s3FlushWatermark, entries, nil
 }
 
 // --- ACK message ---
