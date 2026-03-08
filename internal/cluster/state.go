@@ -633,6 +633,19 @@ func (s *State) StopAllGroups() {
 	}
 }
 
+// WakeAllFetchWaiters wakes every blocked Fetch long-poll across all
+// partitions. Called during demotion so in-flight Fetch handlers return
+// promptly and connection goroutines can exit.
+func (s *State) WakeAllFetchWaiters() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			pd.NotifyWaiters()
+		}
+	}
+}
+
 // Caller must hold s.mu.Lock().
 func (s *State) initPartitionsWAL(td *TopicData) {
 	for _, pd := range td.Partitions {
