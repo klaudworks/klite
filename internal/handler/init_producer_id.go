@@ -27,6 +27,10 @@ func HandleInitProducerID(state *cluster.State) server.Handler {
 		}
 
 		pid, epoch, errCode := state.PIDManager().InitProducerID(txnID, r.TransactionTimeoutMillis)
+		slog.Info("InitProducerID",
+			"txnID", txnID, "pid", pid, "epoch", epoch,
+			"reqPID", r.ProducerID, "reqEpoch", r.ProducerEpoch,
+			"errCode", errCode)
 		if errCode != 0 {
 			resp.ErrorCode = errCode
 			resp.ProducerID = -1

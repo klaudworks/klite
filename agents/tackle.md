@@ -8,7 +8,7 @@ fulfills the plan's intent.
 ## Workflow
 
 1. `br update <issue-id> --status in_progress`
-2. `br show <issue-id>` and `br comments <issue-id>` — find the plan
+2. `br show <issue-id> --format toon -q` and `br comments <issue-id> --format toon -q` — find the plan
 3. Read the relevant source files. Understand the full picture — the plan
    tells you the approach, but you need to understand the code to implement
    it well. Read broadly, not just the files the plan mentions.

@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -249,19 +250,31 @@ func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPar
 
 	ps, ok := m.producers[pid]
 	if !ok {
+		slog.Info("ValidateAndDedup: unknown PID, accepting as new producer",
+			"pid", pid, "epoch", epoch, "topic", tp.Topic, "partition", tp.Partition,
+			"firstSeq", firstSeq, "numRecords", numRecords)
 		return 0, false, 0 // unknown PID — likely idempotent producer that restarted
 	}
 
 	if epoch != ps.Epoch {
 		if epoch < ps.Epoch {
+			slog.Warn("ValidateAndDedup: PRODUCER_FENCED",
+				"pid", pid, "epoch", epoch, "currentEpoch", ps.Epoch)
 			return 35, false, 0 // PRODUCER_FENCED
 		}
 		// KIP-360: accept a higher epoch from the same PID. The client
 		// bumps the epoch locally after a disconnect/failover and resets
 		// sequences to 0. We must accept this and clear old dedup state.
 		if firstSeq != 0 {
+			slog.Warn("ValidateAndDedup: epoch bump with non-zero firstSeq",
+				"pid", pid, "epoch", epoch, "currentEpoch", ps.Epoch,
+				"firstSeq", firstSeq)
 			return 45, false, 0 // OUT_OF_ORDER_SEQUENCE_NUMBER — new epoch must start at seq 0
 		}
+		slog.Warn("ValidateAndDedup: epoch bump accepted (KIP-360)",
+			"pid", pid, "oldEpoch", ps.Epoch, "newEpoch", epoch,
+			"topic", tp.Topic, "partition", tp.Partition,
+			"numRecords", numRecords)
 		ps.Epoch = epoch
 		ps.Sequences = map[TopicPartition]*SequenceWindow{}
 		w := &SequenceWindow{}

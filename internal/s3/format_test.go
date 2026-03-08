@@ -103,7 +103,7 @@ func TestParseFooterInsufficientIndexData(t *testing.T) {
 
 	// Claim 1 entry but only provide the trailer (8 bytes).
 	buf := make([]byte, FooterTrailerSize)
-	binary.BigEndian.PutUint32(buf[0:4], 1)          // entryCount = 1
+	binary.BigEndian.PutUint32(buf[0:4], 1)           // entryCount = 1
 	binary.BigEndian.PutUint32(buf[4:8], FooterMagic) // magic
 
 	_, err := ParseFooter(buf, int64(len(buf)))
@@ -116,9 +116,9 @@ func TestFooterFindBatch(t *testing.T) {
 
 	footer := &Footer{
 		Entries: []BatchIndexEntry{
-			{BaseOffset: 0, LastOffsetDelta: 9},   // offsets 0-9
-			{BaseOffset: 10, LastOffsetDelta: 4},  // offsets 10-14
-			{BaseOffset: 15, LastOffsetDelta: 2},  // offsets 15-17
+			{BaseOffset: 0, LastOffsetDelta: 9},  // offsets 0-9
+			{BaseOffset: 10, LastOffsetDelta: 4}, // offsets 10-14
+			{BaseOffset: 15, LastOffsetDelta: 2}, // offsets 15-17
 		},
 	}
 
@@ -221,8 +221,10 @@ func TestBatchIndexEntryLastOffset(t *testing.T) {
 func TestTopicDirRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	id := [16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+	id := [16]byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
 	dir := TopicDir("my-topic", id)
 	name, parsedID := ParseTopicDir(dir)
 	assert.Equal(t, "my-topic", name)
@@ -250,8 +252,10 @@ func TestParseTopicDirInvalidHex(t *testing.T) {
 func TestTopicDirHyphenatedName(t *testing.T) {
 	t.Parallel()
 
-	id := [16]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,
-		0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99}
+	id := [16]byte{
+		0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,
+		0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+	}
 	dir := TopicDir("my-cool-topic", id)
 	name, parsedID := ParseTopicDir(dir)
 	assert.Equal(t, "my-cool-topic", name)
@@ -261,8 +265,10 @@ func TestTopicDirHyphenatedName(t *testing.T) {
 func TestObjectKeyAndPrefix(t *testing.T) {
 	t.Parallel()
 
-	id := [16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+	id := [16]byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
 
 	prefix := ObjectKeyPrefix("pfx", "mytopic", id, 3)
 	assert.Equal(t, "pfx/mytopic-0102030405060708090a0b0c0d0e0f10/3/", prefix)

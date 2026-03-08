@@ -1070,7 +1070,7 @@ func dumpPodInfo(t *testing.T, client *kubernetes.Clientset) {
 		}
 		logf("  labels: %v", p.Labels)
 
-		logReq := client.CoreV1().Pods(testNamespace).GetLogs(p.Name, &corev1.PodLogOptions{TailLines: ptr(int64(100))})
+		logReq := client.CoreV1().Pods(testNamespace).GetLogs(p.Name, &corev1.PodLogOptions{TailLines: ptr(int64(500))})
 		logStream, err := logReq.Stream(ctx)
 		if err != nil {
 			logf("  logs: (error: %v)", err)
@@ -1078,7 +1078,7 @@ func dumpPodInfo(t *testing.T, client *kubernetes.Clientset) {
 		}
 		logBytes, _ := io.ReadAll(logStream)
 		logStream.Close()
-		logf("  logs (last 100 lines):\n%s", string(logBytes))
+		logf("  logs (last 500 lines):\n%s", string(logBytes))
 	}
 }
 

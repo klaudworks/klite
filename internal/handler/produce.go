@@ -144,7 +144,7 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, clk clock.Clock)
 						meta.BaseSequence, meta.NumRecords, tentativeOffset,
 					)
 					if errCode != 0 {
-						slog.Debug("idempotent produce rejected",
+						slog.Warn("idempotent produce rejected",
 							"topic", rt.Topic, "partition", rp.Partition,
 							"pid", meta.ProducerID, "epoch", meta.ProducerEpoch,
 							"baseSeq", meta.BaseSequence, "numRecords", meta.NumRecords,
@@ -154,6 +154,11 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, clk clock.Clock)
 						continue
 					}
 					if isDup {
+						slog.Info("idempotent produce dedup",
+							"topic", rt.Topic, "partition", rp.Partition,
+							"pid", meta.ProducerID, "epoch", meta.ProducerEpoch,
+							"baseSeq", meta.BaseSequence, "numRecords", meta.NumRecords,
+							"dupOffset", dupOffset)
 						sp.BaseOffset = dupOffset
 						sp.LogAppendTime = -1
 						if isLogAppendTime {

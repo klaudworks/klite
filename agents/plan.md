@@ -18,7 +18,7 @@ the code better.
 ## Workflow
 
 1. `br update <issue-id> --status in_progress`
-2. `br show <issue-id>` — read the issue description
+2. `br show <issue-id> --format toon -q` — read the issue description
 3. Read the relevant source files. Understand the current state thoroughly.
    For refactors, trace callers and callees. For error handling, trace the
    full error path. For structural changes, map out the current organization.
