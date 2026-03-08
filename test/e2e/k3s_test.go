@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -470,7 +471,7 @@ func (c *cluster) consumeAll(expected int64) int64 {
 }
 
 // diagnoseConsumeGap uses a raw franz-go client to consume from offset 0 and
-// log any offset gaps or jumps.
+// log any offset gaps or jumps, with batch-level detail around the gap.
 func (c *cluster) diagnoseConsumeGap(expected int64) {
 	c.t.Helper()
 	client, err := kgo.NewClient(
@@ -493,27 +494,108 @@ func (c *cluster) diagnoseConsumeGap(expected int64) {
 
 	var count int64
 	var lastOffset int64 = -1
-	var gaps []string
+	var gapStart, gapEnd int64
+	pollIdx := 0
 	for ctx.Err() == nil {
 		fetches := client.PollFetches(ctx)
+		var pollFirst, pollLast int64 = -1, -1
+		var pollRecords int64
 		fetches.EachRecord(func(r *kgo.Record) {
-			if lastOffset >= 0 && r.Offset != lastOffset+1 {
-				gap := fmt.Sprintf("gap: offset %d → %d (missing %d)",
-					lastOffset, r.Offset, r.Offset-lastOffset-1)
-				if len(gaps) < 10 {
-					gaps = append(gaps, gap)
-				}
+			if pollFirst == -1 {
+				pollFirst = r.Offset
+			}
+			pollLast = r.Offset
+			pollRecords++
+			if lastOffset >= 0 && r.Offset != lastOffset+1 && gapStart == 0 {
+				gapStart = lastOffset
+				gapEnd = r.Offset
 			}
 			lastOffset = r.Offset
 			count++
 		})
+		// Log the first 5 polls and any poll that contains the gap boundary.
+		if pollRecords > 0 && (pollIdx < 5 || (gapStart > 0 && pollFirst <= gapEnd && pollLast >= gapStart)) {
+			logf("diagnose: poll[%d] records=%d offsets=[%d..%d]",
+				pollIdx, pollRecords, pollFirst, pollLast)
+		}
+		pollIdx++
 		if lastOffset+1 >= expected {
 			break
 		}
 	}
-	logf("diagnose: consumed %d records, last offset=%d, gaps=%d", count, lastOffset, len(gaps))
-	for _, g := range gaps {
-		logf("diagnose: %s", g)
+	logf("diagnose: consumed %d records, last offset=%d", count, lastOffset)
+	if gapStart > 0 {
+		logf("diagnose: gap: offset %d → %d (missing %d)", gapStart, gapEnd, gapEnd-gapStart-1)
+
+		// Issue a raw Fetch request at the gap offset to see what the broker returns.
+		c.diagnoseRawFetch(gapStart + 1)
+	}
+}
+
+// diagnoseRawFetch issues a direct Kafka Fetch request for a single offset
+// and logs the response batches.
+func (c *cluster) diagnoseRawFetch(offset int64) {
+	c.t.Helper()
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(c.proxyAddr),
+		kgo.Dialer(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", c.proxyAddr)
+		}),
+	)
+	if err != nil {
+		logf("diagnose-raw: client error: %v", err)
+		return
+	}
+	defer client.Close()
+
+	req := kmsg.NewFetchRequest()
+	req.MaxWaitMillis = 5000
+	req.MinBytes = 1
+	req.MaxBytes = 1024 * 1024
+	rt := kmsg.NewFetchRequestTopic()
+	rt.Topic = c.topic
+	rp := kmsg.NewFetchRequestTopicPartition()
+	rp.Partition = 0
+	rp.FetchOffset = offset
+	rp.PartitionMaxBytes = 1024 * 1024
+	rt.Partitions = append(rt.Partitions, rp)
+	req.Topics = append(req.Topics, rt)
+
+	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+	defer cancel()
+
+	resp, err := req.RequestWith(ctx, client)
+	if err != nil {
+		logf("diagnose-raw: fetch error at offset %d: %v", offset, err)
+		return
+	}
+
+	for _, t := range resp.Topics {
+		for _, p := range t.Partitions {
+			logf("diagnose-raw: offset=%d errorCode=%d hw=%d logStart=%d recordBytes=%d",
+				offset, p.ErrorCode, p.HighWatermark, p.LogStartOffset, len(p.RecordBatches))
+			// Parse individual batches from the response.
+			data := p.RecordBatches
+			batchIdx := 0
+			for len(data) >= 61 { // minimum Kafka batch header
+				baseOffset := int64(binary.BigEndian.Uint64(data[0:8]))
+				batchLen := int32(binary.BigEndian.Uint32(data[8:12]))
+				lastOffsetDelta := int32(binary.BigEndian.Uint32(data[23:27]))
+				numRecords := int32(binary.BigEndian.Uint32(data[57:61]))
+				logf("diagnose-raw: batch[%d] baseOffset=%d lastOffsetDelta=%d numRecords=%d batchLen=%d",
+					batchIdx, baseOffset, lastOffsetDelta, numRecords, batchLen)
+				totalSize := 12 + batchLen // 8 (offset) + 4 (length) + batchLen
+				if int(totalSize) > len(data) {
+					break
+				}
+				data = data[totalSize:]
+				batchIdx++
+				if batchIdx >= 10 {
+					logf("diagnose-raw: ... (truncated, %d bytes remaining)", len(data))
+					break
+				}
+			}
+		}
 	}
 }
 
