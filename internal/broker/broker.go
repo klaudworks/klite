@@ -141,70 +141,70 @@ func (b *Broker) initSASLStore() {
 }
 
 func (b *Broker) registerBaseHandlers() {
-	b.handlers.Register(18, handler.HandleApiVersions())
+	b.handlers.Register(handler.APIKeyApiVersions, handler.HandleApiVersions())
 
 	if b.saslStore != nil {
-		b.handlers.RegisterConn(17, handler.HandleSASLHandshake())
-		b.handlers.RegisterConn(36, handler.HandleSASLAuthenticate(b.saslStore))
+		b.handlers.RegisterConn(handler.APIKeySASLHandshake, handler.HandleSASLHandshake())
+		b.handlers.RegisterConn(handler.APIKeySASLAuthenticate, handler.HandleSASLAuthenticate(b.saslStore))
 	}
 }
 
 func (b *Broker) registerRuntimeHandlers(advAddr string) {
-	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter, b.cfg.Clock))
-	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh, b.cfg.Clock))
-	b.handlers.Register(2, handler.HandleListOffsets(b.state))
-	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
+	b.handlers.Register(handler.APIKeyProduce, handler.HandleProduce(b.state, b.walWriter, b.cfg.Clock))
+	b.handlers.Register(handler.APIKeyFetch, handler.HandleFetch(b.state, b.shutdownCh, b.cfg.Clock))
+	b.handlers.Register(handler.APIKeyListOffsets, handler.HandleListOffsets(b.state))
+	b.handlers.Register(handler.APIKeyMetadata, handler.HandleMetadata(handler.MetadataConfig{
 		NodeID:         b.cfg.NodeID,
 		AdvertisedAddr: advAddr,
 		ClusterID:      b.clusterID,
 		State:          b.state,
 	}))
-	b.handlers.Register(19, handler.HandleCreateTopics(b.state))
-	b.handlers.Register(10, handler.HandleFindCoordinator(handler.FindCoordinatorConfig{
+	b.handlers.Register(handler.APIKeyCreateTopics, handler.HandleCreateTopics(b.state))
+	b.handlers.Register(handler.APIKeyFindCoordinator, handler.HandleFindCoordinator(handler.FindCoordinatorConfig{
 		NodeID:         b.cfg.NodeID,
 		AdvertisedAddr: advAddr,
 	}))
-	b.handlers.Register(8, handler.HandleOffsetCommit(b.state))
-	b.handlers.Register(9, handler.HandleOffsetFetch(b.state))
-	b.handlers.Register(11, handler.HandleJoinGroup(b.state))
-	b.handlers.Register(12, handler.HandleHeartbeat(b.state))
-	b.handlers.Register(13, handler.HandleLeaveGroup(b.state))
-	b.handlers.Register(14, handler.HandleSyncGroup(b.state))
-	b.handlers.Register(47, handler.HandleOffsetDelete(b.state))
+	b.handlers.Register(handler.APIKeyOffsetCommit, handler.HandleOffsetCommit(b.state))
+	b.handlers.Register(handler.APIKeyOffsetFetch, handler.HandleOffsetFetch(b.state))
+	b.handlers.Register(handler.APIKeyJoinGroup, handler.HandleJoinGroup(b.state))
+	b.handlers.Register(handler.APIKeyHeartbeat, handler.HandleHeartbeat(b.state))
+	b.handlers.Register(handler.APIKeyLeaveGroup, handler.HandleLeaveGroup(b.state))
+	b.handlers.Register(handler.APIKeySyncGroup, handler.HandleSyncGroup(b.state))
+	b.handlers.Register(handler.APIKeyOffsetDelete, handler.HandleOffsetDelete(b.state))
 
-	b.handlers.Register(15, handler.HandleDescribeGroups(b.state))
-	b.handlers.Register(16, handler.HandleListGroups(b.state))
-	b.handlers.Register(20, handler.HandleDeleteTopics(b.state))
-	b.handlers.Register(21, handler.HandleDeleteRecords(b.state))
-	b.handlers.Register(23, handler.HandleOffsetForLeaderEpoch(b.state))
-	b.handlers.Register(32, handler.HandleDescribeConfigs(handler.DescribeConfigsConfig{
+	b.handlers.Register(handler.APIKeyDescribeGroups, handler.HandleDescribeGroups(b.state))
+	b.handlers.Register(handler.APIKeyListGroups, handler.HandleListGroups(b.state))
+	b.handlers.Register(handler.APIKeyDeleteTopics, handler.HandleDeleteTopics(b.state))
+	b.handlers.Register(handler.APIKeyDeleteRecords, handler.HandleDeleteRecords(b.state))
+	b.handlers.Register(handler.APIKeyOffsetForLeaderEpoch, handler.HandleOffsetForLeaderEpoch(b.state))
+	b.handlers.Register(handler.APIKeyDescribeConfigs, handler.HandleDescribeConfigs(handler.DescribeConfigsConfig{
 		NodeID: b.cfg.NodeID,
 		State:  b.state,
 	}))
-	b.handlers.Register(33, handler.HandleAlterConfigs(b.state))
-	b.handlers.Register(35, handler.HandleDescribeLogDirs(b.state, b.cfg.DataDir))
-	b.handlers.Register(37, handler.HandleCreatePartitions(b.state))
-	b.handlers.Register(42, handler.HandleDeleteGroups(b.state))
-	b.handlers.Register(44, handler.HandleIncrementalAlterConfigs(b.state))
-	b.handlers.Register(60, handler.HandleDescribeCluster(handler.DescribeClusterConfig{
+	b.handlers.Register(handler.APIKeyAlterConfigs, handler.HandleAlterConfigs(b.state))
+	b.handlers.Register(handler.APIKeyDescribeLogDirs, handler.HandleDescribeLogDirs(b.state, b.cfg.DataDir))
+	b.handlers.Register(handler.APIKeyCreatePartitions, handler.HandleCreatePartitions(b.state))
+	b.handlers.Register(handler.APIKeyDeleteGroups, handler.HandleDeleteGroups(b.state))
+	b.handlers.Register(handler.APIKeyIncrementalAlterConfigs, handler.HandleIncrementalAlterConfigs(b.state))
+	b.handlers.Register(handler.APIKeyDescribeCluster, handler.HandleDescribeCluster(handler.DescribeClusterConfig{
 		NodeID:         b.cfg.NodeID,
 		AdvertisedAddr: advAddr,
 		ClusterID:      b.clusterID,
 	}))
 
 	if b.saslStore != nil {
-		b.handlers.Register(50, handler.HandleDescribeUserScramCredentials(b.saslStore))
-		b.handlers.Register(51, handler.HandleAlterUserScramCredentials(b.saslStore, b.metaLog))
+		b.handlers.Register(handler.APIKeyDescribeUserScramCreds, handler.HandleDescribeUserScramCredentials(b.saslStore))
+		b.handlers.Register(handler.APIKeyAlterUserScramCreds, handler.HandleAlterUserScramCredentials(b.saslStore, b.metaLog))
 	}
 
-	b.handlers.Register(22, handler.HandleInitProducerID(b.state))
-	b.handlers.Register(24, handler.HandleAddPartitionsToTxn(b.state))
-	b.handlers.Register(25, handler.HandleAddOffsetsToTxn(b.state))
-	b.handlers.Register(26, handler.HandleEndTxn(b.state, b.walWriter, b.cfg.Clock))
-	b.handlers.Register(28, handler.HandleTxnOffsetCommit(b.state))
-	b.handlers.Register(61, handler.HandleDescribeProducers(b.state))
-	b.handlers.Register(65, handler.HandleDescribeTransactions(b.state))
-	b.handlers.Register(66, handler.HandleListTransactions(b.state))
+	b.handlers.Register(handler.APIKeyInitProducerID, handler.HandleInitProducerID(b.state))
+	b.handlers.Register(handler.APIKeyAddPartitionsToTxn, handler.HandleAddPartitionsToTxn(b.state))
+	b.handlers.Register(handler.APIKeyAddOffsetsToTxn, handler.HandleAddOffsetsToTxn(b.state))
+	b.handlers.Register(handler.APIKeyEndTxn, handler.HandleEndTxn(b.state, b.walWriter, b.cfg.Clock))
+	b.handlers.Register(handler.APIKeyTxnOffsetCommit, handler.HandleTxnOffsetCommit(b.state))
+	b.handlers.Register(handler.APIKeyDescribeProducers, handler.HandleDescribeProducers(b.state))
+	b.handlers.Register(handler.APIKeyDescribeTransactions, handler.HandleDescribeTransactions(b.state))
+	b.handlers.Register(handler.APIKeyListTransactions, handler.HandleListTransactions(b.state))
 }
 
 // Run starts the broker and blocks until ctx is cancelled.
