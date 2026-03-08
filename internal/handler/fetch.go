@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/klaudworks/klite/internal/clock"
@@ -9,6 +11,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
+
+var lastFetchHandlerLog atomic.Int64
 
 func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, clk clock.Clock) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
@@ -60,6 +64,23 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, clk clock.Clo
 					info.pd = td.Partitions[rp.Partition]
 				}
 				allParts = append(allParts, info)
+			}
+		}
+
+		// Diagnostic: log fetch requests with offset and HW (rate-limited to 1/s).
+		if now := time.Now().UnixNano(); now-lastFetchHandlerLog.Load() > int64(time.Second) {
+			lastFetchHandlerLog.Store(now)
+			for _, info := range allParts {
+				if info.pd != nil {
+					rp := r.Topics[info.topicIdx].Partitions[info.partIdx]
+					info.pd.RLock()
+					hw := info.pd.HW()
+					info.pd.RUnlock()
+					slog.Debug("fetch handler: request",
+						"topic", info.topicName, "partition", info.partitionID,
+						"fetch_offset", rp.FetchOffset, "hw", hw,
+						"session_id", r.SessionID)
+				}
 			}
 		}
 

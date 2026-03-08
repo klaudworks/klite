@@ -50,6 +50,10 @@ type FlushPartition struct {
 	// Returns the detached chunks and the chunk pool for release after upload.
 	DetachChunks func(flushAll bool) ([]*chunk.Chunk, *chunk.Pool)
 
+	// ReattachChunks prepends chunks back onto the partition's sealed list
+	// so they can be retried on the next flush cycle. Called on upload failure.
+	ReattachChunks func(chunks []*chunk.Chunk)
+
 	// AdvanceWatermark is called after successful flush to advance the watermark.
 	AdvanceWatermark func(newWatermark int64)
 }
@@ -252,6 +256,27 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 		if len(chunks) == 0 {
 			continue
 		}
+		// Diagnostic: log chunk coverage for debugging offset gaps.
+		var firstOff, lastOff int64 = -1, -1
+		var totalBatches int
+		for _, c := range chunks {
+			for _, b := range c.Batches {
+				if firstOff < 0 || b.BaseOffset < firstOff {
+					firstOff = b.BaseOffset
+				}
+				endOff := b.BaseOffset + int64(b.LastOffsetDelta)
+				if endOff > lastOff {
+					lastOff = endOff
+				}
+				totalBatches++
+			}
+		}
+		f.logger.Debug("S3 flush: detached chunks",
+			"topic", fc.fp.Topic, "partition", fc.fp.Partition,
+			"chunks", len(chunks), "batches", totalBatches,
+			"first_offset", firstOff, "last_offset", lastOff,
+			"include_current", fc.includeCurrent,
+			"s3_watermark", fc.fp.S3Watermark)
 		jobs = append(jobs, flushJob{
 			FlushPartition: fc.fp,
 			chunks:         chunks,
@@ -297,10 +322,13 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 					firstErr = err
 				}
 				errMu.Unlock()
-				f.logger.Error("S3 partition flush failed",
+				f.logger.Error("S3 partition flush failed, re-enqueuing chunks for retry",
 					"topic", job.Topic, "partition", job.Partition, "err", err)
-				// Data is still in WAL for retry on next scan
-				job.pool.ReleaseMany(job.chunks)
+				if job.ReattachChunks != nil {
+					job.ReattachChunks(job.chunks)
+				} else {
+					job.pool.ReleaseMany(job.chunks)
+				}
 				return
 			}
 

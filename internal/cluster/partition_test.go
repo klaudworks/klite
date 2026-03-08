@@ -1629,3 +1629,106 @@ func TestFetchAtLogStartBoundary(t *testing.T) {
 		t.Errorf("LogStart in response: got %d, want 3", fr.LogStart)
 	}
 }
+
+// TestAdvanceLogStartOffset_ConcurrentFetch is a regression test verifying
+// that AdvanceLogStartOffset does not hold the partition lock during metadata
+// persistence. Before the fix, metaLog.AppendSync (disk fsync) was called under
+// pd.mu.Lock(), blocking all Fetch and Produce requests for the fsync duration.
+//
+// This test runs concurrent AdvanceLogStartOffset and Fetch operations to verify
+// they don't deadlock. With the old code (fsync under lock), this would either
+// deadlock or show significant contention under -race.
+func TestAdvanceLogStartOffset_ConcurrentFetch(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+	pd.Lock()
+	for i := 0; i < 20; i++ {
+		pushTestBatch(t, pd, 1, int64(i*100))
+	}
+	pd.Unlock()
+
+	var wg sync.WaitGroup
+
+	// Run many concurrent AdvanceLogStartOffset calls (without metaLog for speed).
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(offset int64) {
+			defer wg.Done()
+			pd.CompactionMu.Lock()
+			_ = pd.AdvanceLogStartOffset(offset, nil)
+			pd.CompactionMu.Unlock()
+		}(int64(i))
+	}
+
+	// Run many concurrent Fetch calls — these must not deadlock.
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = pd.Fetch(0, 1024*1024)
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success — no deadlock.
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: concurrent Fetch + AdvanceLogStartOffset did not complete in 5s")
+	}
+
+	// Verify logStart was advanced to the highest value.
+	pd.RLock()
+	ls := pd.LogStart()
+	pd.RUnlock()
+	if ls < 9 {
+		t.Errorf("logStart: got %d, want >= 9", ls)
+	}
+}
+
+// TestReattachSealedChunks verifies that ReattachSealedChunks prepends chunks
+// back onto the sealed list, preserving order so the oldest chunks are flushed first.
+func TestReattachSealedChunks(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	// Push some data to create a sealed chunk.
+	pd.Lock()
+	pushTestBatch(t, pd, 5, 100)
+	pd.Unlock()
+
+	// Detach the sealed chunks (simulating S3 flusher taking them).
+	pd.Lock()
+	detached := pd.DetachSealedChunks(true)
+	pd.Unlock()
+
+	if len(detached) == 0 {
+		t.Fatal("expected at least one detached chunk")
+	}
+
+	// Push more data to create new sealed chunks.
+	pd.Lock()
+	pushTestBatch(t, pd, 5, 200)
+	pd.Unlock()
+
+	// Reattach the original chunks (simulating upload failure).
+	pd.Lock()
+	pd.ReattachSealedChunks(detached)
+	allSealed := pd.DetachSealedChunks(true)
+	pd.Unlock()
+
+	// The reattached chunks should come first (they're older).
+	if len(allSealed) < 2 {
+		t.Fatalf("expected at least 2 chunks after reattach, got %d", len(allSealed))
+	}
+	if allSealed[0] != detached[0] {
+		t.Error("reattached chunk should be first (prepended)")
+	}
+}

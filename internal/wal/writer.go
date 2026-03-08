@@ -807,7 +807,9 @@ func (w *Writer) cleanSegments() {
 			}
 			w.diskUsage.Add(-oldest.size)
 			w.logger.Info("deleted WAL segment (disk pressure)",
-				"seq", oldest.seq, "path", oldest.path)
+				"seq", oldest.seq, "min_seq", oldest.minSeq, "max_seq", oldest.maxSeq,
+				"size", oldest.size, "disk_after", w.diskUsage.Load(),
+				"s3_watermark", watermark, "path", oldest.path)
 			w.segments = w.segments[1:]
 		}
 	}

@@ -1036,16 +1036,21 @@ func (b *Broker) rebuildChunksFromWAL() {
 
 		entries := b.walIndex.PartitionEntries(tp)
 		var loaded int
+		var skippedS3, skippedRead int
+		var firstLoadedOffset, lastLoadedOffset int64
+		firstLoadedOffset = -1
 		// Track open txns per-producer to reconstruct abortedTxns index.
 		openTxnFirstOffset := make(map[int64]int64) // producerID -> first data offset
 		for _, e := range entries {
 			// Skip entries already flushed to S3.
 			if e.LastOffset < s3WM {
+				skippedS3++
 				continue
 			}
 
 			data, err := b.walWriter.ReadBatch(e)
 			if err != nil {
+				skippedRead++
 				b.logger.Warn("rebuildChunks: skipping unreadable WAL entry",
 					"topic_id", tp.TopicID, "partition", tp.Partition,
 					"base_offset", e.BaseOffset, "err", err)
@@ -1098,6 +1103,10 @@ func (b *Broker) rebuildChunksFromWAL() {
 			}, spare)
 			pd.Unlock()
 			pd.ReleaseSpareChunk(spare)
+			if firstLoadedOffset < 0 {
+				firstLoadedOffset = e.BaseOffset
+			}
+			lastLoadedOffset = e.LastOffset
 			loaded++
 		}
 
@@ -1105,7 +1114,10 @@ func (b *Broker) rebuildChunksFromWAL() {
 			rebuilt++
 			b.logger.Debug("rebuildChunks: loaded WAL entries into chunks",
 				"topic", td.Name, "partition", tp.Partition,
-				"entries", loaded, "s3_watermark", s3WM)
+				"entries", loaded, "s3_watermark", s3WM,
+				"first_offset", firstLoadedOffset, "last_offset", lastLoadedOffset,
+				"skipped_s3", skippedS3, "skipped_read", skippedRead,
+				"total_wal_entries", len(entries))
 		}
 	}
 
@@ -1985,6 +1997,11 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 				pool := pd.ChunkPool()
 				pd.Unlock()
 				return chunks, pool
+			},
+			ReattachChunks: func(chunks []*chunk.Chunk) {
+				pd.Lock()
+				pd.ReattachSealedChunks(chunks)
+				pd.Unlock()
 			},
 			AdvanceWatermark: func(newWatermark int64) {
 				pd.Lock()

@@ -827,27 +827,6 @@ func countWALFiles(t *testing.T, dir string) int {
 	return count
 }
 
-func TestIndexPruneBefore(t *testing.T) {
-	t.Parallel()
-
-	idx := NewIndex()
-	tp := TopicPartition{TopicID: [16]byte{1}, Partition: 0}
-
-	idx.Add(tp, IndexEntry{BaseOffset: 0, LastOffset: 4})
-	idx.Add(tp, IndexEntry{BaseOffset: 5, LastOffset: 9})
-	idx.Add(tp, IndexEntry{BaseOffset: 10, LastOffset: 14})
-
-	idx.PruneBefore(tp, 5) // should remove entry with LastOffset=4
-
-	entries := idx.Lookup(tp, 0, 1024*1024)
-	if len(entries) != 2 {
-		t.Errorf("after prune: got %d entries, want 2", len(entries))
-	}
-	if entries[0].BaseOffset != 5 {
-		t.Errorf("first entry after prune: got base %d, want 5", entries[0].BaseOffset)
-	}
-}
-
 func TestUnflushedBytes(t *testing.T) {
 	t.Parallel()
 
@@ -1205,12 +1184,12 @@ func TestIndexConcurrentAccess(t *testing.T) {
 		}()
 	}
 
-	// Concurrent prune
+	// Concurrent prune (uses PruneSegment, the production code path)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			idx.PruneBefore(tp, int64(i*10))
+			idx.PruneSegment(uint64(i))
 		}
 	}()
 

@@ -403,6 +403,69 @@ func TestScanAndFlush_UploadFailure_ReturnsError(t *testing.T) {
 	assert.Equal(t, poolFreeBeforeFlush, pool.Free(), "chunks should be released on failure")
 }
 
+// TestScanAndFlush_UploadFailure_ReattachesChunks verifies that when an S3
+// upload fails, chunks are re-enqueued onto the partition's sealed list via
+// ReattachChunks so they can be retried on the next flush cycle. This is a
+// regression test for a bug where chunks were released to the pool on failure,
+// causing data loss (the flusher never reads from WAL during normal operation).
+func TestScanAndFlush_UploadFailure_ReattachesChunks(t *testing.T) {
+	t.Parallel()
+
+	pool := chunk.NewPool(10*1024*1024, 1024*1024)
+	testChunks := []*chunk.Chunk{
+		makeTestChunk(pool, []chunk.ChunkBatch{
+			{BaseOffset: 0, LastOffsetDelta: 4},
+		}),
+	}
+
+	var reattachedChunks []*chunk.Chunk
+	var watermarkAdvanced bool
+	detachCalls := 0
+
+	provider := &stubPartitionProvider{
+		partitions: []FlushPartition{{
+			Topic:       "test-topic",
+			Partition:   0,
+			TopicID:     [16]byte{99},
+			SealedBytes: 2 * 1024 * 1024,
+			DetachChunks: func(flushAll bool) ([]*chunk.Chunk, *chunk.Pool) {
+				detachCalls++
+				return testChunks, pool
+			},
+			ReattachChunks: func(chunks []*chunk.Chunk) {
+				reattachedChunks = chunks
+			},
+			AdvanceWatermark: func(wm int64) { watermarkAdvanced = true },
+		}},
+	}
+
+	clk := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	failS3 := &alwaysFailingS3{err: errors.New("S3 down")}
+	client := NewClient(ClientConfig{
+		S3Client: failS3,
+		Bucket:   "test-bucket",
+		Prefix:   "test-prefix",
+	})
+
+	flusher := NewFlusher(FlusherConfig{
+		Client:            client,
+		FlushInterval:     60 * time.Second,
+		TargetObjectSize:  1024 * 1024,
+		UploadConcurrency: 1,
+		Clock:             clk,
+	}, provider)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := flusher.scanAndFlush(ctx, true)
+	require.Error(t, err)
+
+	require.Len(t, reattachedChunks, 1, "chunks must be re-enqueued on upload failure")
+	assert.Same(t, testChunks[0], reattachedChunks[0], "same chunk objects must be returned")
+	assert.False(t, watermarkAdvanced, "watermark must not advance on failure")
+}
+
 // --- uploadWithRetry tests ---
 
 func TestUploadWithRetry_Success(t *testing.T) {

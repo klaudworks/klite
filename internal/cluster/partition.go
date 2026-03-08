@@ -2,13 +2,21 @@ package cluster
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/wal"
+)
+
+var (
+	lastEmptyFetchLog   atomic.Int64
+	lastColdGapLog      atomic.Int64
+	lastChunkFallbackLog atomic.Int64
 )
 
 const ErrCodeOffsetOutOfRange int16 = 1
@@ -377,12 +385,56 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	walIdx := pd.walIndex
 	walW := pd.walWriter
 	s3Fetch := pd.s3Fetch
+	s3WM := pd.s3FlushWatermark
+	chunkFirstOffset := int64(-1)
+	if len(chunkBatches) > 0 {
+		chunkFirstOffset = chunkBatches[0].BaseOffset
+	}
 	pd.mu.RUnlock()
 
-	if coldBatches := fetchFromCold(fetchOffset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch); len(coldBatches) > 0 {
+	coldBatches := fetchFromCold(fetchOffset, maxBytes, topicID, partIdx, topic, walIdx, walW, s3Fetch)
+	if len(coldBatches) > 0 {
 		coldBatches = filterBatchesByHW(coldBatches, hw)
 		if len(coldBatches) > 0 {
+			// Diagnostic: cold path returned data starting after the requested offset.
+			if coldBatches[0].BaseOffset > fetchOffset {
+				if now := time.Now().UnixNano(); now-lastColdGapLog.Load() > int64(time.Second) {
+					lastColdGapLog.Store(now)
+					slog.Warn("fetch: cold path gap",
+						"topic", topic, "partition", partIdx,
+						"fetch_offset", fetchOffset,
+						"cold_base_offset", coldBatches[0].BaseOffset,
+						"gap", coldBatches[0].BaseOffset-fetchOffset,
+						"hw", hw, "s3_watermark", s3WM,
+						"chunk_first_offset", chunkFirstOffset)
+				}
+			}
 			return FetchResponse{HW: hw, LogStart: logStart, LSO: lso, Batches: coldBatches}
+		}
+	}
+
+	// Diagnostic: offset is below HW but neither chunks nor cold path returned data.
+	if now := time.Now().UnixNano(); now-lastEmptyFetchLog.Load() > int64(time.Second) {
+		lastEmptyFetchLog.Store(now)
+		slog.Warn("fetch: empty response for valid offset",
+			"topic", topic, "partition", partIdx,
+			"fetch_offset", fetchOffset, "hw", hw,
+			"s3_watermark", s3WM,
+			"chunk_first_offset", chunkFirstOffset,
+			"cold_len", len(coldBatches),
+			"wal_index_nil", walIdx == nil, "s3_fetch_nil", s3Fetch == nil)
+	}
+
+	// Diagnostic: falling back to chunk batches that start after the requested offset.
+	if len(chunkBatches) > 0 && chunkBatches[0].BaseOffset > fetchOffset {
+		if now := time.Now().UnixNano(); now-lastChunkFallbackLog.Load() > int64(time.Second) {
+			lastChunkFallbackLog.Store(now)
+			slog.Warn("fetch: chunk fallback gap",
+				"topic", topic, "partition", partIdx,
+				"fetch_offset", fetchOffset,
+				"chunk_base_offset", chunkBatches[0].BaseOffset,
+				"gap", chunkBatches[0].BaseOffset-fetchOffset,
+				"hw", hw, "s3_watermark", s3WM)
 		}
 	}
 
@@ -415,7 +467,12 @@ func readFromS3(s3Fetch S3Fetcher, topic string, topicID [16]byte, partition int
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s3Batches, err := s3Fetch.FetchBatches(ctx, topic, topicID, partition, offset, maxBytes)
-	if err != nil || len(s3Batches) == 0 {
+	if err != nil {
+		slog.Warn("readFromS3: error", "topic", topic, "partition", partition,
+			"offset", offset, "err", err)
+		return nil
+	}
+	if len(s3Batches) == 0 {
 		return nil
 	}
 	var result []StoredBatch
@@ -446,6 +503,8 @@ func filterBatchesByHW(batches []StoredBatch, hw int64) []StoredBatch {
 	return batches[:n]
 }
 
+var lastColdReadLog atomic.Int64
+
 func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32, topic string, walIdx *wal.Index, walW *wal.Writer, s3Fetch S3Fetcher) []StoredBatch {
 	var walEntries []wal.IndexEntry
 	if walIdx != nil && walW != nil {
@@ -457,8 +516,20 @@ func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32
 	if len(walEntries) > 0 {
 		if walEntries[0].BaseOffset <= offset || s3Fetch == nil {
 			walHasOffset = true
-			if result := readFromWAL(walW, walEntries); len(result) > 0 {
+			result := readFromWAL(walW, walEntries)
+			if len(result) > 0 {
 				return result
+			}
+			// WAL index had entries but read failed (segment deleted?).
+			if now := time.Now().UnixNano(); now-lastColdReadLog.Load() > int64(time.Second) {
+				lastColdReadLog.Store(now)
+				slog.Warn("fetchFromCold: WAL read empty despite index hit",
+					"topic", topic, "partition", partIdx,
+					"fetch_offset", offset,
+					"wal_entry_base", walEntries[0].BaseOffset,
+					"wal_entry_last", walEntries[0].LastOffset,
+					"wal_entry_seg", walEntries[0].SegmentSeq,
+					"wal_entries", len(walEntries))
 			}
 		}
 	}
@@ -622,19 +693,26 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 	if newOffset > pd.hw {
 		newOffset = pd.hw
 	}
+	topic := pd.Topic
+	partIdx := pd.Index
+	pd.mu.Unlock()
 
+	// Persist outside the partition lock to avoid blocking Fetch/Produce
+	// during the fsync. CompactionMu (held by caller) prevents concurrent
+	// AdvanceLogStartOffset calls, so the offset can't regress between
+	// our read above and the write below.
 	if metaLog != nil {
 		entry := metadata.MarshalLogStartOffset(&metadata.LogStartOffsetEntry{
-			TopicName:      pd.Topic,
-			Partition:      pd.Index,
+			TopicName:      topic,
+			Partition:      partIdx,
 			LogStartOffset: newOffset,
 		})
 		if err := metaLog.AppendSync(entry); err != nil {
-			pd.mu.Unlock()
 			return err
 		}
 	}
 
+	pd.mu.Lock()
 	pd.trimBatchesLocked(newOffset)
 	pd.mu.Unlock()
 
@@ -774,6 +852,14 @@ func (pd *PartData) DetachSealedChunks(includeCurrentIfNonEmpty bool) []*chunk.C
 	result := pd.chunkSealed
 	pd.chunkSealed = nil
 	return result
+}
+
+// ReattachSealedChunks prepends chunks back onto the sealed list.
+// Used by the S3 flusher to re-enqueue chunks after a failed upload so they
+// can be retried on the next flush cycle instead of being lost.
+// Caller must hold pd.mu.Lock().
+func (pd *PartData) ReattachSealedChunks(chunks []*chunk.Chunk) {
+	pd.chunkSealed = append(chunks, pd.chunkSealed...)
 }
 
 // Caller must hold pd.mu.RLock().

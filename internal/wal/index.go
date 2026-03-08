@@ -72,24 +72,6 @@ func (idx *Index) Lookup(tp TopicPartition, fetchOffset int64, maxBytes int32) [
 	return result
 }
 
-func (idx *Index) PruneBefore(tp TopicPartition, newLogStart int64) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	entries := idx.partitions[tp]
-	if len(entries) == 0 {
-		return
-	}
-
-	cutoff := sort.Search(len(entries), func(i int) bool {
-		return entries[i].LastOffset >= newLogStart
-	})
-
-	if cutoff > 0 {
-		idx.partitions[tp] = entries[cutoff:]
-	}
-}
-
 func (idx *Index) PruneSegment(segmentSeq uint64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
