@@ -124,6 +124,14 @@ type Writer struct {
 
 	// localOnlyBatches counts WAL batches written without replication because
 	// the standby was not connected. Reset on standby reconnect.
+	//
+	// These batches exist only on the primary's local WAL and in S3 once
+	// flushed. The standby does NOT receive them on reconnection (the
+	// replication protocol only streams new entries forward). After a
+	// standby reconnects, at least one S3 flush interval must elapse
+	// before a subsequent failover is safe — otherwise the local-only
+	// window data is lost because it's neither on the standby's WAL
+	// nor in S3.
 	localOnlyBatches atomic.Int64
 
 	// replicator stores the current Replicator behind an atomic.Value
@@ -483,7 +491,9 @@ func (w *Writer) run() {
 			firstSeq, lastSeq := w.batchSeqRange(pending[:written])
 			replCh = repl.Replicate(batch, firstSeq, lastSeq)
 		} else if written > 0 && repl != nil && !repl.Connected() {
-			w.localOnlyBatches.Add(int64(written))
+			newTotal := w.localOnlyBatches.Add(int64(written))
+			w.logger.Warn("WAL local-only ack: standby not connected, acking without replication",
+				"batches", written, "local_only_total", newTotal)
 		}
 
 		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {

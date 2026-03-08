@@ -253,9 +253,12 @@ func (s *Sender) drainPending() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	n := len(s.pending)
 	for _, ch := range s.pending {
 		ch <- errDisconnected
 	}
 	s.pending = nil
 	s.connected = false
+	s.logger.Info("repl sender: drainPending complete, connected=false",
+		"drained_entries", n)
 }
