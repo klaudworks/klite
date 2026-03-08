@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 type Client struct {
@@ -249,6 +251,7 @@ type InMemoryS3 struct {
 	etagCounter   int
 	timestamps    map[string]time.Time
 	RangeRequests []RangeRequest
+	clk           clock.Clock
 }
 
 type RangeRequest struct {
@@ -261,7 +264,14 @@ func NewInMemoryS3() *InMemoryS3 {
 		objects:    make(map[string][]byte),
 		etags:      make(map[string]string),
 		timestamps: make(map[string]time.Time),
+		clk:        clock.RealClock{},
 	}
+}
+
+func (m *InMemoryS3) SetClock(c clock.Clock) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clk = c
 }
 
 func (m *InMemoryS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -299,7 +309,7 @@ func (m *InMemoryS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ..
 
 	m.objects[key] = data
 	m.etags[key] = etag
-	m.timestamps[key] = time.Now()
+	m.timestamps[key] = m.clk.Now()
 	return &s3.PutObjectOutput{ETag: &etag}, nil
 }
 

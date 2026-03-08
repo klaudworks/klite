@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 type ChunkBatch struct {
@@ -44,6 +46,7 @@ type Pool struct {
 	cond   *sync.Cond
 	free   []*Chunk // available chunks (stack, LIFO for cache warmth)
 	closed bool
+	clk    clock.Clock
 
 	allocated atomic.Int64 // number of chunks currently out on loan
 
@@ -64,6 +67,7 @@ func NewPool(budget int64, chunkSize int) *Pool {
 		chunkSize: chunkSize,
 		maxChunks: maxChunks,
 		free:      make([]*Chunk, maxChunks),
+		clk:       clock.RealClock{},
 	}
 	p.cond = sync.NewCond(&p.mu)
 
@@ -75,6 +79,10 @@ func NewPool(budget int64, chunkSize int) *Pool {
 	}
 
 	return p
+}
+
+func (p *Pool) SetClock(c clock.Clock) {
+	p.clk = c
 }
 
 func (p *Pool) SetTriggerCh(ch chan struct{}) {
@@ -107,7 +115,7 @@ func (p *Pool) Acquire() *Chunk {
 	p.mu.Unlock()
 
 	p.allocated.Add(1)
-	c.CreatedAt = time.Now()
+	c.CreatedAt = p.clk.Now()
 	return c
 }
 
@@ -130,7 +138,7 @@ func (p *Pool) TryAcquire() *Chunk {
 		p.signalEmergencyFlush()
 	}
 
-	c.CreatedAt = time.Now()
+	c.CreatedAt = p.clk.Now()
 	return c
 }
 

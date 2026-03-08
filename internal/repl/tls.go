@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 // ErrAlreadyExists is returned by TLSStore.PutIfAbsent when the key already exists.
@@ -34,11 +36,12 @@ type TLSStore interface {
 
 // TLSConfig configures EnsureTLS.
 type TLSConfig struct {
-	Store     TLSStore // S3 storage for certs
-	Prefix    string   // S3 key prefix (e.g. "klite-<clusterID>")
-	CacheDir  string   // Local cache directory (e.g. "<data-dir>/repl-tls/")
-	ExtraSANs []string // Additional DNS SANs for the node certificate
+	Store     TLSStore     // S3 storage for certs
+	Prefix    string       // S3 key prefix (e.g. "klite-<clusterID>")
+	CacheDir  string       // Local cache directory (e.g. "<data-dir>/repl-tls/")
+	ExtraSANs []string     // Additional DNS SANs for the node certificate
 	Logger    *slog.Logger
+	Clock     clock.Clock  // If nil, uses clock.RealClock{}
 }
 
 // EnsureTLS ensures TLS certificates exist for replication mTLS. It checks
@@ -48,6 +51,9 @@ type TLSConfig struct {
 func EnsureTLS(ctx context.Context, cfg TLSConfig) (*tls.Config, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = clock.RealClock{}
 	}
 
 	// Try local cache first
@@ -244,11 +250,12 @@ func generateAndUpload(ctx context.Context, cfg TLSConfig) error {
 		return fmt.Errorf("generate CA serial: %w", err)
 	}
 
+	now := cfg.Clock.Now()
 	caTemplate := &x509.Certificate{
 		SerialNumber:          caSerial,
 		Subject:               pkix.Name{CommonName: "klite-repl-ca"},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		NotBefore:             now.Add(-1 * time.Hour),
+		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
@@ -273,8 +280,8 @@ func generateAndUpload(ctx context.Context, cfg TLSConfig) error {
 	nodeTemplate := &x509.Certificate{
 		SerialNumber: nodeSerial,
 		Subject:      pkix.Name{CommonName: "klite-repl-node"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+		NotBefore:    now.Add(-1 * time.Hour),
+		NotAfter:     now.Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:     tlsDNSNames(cfg.ExtraSANs),
