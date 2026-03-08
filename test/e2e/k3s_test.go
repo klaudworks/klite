@@ -614,11 +614,8 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 
 	logf("checkpoint consume: expecting %d records...", checkpoint)
 	consumed := c.consumeAll(checkpoint)
-	require.GreaterOrEqual(t, consumed, checkpoint,
-		"checkpoint: consumed records must be >= produced (at-least-once): got %d, want >= %d", consumed, checkpoint)
-	if consumed > checkpoint {
-		logf("checkpoint: %d duplicates detected (at-least-once during failover)", consumed-checkpoint)
-	}
+	require.Equal(t, checkpoint, consumed,
+		"checkpoint: consumed records must equal produced (exactly-once with sync replication): got %d, want %d", consumed, checkpoint)
 	logf("checkpoint passed: %d records verified after first failover", consumed)
 
 	// Round 2: failover back to original primary.
@@ -632,11 +629,8 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 
 	logf("final consume: expecting %d records...", total)
 	consumed = c.consumeAll(total)
-	require.GreaterOrEqual(t, consumed, total,
-		"consumed records must be >= produced (at-least-once): got %d, want >= %d", consumed, total)
-	if consumed > total {
-		logf("final: %d duplicates detected (at-least-once during failover)", consumed-total)
-	}
+	require.Equal(t, total, consumed,
+		"consumed records must equal produced (exactly-once with sync replication): got %d, want %d", consumed, total)
 	logf("all %d records verified across %d failovers", consumed, c.round)
 }
 
