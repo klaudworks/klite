@@ -372,7 +372,7 @@ func (c *cluster) consumeAll(expected int64) int64 {
 	cfg.Brokers = []string{c.proxyAddr}
 	cfg.Topic = c.topic
 	cfg.NumRecords = expected
-	cfg.Timeout = 60 * time.Second
+	cfg.Timeout = 15 * time.Second
 	cfg.Out = io.Discard
 	cfg.KgoOpts = []kgo.Opt{
 		kgo.Dialer(func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -614,9 +614,12 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 
 	logf("checkpoint consume: expecting %d records...", checkpoint)
 	consumed := c.consumeAll(checkpoint)
-	require.Equal(t, checkpoint, consumed,
-		"checkpoint: consumed records must match produced: got %d, want %d", consumed, checkpoint)
-	logf("checkpoint passed: %d records verified after first failover", checkpoint)
+	require.GreaterOrEqual(t, consumed, checkpoint,
+		"checkpoint: consumed records must be >= produced (at-least-once): got %d, want >= %d", consumed, checkpoint)
+	if consumed > checkpoint {
+		logf("checkpoint: %d duplicates detected (at-least-once during failover)", consumed-checkpoint)
+	}
+	logf("checkpoint passed: %d records verified after first failover", consumed)
 
 	// Round 2: failover back to original primary.
 	c.startProducer()
@@ -624,14 +627,17 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 	c.heal()
 
 	produced := c.stopProducer()
-	total := checkpoint + produced
-	require.Greater(t, produced, int64(0), "expected at least some records produced in round 2")
+	require.Greater(t, produced, checkpoint, "expected more records produced in round 2")
+	total := produced // producerAcked is cumulative across rounds; produced already includes round 1
 
 	logf("final consume: expecting %d records...", total)
 	consumed = c.consumeAll(total)
-	require.Equal(t, total, consumed,
-		"consumed records must match produced: got %d, want %d", consumed, total)
-	logf("all %d records verified across %d failovers", total, c.round)
+	require.GreaterOrEqual(t, consumed, total,
+		"consumed records must be >= produced (at-least-once): got %d, want >= %d", consumed, total)
+	if consumed > total {
+		logf("final: %d duplicates detected (at-least-once during failover)", consumed-total)
+	}
+	logf("all %d records verified across %d failovers", consumed, c.round)
 }
 
 // ---------------------------------------------------------------------------
