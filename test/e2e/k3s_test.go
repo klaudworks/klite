@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -617,16 +618,21 @@ func (c *cluster) heal() {
 
 	// Convergence: the healed pod reconnects as standby.
 	tr.check(c.t, "standby reconnected", 60*time.Second, 2*time.Second, func() bool {
-		logReq := c.k8s.CoreV1().Pods(testNamespace).GetLogs(c.state.primary, &corev1.PodLogOptions{
-			TailLines: ptr(int64(50)),
-		})
-		logStream, err := logReq.Stream(c.ctx)
+		result := c.k8s.CoreV1().RESTClient().Get().
+			Namespace(testNamespace).
+			Resource("pods").
+			SubResource("proxy").
+			Name(c.state.primary + ":8080").
+			Suffix("/replz").
+			Do(c.ctx)
+		raw, err := result.Raw()
 		if err != nil {
 			return false
 		}
-		logBytes, _ := io.ReadAll(logStream)
-		logStream.Close()
-		return strings.Contains(string(logBytes), "standby connected")
+		var status struct {
+			StandbyConnected *bool `json:"standby_connected"`
+		}
+		return json.Unmarshal(raw, &status) == nil && status.StandbyConnected != nil && *status.StandbyConnected
 	})
 
 	// Wait for the S3 flusher to persist any WAL data that was written while
@@ -905,18 +911,25 @@ func waitForPrimaryLabel(t *testing.T, client *kubernetes.Clientset, timeout tim
 	}
 }
 
+// waitForStandbyConnected polls the primary's /replz health endpoint until
+// it reports standby_connected=true, or times out.
 func waitForStandbyConnected(t *testing.T, client *kubernetes.Clientset, primaryPod string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
 	for {
-		logReq := client.CoreV1().Pods(testNamespace).GetLogs(primaryPod, &corev1.PodLogOptions{
-			TailLines: ptr(int64(50)),
-		})
-		logStream, err := logReq.Stream(t.Context())
-		if err == nil {
-			logBytes, _ := io.ReadAll(logStream)
-			logStream.Close()
-			if strings.Contains(string(logBytes), "standby connected") {
+		result := client.CoreV1().RESTClient().Get().
+			Namespace(testNamespace).
+			Resource("pods").
+			SubResource("proxy").
+			Name(primaryPod + ":8080").
+			Suffix("/replz").
+			Do(t.Context())
+
+		if raw, err := result.Raw(); err == nil {
+			var status struct {
+				StandbyConnected *bool `json:"standby_connected"`
+			}
+			if json.Unmarshal(raw, &status) == nil && status.StandbyConnected != nil && *status.StandbyConnected {
 				logf("standby connected to primary %s", primaryPod)
 				return
 			}
