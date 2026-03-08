@@ -152,8 +152,9 @@ type cluster struct {
 	producerAcked  atomic.Int64
 	producerErrors atomic.Int64
 
-	// Port-forward to socat proxy — stable across failovers.
+	// Port-forward to socat proxy.
 	proxyAddr string
+	pfCancel  context.CancelFunc
 }
 
 // setupCluster creates a k3s cluster, deploys LocalStack + socat proxy + klite,
