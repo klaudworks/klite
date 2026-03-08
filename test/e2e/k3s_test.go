@@ -383,6 +383,22 @@ func (c *cluster) runProducer(ctx context.Context) {
 	}
 }
 
+// waitForProducerAcked blocks until the producer has acked at least n records,
+// ensuring there is meaningful in-flight traffic before triggering a disruption.
+func (c *cluster) waitForProducerAcked(n int64, timeout time.Duration) {
+	c.t.Helper()
+	deadline := time.After(timeout)
+	for c.producerAcked.Load() < n {
+		select {
+		case <-deadline:
+			c.t.Fatalf("producer did not ack %d records within %v (got %d)",
+				n, timeout, c.producerAcked.Load())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	logf("producer reached %d acked records", c.producerAcked.Load())
+}
+
 // stopProducer cancels the background producer and returns the number of
 // acked records.
 func (c *cluster) stopProducer() int64 {
@@ -697,6 +713,7 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 
 	// Round 1: single failover + checkpoint.
 	c.startProducer()
+	c.waitForProducerAcked(10_000, 30*time.Second)
 	c.disrupt()
 	c.heal()
 	checkpoint := c.stopProducer()
@@ -710,6 +727,7 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 
 	// Round 2: failover back to original primary.
 	c.startProducer()
+	c.waitForProducerAcked(checkpoint+10_000, 30*time.Second)
 	c.disrupt()
 	c.heal()
 
