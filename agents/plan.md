@@ -10,6 +10,11 @@ abstractions, eliminating entire categories of bugs. A bold refactor that
 makes the code genuinely better is always preferred over a timid patch that
 leaves the mess in place.
 
+klite is in active development with no external consumers yet. Backwards
+compatibility is not a constraint — renaming exported symbols, changing
+package structure, altering internal APIs are all fair game if they make
+the code better.
+
 ## Workflow
 
 1. `bd show <issue-id>` — read the issue description
@@ -44,11 +49,18 @@ leaves the mess in place.
    Think like an architect, not a patch author. The best solution might be
    restructuring a package, introducing an interface, or consolidating
    duplicated logic — not just fixing the thing the issue literally says.
-7. Write the plan as a comment:
+7. **Fast-track check.** If the issue is small and clear-cut — the fix is
+   obvious, mechanical, and touches only a few files (e.g., a lint fix, a
+   straightforward rename, a missing error wrap) — skip the plan and
+   implement it directly in this iteration. Follow the workflow in
+   `agents/tackle.md` from step 3 onward. No need to write a plan comment
+   or promote labels — just implement, verify, commit, and create the
+   review issue.
+8. Otherwise, write the plan as a comment:
    ```
    bd comments add <issue-id> "Plan: <plan>"
    ```
-8. Promote to ready-for-implementation:
+9. Promote to ready-for-implementation:
    ```
    bd label remove <issue-id> needs-plan
    bd label add <issue-id> has-plan

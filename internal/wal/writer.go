@@ -122,6 +122,10 @@ type Writer struct {
 	// noStandbyWarned tracks whether we've logged the no-standby warning
 	noStandbyWarned atomic.Bool
 
+	// localOnlyBatches counts WAL batches written without replication because
+	// the standby was not connected. Reset on standby reconnect.
+	localOnlyBatches atomic.Int64
+
 	// replicator stores the current Replicator behind an atomic.Value
 	// so SetReplicator (called from the broker goroutine) and run()
 	// (the writer goroutine) don't race. Stores nil or a Replicator.
@@ -478,6 +482,8 @@ func (w *Writer) run() {
 			batch := w.collectBatchBytes(pending[:written])
 			firstSeq, lastSeq := w.batchSeqRange(pending[:written])
 			replCh = repl.Replicate(batch, firstSeq, lastSeq)
+		} else if written > 0 && repl != nil && !repl.Connected() {
+			w.localOnlyBatches.Add(int64(written))
 		}
 
 		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
@@ -502,6 +508,8 @@ func (w *Writer) run() {
 			}
 
 			if replErr != nil {
+				w.logger.Warn("WAL replication failed, returning error to producers",
+					"err", replErr, "batches", written)
 				for _, req := range pending[:written] {
 					req.errCh <- replErr
 				}
@@ -642,6 +650,18 @@ func (w *Writer) logNoStandbyOnce() {
 		w.logger.Warn("replicator configured but no standby connected, proceeding with local fsync only")
 		w.noStandbyWarned.Store(true)
 	}
+}
+
+// LocalOnlyBatches returns the number of WAL batches acked without replication
+// since the last reset.
+func (w *Writer) LocalOnlyBatches() int64 {
+	return w.localOnlyBatches.Load()
+}
+
+// ResetLocalOnlyBatches resets the local-only batch counter (e.g. on standby reconnect).
+func (w *Writer) ResetLocalOnlyBatches() {
+	w.localOnlyBatches.Store(0)
+	w.noStandbyWarned.Store(false)
 }
 
 // rotateSegment closes the current segment and switches to the next one.

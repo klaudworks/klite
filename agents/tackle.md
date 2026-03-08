@@ -43,7 +43,11 @@ fulfills the plan's intent.
    - Fix it (up to 3 attempts)
    - If unfixable: revert and defer (see "Getting Stuck" in `ralph/03-improve.md`)
 
-## Commit Messages
+## Commits
+
+One atomic commit per issue. The review agent expects a single hash to
+evaluate, and revert must be clean. If a change has logical stages, implement
+them all and commit once.
 
 Format: `improve(<scope>): <description>`
 

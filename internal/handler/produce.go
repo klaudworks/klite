@@ -203,7 +203,10 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, clk clock.Clock)
 			if walErr := produceCommitWAL(pc.pending); walErr != nil {
 				slog.Error("WAL write failed for produce",
 					"topic", pc.topic, "partition", pc.partition,
-					"baseOffset", pc.pending.baseOffset, "err", walErr)
+					"baseOffset", pc.pending.baseOffset,
+					"pid", pc.meta.ProducerID, "epoch", pc.meta.ProducerEpoch,
+					"baseSeq", pc.meta.BaseSequence, "numRecords", pc.meta.NumRecords,
+					"err", walErr)
 				sp.ErrorCode = kerr.KafkaStorageError.Code
 				sp.BaseOffset = -1
 				continue

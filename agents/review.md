@@ -8,32 +8,42 @@ You are reviewing a change made by a previous iteration.
    **commit hash**. The `discovered-from` dependency points to the
    **original issue**.
 2. `git show <commit-hash>` — read the full diff
-3. `bd show <original-issue-id>` — understand what was being improved
-4. `bd comments <original-issue-id>` — read the plan that was executed
-5. Evaluate:
+3. If the diff isn't enough to understand the change (large refactors,
+   structural moves), read the affected files in their final state. Start
+   from the diff, then read whatever you need to fully understand the result.
+4. `bd show <original-issue-id>` — understand what was being improved
+5. `bd comments <original-issue-id>` — read the plan that was executed
+6. Evaluate (klite is in active development with no external consumers —
+   backwards compatibility is not a constraint, so renamed exports, changed
+   package structure, and altered internal APIs are fine if they improve things):
    - **Correctness**: Does the change achieve what the plan intended?
    - **No regressions**: Could it break existing behavior?
    - **Code quality**: Clean, idiomatic Go? Is the result elegant and robust?
    - **Behavioral preservation**: For refactors, does the code still do
      exactly the same thing? Trace through the logic.
    - **Net improvement**: Is the codebase clearly better after this change?
-   Large diffs are fine — judge the change by whether it improves klite,
-   not by how many files it touches.
-6. `go build ./...` and `go vet ./...`
-7. `go test ./... -count=1`
-8. **If good**: `bd close <review-issue-id> --reason "Approved"`
-9. **If bad**:
-   - `git revert --no-edit <commit-hash>`
-   - `bd reopen <original-issue-id>`
-   - `bd comments add <original-issue-id> "Reverted: <what was wrong>"`
-   - `bd close <review-issue-id> --reason "Reverted: <summary>"`
+     Large diffs are fine — judge the change by whether it improves klite,
+     not by how many files it touches.
+7. `go build ./...` and `go vet ./...`
+8. `go test ./... -count=1`
+9. **If good**: `bd close <review-issue-id> --reason "Approved"`
+10. **If minor issues** (typo, missed error wrap, off-by-one — things that
+    don't change the approach):
+    - Fix them directly
+    - Commit: `improve(<scope>): fixup <description>`
+    - `bd close <review-issue-id> --reason "Approved with fixup <new-hash>"`
+11. **If fundamentally wrong** (wrong approach, regression, broken logic):
+
+- `git revert --no-edit <commit-hash>`
+- `bd reopen <original-issue-id>`
+- `bd comments add <original-issue-id> "Reverted: <what was wrong>"`
+- `bd close <review-issue-id> --reason "Reverted: <summary>"`
 
 ## What to Look For
 
 - **Semantic changes**: Refactors that subtly change behavior (different error
   types, reordered operations, changed nil handling)
 - **Concurrency**: Mutex scope changes, channel behavior changes
-- **Public API**: Renamed exported symbols break callers
 - **Test validity**: New tests that don't actually test what they claim
 - **Unrelated changes**: Changes to code that have nothing to do with the
   issue's intent (but touching many files for a consistent refactor is fine)

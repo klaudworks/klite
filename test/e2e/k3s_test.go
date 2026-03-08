@@ -22,6 +22,7 @@ import (
 	tclog "github.com/testcontainers/testcontainers-go/log"
 	"github.com/testcontainers/testcontainers-go/modules/k3s"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -368,6 +369,10 @@ func (c *cluster) stopProducer() int64 {
 // the count. Uses bench.RunConsumer with the socat proxy.
 func (c *cluster) consumeAll(expected int64) int64 {
 	c.t.Helper()
+
+	// Query the broker's high watermark before consuming for diagnostics.
+	c.logPartitionHW()
+
 	cfg := bench.DefaultConsumerConfig()
 	cfg.Brokers = []string{c.proxyAddr}
 	cfg.Topic = c.topic
@@ -381,9 +386,51 @@ func (c *cluster) consumeAll(expected int64) int64 {
 	}
 	result, err := bench.RunConsumer(c.ctx, cfg)
 	if err != nil {
-		logf("consume warning: %v", err)
+		logf("consume warning: consumed %d/%d records: %v", result.Records, expected, err)
 	}
 	return result.Records
+}
+
+// logPartitionHW queries the broker for the current high watermark via ListOffsets.
+func (c *cluster) logPartitionHW() {
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(c.proxyAddr),
+		kgo.Dialer(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", c.proxyAddr)
+		}),
+	)
+	if err != nil {
+		logf("logPartitionHW: client error: %v", err)
+		return
+	}
+	defer client.Close()
+
+	// Use ListEndOffsets (latest) to get the HW.
+	reqCtx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+	defer cancel()
+
+	req := kmsg.NewListOffsetsRequest()
+	req.ReplicaID = -1
+	req.IsolationLevel = 0 // READ_UNCOMMITTED to see true HW
+	rt := kmsg.NewListOffsetsRequestTopic()
+	rt.Topic = c.topic
+	rp := kmsg.NewListOffsetsRequestTopicPartition()
+	rp.Partition = 0
+	rp.Timestamp = -1 // latest
+	rt.Partitions = append(rt.Partitions, rp)
+	req.Topics = append(req.Topics, rt)
+
+	resp, err := req.RequestWith(reqCtx, client)
+	if err != nil {
+		logf("logPartitionHW: ListOffsets error: %v", err)
+		return
+	}
+	for _, t := range resp.Topics {
+		for _, p := range t.Partitions {
+			logf("logPartitionHW: topic=%s partition=%d offset=%d errorCode=%d",
+				t.Topic, p.Partition, p.Offset, p.ErrorCode)
+		}
+	}
 }
 
 // disrupt transitions:
@@ -412,7 +459,8 @@ func (c *cluster) disrupt() {
 			secondary: oldPrimary,
 		},
 	}
-	logf("%s: starting", tr)
+	logf("%s: starting (producer: acked=%d errors=%d)", tr,
+		c.producerAcked.Load(), c.producerErrors.Load())
 
 	// Action: isolate + kill the primary.
 	applyIsolationPolicy(c.t, c.k8s, netpolName, oldPrimary)
@@ -440,7 +488,9 @@ func (c *cluster) disrupt() {
 		}
 		return false
 	})
-	logf("%s: failover took %s, new primary: %s", tr, time.Since(start).Round(time.Millisecond), newPrimary)
+	logf("%s: failover took %s, new primary: %s (producer: acked=%d errors=%d)", tr,
+		time.Since(start).Round(time.Millisecond), newPrimary,
+		c.producerAcked.Load(), c.producerErrors.Load())
 
 	// Convergence: verify labels are correct on all pods.
 	tr.check(c.t, "labels correct", 10*time.Second, 1*time.Second, func() bool {
@@ -570,12 +620,16 @@ func (c *cluster) heal() {
 	logf("%s: waiting %s for S3 flush", tr, s3FlushInterval)
 	time.Sleep(s3FlushInterval)
 
+	// Log broker HW after heal to verify replication caught up.
+	c.logPartitionHW()
+
 	c.state = clusterState{
 		name:      stateHealthy,
 		primary:   c.state.primary,
 		secondary: isolated,
 	}
-	logf("%s: completed → %s", tr, c.state)
+	logf("%s: completed → %s (producer: acked=%d errors=%d)", tr, c.state,
+		c.producerAcked.Load(), c.producerErrors.Load())
 }
 
 // ---------------------------------------------------------------------------

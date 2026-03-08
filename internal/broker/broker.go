@@ -522,6 +522,26 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// that predate the receiver (e.g. local WAL from a previous primary tenure).
 	b.rebuildHWFromWAL()
 
+	// Log partition state at promotion time for diagnostics.
+	if b.walIndex != nil {
+		for _, tp := range b.walIndex.AllPartitions() {
+			td := b.state.GetTopicByID(tp.TopicID)
+			if td == nil || int(tp.Partition) >= len(td.Partitions) {
+				continue
+			}
+			pd := td.Partitions[tp.Partition]
+			pd.RLock()
+			hw := pd.HW()
+			s3wm := pd.S3FlushWatermark()
+			pd.RUnlock()
+			walMax := b.walIndex.MaxOffset(tp)
+			b.logger.Info("promotion: partition state",
+				"topic", td.Name, "partition", tp.Partition,
+				"hw", hw, "s3_watermark", s3wm, "wal_max_offset", walMax,
+				"wal_entries", len(b.walIndex.PartitionEntries(tp)))
+		}
+	}
+
 	// Rebuild chunks from WAL entries received during the standby phase.
 	// The replication receiver writes WAL entries to disk but does NOT
 	// populate in-memory chunks. Without this step, the S3 flusher would
@@ -529,6 +549,24 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// the S3 watermark past replicated-but-unchunked data. When WAL segments
 	// are then cleaned, that data is permanently lost.
 	b.rebuildChunksFromWAL()
+
+	// Log partition state after rebuild for diagnostics.
+	if b.walIndex != nil {
+		for _, tp := range b.walIndex.AllPartitions() {
+			td := b.state.GetTopicByID(tp.TopicID)
+			if td == nil || int(tp.Partition) >= len(td.Partitions) {
+				continue
+			}
+			pd := td.Partitions[tp.Partition]
+			pd.RLock()
+			hw := pd.HW()
+			s3wm := pd.S3FlushWatermark()
+			pd.RUnlock()
+			b.logger.Info("promotion: partition state after rebuild",
+				"topic", td.Name, "partition", tp.Partition,
+				"hw", hw, "s3_watermark", s3wm)
+		}
+	}
 
 	// Probe S3 for partition HW. The replication snapshot may skip WAL entries
 	// that were already flushed to S3 by the old primary, leaving the standby
@@ -721,9 +759,12 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	localOnly := b.walWriter.LocalOnlyBatches()
 	b.logger.Info("standby connected",
 		"last_wal_seq", lastWALSeq,
-		"epoch", epoch)
+		"epoch", epoch,
+		"local_only_batches_since_last_standby", localOnly)
+	b.walWriter.ResetLocalOnlyBatches()
 
 	ackTimeout := b.cfg.ReplicationAckTimeout
 	if ackTimeout == 0 {
