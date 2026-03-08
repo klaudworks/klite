@@ -364,6 +364,62 @@ func TestReplicationDemotionStopsWrites(t *testing.T) {
 	// If dial fails, that's the expected behavior — connection refused
 }
 
+func TestDemotionCompletesWithConnectedClient(t *testing.T) {
+	t.Parallel()
+
+	pair := StartReplicaPair(t)
+
+	pair.ElectorA.Elect()
+	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond)
+
+	topic := "test-demotion-connected-client"
+	cl := NewClient(t, pair.Primary.Addr,
+		kgo.AllowAutoTopicCreation(),
+		kgo.RequestRetries(3),
+		kgo.RetryTimeout(5*time.Second),
+	)
+	ProduceN(t, cl, topic, 50)
+	cl.Close()
+
+	// Start a consumer that stays connected during demotion.
+	// franz-go's internal Fetch loop will be blocked in a long-poll,
+	// which previously caused shutdownPrimary to stall for ~57s.
+	consumer := NewClient(t, pair.Primary.Addr,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	_ = ConsumeN(t, consumer, 50, 10*time.Second)
+	// consumer is intentionally NOT closed — it stays connected
+
+	// Demotion must complete promptly despite the connected consumer.
+	demoteDone := make(chan struct{})
+	go func() {
+		pair.ElectorA.Demote()
+		close(demoteDone)
+	}()
+
+	select {
+	case <-demoteDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("demotion did not complete within 5s — likely stalled on connected client")
+	}
+
+	waitStandby(t, pair.HealthAddrA, 5*time.Second)
+
+	// Promote B and verify the cluster still works.
+	pair.ElectorB.Elect()
+	waitPrimary(t, pair.HealthAddrB, 5*time.Second)
+
+	cl2 := NewClient(t, pair.Standby.Addr,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	recs := ConsumeN(t, cl2, 50, 10*time.Second)
+	require.Len(t, recs, 50)
+}
+
 func TestReplicationDataContinuity(t *testing.T) {
 	t.Parallel()
 
@@ -925,6 +981,7 @@ func TestStandbyWALPrunePreservesS3Gap(t *testing.T) {
 	)
 	recs1 := ConsumeN(t, consumer1, recordsPerRound, 30*time.Second)
 	require.Len(t, recs1, recordsPerRound, "round 1 checkpoint failed")
+	consumer1.Close()
 
 	// ---- Round 2: B=primary, A=standby ----
 	waitStandby(t, pair.HealthAddrA, 5*time.Second)

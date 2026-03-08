@@ -644,28 +644,57 @@ func (b *Broker) onDemoted() {
 
 // shutdownPrimary cleanly shuts down primary-specific resources.
 func (b *Broker) shutdownPrimary() {
+	// Log final partition state for diagnostics.
+	for _, td := range b.state.GetAllTopics() {
+		for _, pd := range td.Partitions {
+			pd.RLock()
+			hw := pd.HW()
+			s3wm := pd.S3FlushWatermark()
+			pd.RUnlock()
+			b.logger.Info("shutdownPrimary: final partition state",
+				"topic", td.Name, "partition", pd.Index,
+				"hw", hw, "s3_watermark", s3wm)
+		}
+	}
+	if b.walWriter != nil {
+		b.logger.Info("shutdownPrimary: local-only batches since last standby",
+			"count", b.walWriter.LocalOnlyBatches())
+	}
+
 	// 1. Close Kafka listener (MUST be first — no new connections)
 	if b.listener != nil {
 		_ = b.listener.Close()
 		b.listener = nil
 	}
 
-	// 2. Drain in-flight requests
+	// 2. Close existing client connections. klite is a single-primary-per-cluster
+	// broker, so on demotion zero partitions remain on this node — there's
+	// nothing useful a client can do on this connection. This also stops
+	// readLoops from dispatching new Fetch handlers.
+	b.server.CloseConns()
+
+	// 3. Wake all Fetch long-poll waiters so in-flight Fetch handlers return
+	// immediately. This MUST happen after CloseConns — otherwise the Fetch
+	// handler returns, the client sends a new Fetch, and the readLoop
+	// dispatches a new handler with a fresh waiter that missed the wake.
+	b.state.WakeAllFetchWaiters()
+
+	// 4. Drain in-flight requests
 	b.server.Wait()
 	b.state.StopAllGroups()
 
-	// 3. Clear WAL Replicator
+	// 5. Clear WAL Replicator
 	if b.walWriter != nil {
 		b.walWriter.SetReplicator(nil)
 	}
 
-	// 4. Clear metadata.log hooks
+	// 6. Clear metadata.log hooks
 	if b.metaLog != nil {
 		b.metaLog.SetReplicateHook(nil)
 		b.metaLog.SetCompactHook(nil)
 	}
 
-	// 5. Close replication listener and sender
+	// 7. Close replication listener and sender
 	if b.replListener != nil {
 		_ = b.replListener.Close()
 		b.replListener = nil
@@ -675,7 +704,7 @@ func (b *Broker) shutdownPrimary() {
 		b.replSender = nil
 	}
 
-	// 6. Stop S3 flusher (final flush)
+	// 8. Stop S3 flusher (final flush)
 	if b.s3Flusher != nil {
 		b.s3Flusher.Stop()
 	}
@@ -736,7 +765,16 @@ func (b *Broker) acceptReplicationConns(ctx context.Context, ln net.Listener) {
 	}
 }
 
-// handleStandbyConn handles a single standby connection (reads HELLO, sends SNAPSHOT if needed).
+// handleStandbyConn handles a single standby connection (reads HELLO, sends
+// SNAPSHOT if needed, and wires the new Sender into the WAL writer).
+//
+// IMPORTANT: reconnection only sets up forward-streaming of new WAL entries.
+// The primary does NOT backfill WAL entries that were written while the standby
+// was disconnected (the "local-only" window tracked by localOnlyBatches).
+// Those entries reach the standby only via S3: the primary's S3 flusher must
+// persist them before the next failover, or they will be lost. Callers that
+// need the standby to be fully caught up must wait at least one S3 flush
+// interval after reconnection.
 func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 	// Read HELLO
 	msgType, payload, err := repl.ReadFrame(conn)
