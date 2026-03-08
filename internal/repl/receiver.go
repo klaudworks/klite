@@ -241,10 +241,6 @@ func (r *Receiver) handleWALBatch(payload []byte, conn net.Conn) error {
 		return fmt.Errorf("send ACK: %w", err)
 	}
 
-	r.logger.Debug("repl receiver: WAL batch processed",
-		"first_seq", firstSeq, "last_seq", lastSeq,
-		"entries", entryCount, "written", written)
-
 	return nil
 }
 

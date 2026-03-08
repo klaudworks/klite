@@ -273,13 +273,6 @@ func setupCluster(t *testing.T) *cluster {
 	logf("waiting for standby to connect to primary...")
 	waitForStandbyConnected(t, k8sClient, primary, 60*time.Second)
 
-	// --- Port-forward to socat proxy (stable across failovers) ---
-	pfCtx, pfCancel := context.WithCancel(ctx)
-	localPort := portForward(t, pfCtx, kubeconfigPath, "pod/kafka-proxy", 9092)
-	proxyAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
-	waitForPortReady(t, ctx, proxyAddr, 10*time.Second)
-	logf("proxy port-forward: %s -> pod/kafka-proxy:9092", proxyAddr)
-
 	c := &cluster{
 		t:              t,
 		ctx:            ctx,
@@ -291,9 +284,9 @@ func setupCluster(t *testing.T) *cluster {
 			primary:   primary,
 			secondary: standby,
 		},
-		proxyAddr: proxyAddr,
 	}
-	t.Cleanup(func() { pfCancel() })
+	c.newPortForward()
+	t.Cleanup(func() { c.pfCancel() })
 
 	logf("initial state: %s", c.state)
 	return c
@@ -398,6 +391,27 @@ func (c *cluster) waitForProducerAcked(n int64, timeout time.Duration) {
 		}
 	}
 	logf("producer reached %d acked records", c.producerAcked.Load())
+}
+
+// newPortForward starts a kubectl port-forward to the socat proxy pod and
+// updates c.proxyAddr. Must only be called when no producer is running.
+func (c *cluster) newPortForward() {
+	c.t.Helper()
+	pfCtx, pfCancel := context.WithCancel(c.ctx)
+	localPort := portForward(c.t, pfCtx, c.kubeconfigPath, "pod/kafka-proxy", 9092)
+	c.proxyAddr = fmt.Sprintf("127.0.0.1:%d", localPort)
+	c.pfCancel = pfCancel
+	waitForPortReady(c.t, c.ctx, c.proxyAddr, 10*time.Second)
+	logf("proxy port-forward: %s -> pod/kafka-proxy:9092", c.proxyAddr)
+}
+
+// refreshPortForward tears down the current port-forward and creates a fresh
+// one. This avoids stale kubectl port-forward connections that accumulate
+// errors after pod disruptions. Must only be called when no producer is running.
+func (c *cluster) refreshPortForward() {
+	c.t.Helper()
+	c.pfCancel()
+	c.newPortForward()
 }
 
 // stopProducer cancels the background producer and returns the number of
@@ -721,6 +735,7 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 	require.Greater(t, checkpoint, int64(0), "expected at least some records produced")
 
 	logf("checkpoint consume: expecting %d records...", checkpoint)
+	c.refreshPortForward()
 	consumed := c.consumeAll(checkpoint)
 	require.Equal(t, checkpoint, consumed,
 		"checkpoint: consumed records must equal produced (exactly-once with sync replication): got %d, want %d", consumed, checkpoint)
@@ -737,6 +752,7 @@ func TestK3sHelmReplicationFailover(t *testing.T) {
 	total := produced // producerAcked is cumulative across rounds; produced already includes round 1
 
 	logf("final consume: expecting %d records...", total)
+	c.refreshPortForward()
 	consumed = c.consumeAll(total)
 	require.Equal(t, total, consumed,
 		"consumed records must equal produced (exactly-once with sync replication): got %d, want %d", consumed, total)
