@@ -77,12 +77,12 @@ func newTestFlusher(t *testing.T, provider PartitionProvider) (*Flusher, *InMemo
 	pool.SetClock(clk)
 
 	flusher := NewFlusher(FlusherConfig{
-		Client:           client,
-		FlushInterval:    60 * time.Second,
-		CheckInterval:    1 * time.Second,
-		TargetObjectSize: 1024 * 1024, // 1 MiB
+		Client:            client,
+		FlushInterval:     60 * time.Second,
+		CheckInterval:     1 * time.Second,
+		TargetObjectSize:  1024 * 1024, // 1 MiB
 		UploadConcurrency: 4,
-		Clock:            clk,
+		Clock:             clk,
 	}, provider)
 
 	return flusher, mem, clk, pool
@@ -304,7 +304,7 @@ func TestScanAndFlush_NoCandidates(t *testing.T) {
 		partitions: []FlushPartition{{
 			Topic:           "test-topic",
 			Partition:       0,
-			SealedBytes:     100,                                        // below threshold
+			SealedBytes:     100,                                         // below threshold
 			OldestChunkTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), // recent
 		}},
 	}
@@ -437,12 +437,12 @@ func TestUploadWithRetry_RetriesOnFailure(t *testing.T) {
 	failCount := 3
 
 	countingS3 := &countingFailS3{
-		InMemoryS3:    NewInMemoryS3(),
-		attempts:      &attempts,
-		failUntil:     int32(failCount),
-		err:           errors.New("transient error"),
+		InMemoryS3: NewInMemoryS3(),
+		attempts:   &attempts,
+		failUntil:  int32(failCount),
+		err:        errors.New("transient error"),
 	}
-	countingS3.InMemoryS3.SetClock(clk)
+	countingS3.SetClock(clk)
 
 	client := NewClient(ClientConfig{
 		S3Client: countingS3,
@@ -673,7 +673,7 @@ func TestUpdateGlobalFlushWatermark(t *testing.T) {
 	walIdx := wal.NewIndex()
 	walWriter, err := wal.NewWriter(wal.WriterConfig{Dir: dir}, walIdx)
 	require.NoError(t, err)
-	walWriter.Start()
+	require.NoError(t, walWriter.Start())
 	defer walWriter.Stop()
 
 	topicID1 := [16]byte{0x01}
@@ -694,8 +694,8 @@ func TestUpdateGlobalFlushWatermark(t *testing.T) {
 
 	watermarkProvider := &stubWatermarkProvider{
 		watermarks: []PartitionWatermarkInfo{
-			{TopicID: topicID1, Partition: 0, S3Watermark: 3},  // partially flushed, entry still unflushed (LastOffset=4 >= 3)
-			{TopicID: topicID2, Partition: 0, S3Watermark: 0},  // nothing flushed
+			{TopicID: topicID1, Partition: 0, S3Watermark: 3}, // partially flushed, entry still unflushed (LastOffset=4 >= 3)
+			{TopicID: topicID2, Partition: 0, S3Watermark: 0}, // nothing flushed
 		},
 	}
 
@@ -725,7 +725,7 @@ func TestUpdateGlobalFlushWatermark_AllFlushed(t *testing.T) {
 	walIdx := wal.NewIndex()
 	walWriter, err := wal.NewWriter(wal.WriterConfig{Dir: dir}, walIdx)
 	require.NoError(t, err)
-	walWriter.Start()
+	require.NoError(t, walWriter.Start())
 	defer walWriter.Stop()
 
 	// Populate index, but watermarks are past all entries — everything flushed.

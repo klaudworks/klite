@@ -198,7 +198,7 @@ func TestCloseConnsUnblocksWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Wait for the server to register the connection.
 	deadline := time.After(2 * time.Second)

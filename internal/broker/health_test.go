@@ -241,7 +241,7 @@ func TestReplzPrimaryNoStandby(t *testing.T) {
 	if err != nil {
 		t.Fatal("GET /replz:", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		t.Fatalf("/replz: got status %d, want 200", resp.StatusCode)
@@ -290,7 +290,7 @@ func TestReplzStandby(t *testing.T) {
 	if err != nil {
 		t.Fatal("GET /replz:", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		t.Fatalf("/replz: got status %d, want 200", resp.StatusCode)
@@ -334,7 +334,7 @@ func TestReplzBeforeReady(t *testing.T) {
 	if err != nil {
 		t.Fatal("GET /replz:", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("/replz before ready: got status %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)

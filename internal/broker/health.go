@@ -98,7 +98,7 @@ func (b *Broker) handleReplz(w http.ResponseWriter, r *http.Request) {
 	case <-b.ready:
 	default:
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(replStatus{Role: "not_ready"})
+		_ = json.NewEncoder(w).Encode(replStatus{Role: "not_ready"})
 		return
 	}
 
@@ -114,5 +114,5 @@ func (b *Broker) handleReplz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
