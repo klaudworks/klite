@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"testing"
 )
 
@@ -158,6 +159,156 @@ func TestParseBatchHeader(t *testing.T) {
 		}
 		if meta.NumRecords != 5 {
 			t.Errorf("NumRecords: got %d, want 5", meta.NumRecords)
+		}
+	})
+}
+
+// makeBatchWithValidCRC builds a 61-byte batch and sets the CRC field to
+// the correct CRC32C over bytes 21+. Returns the batch bytes and parsed meta.
+func makeBatchWithValidCRC(attrs int16, baseTS, maxTS int64, numRecords int32) ([]byte, BatchMeta) {
+	raw := makeBatchBytes(0, 49, 0, 2, 0, attrs, numRecords-1, baseTS, maxTS, -1, -1, -1, numRecords)
+	correctCRC := crc32.Checksum(raw[21:], crc32cTable)
+	binary.BigEndian.PutUint32(raw[17:21], correctCRC)
+	meta, _ := ParseBatchHeader(raw)
+	return raw, meta
+}
+
+func TestSetLogAppendTime(t *testing.T) {
+	t.Parallel()
+
+	t.Run("overwrites timestamps and sets attribute bit", func(t *testing.T) {
+		t.Parallel()
+		raw, meta := makeBatchWithValidCRC(0, 1000, 2000, 3)
+		nowMillis := int64(5000)
+
+		SetLogAppendTime(raw, nowMillis, &meta)
+
+		if meta.BaseTimestamp != nowMillis {
+			t.Errorf("meta.BaseTimestamp: got %d, want %d", meta.BaseTimestamp, nowMillis)
+		}
+		if meta.MaxTimestamp != nowMillis {
+			t.Errorf("meta.MaxTimestamp: got %d, want %d", meta.MaxTimestamp, nowMillis)
+		}
+		if meta.Attributes&0x0008 == 0 {
+			t.Errorf("LogAppendTime bit not set in meta.Attributes: %016b", meta.Attributes)
+		}
+
+		// Verify raw bytes match
+		gotBaseTS := int64(binary.BigEndian.Uint64(raw[27:35]))
+		if gotBaseTS != nowMillis {
+			t.Errorf("raw BaseTimestamp: got %d, want %d", gotBaseTS, nowMillis)
+		}
+		gotMaxTS := int64(binary.BigEndian.Uint64(raw[35:43]))
+		if gotMaxTS != nowMillis {
+			t.Errorf("raw MaxTimestamp: got %d, want %d", gotMaxTS, nowMillis)
+		}
+		gotAttrs := binary.BigEndian.Uint16(raw[21:23])
+		if gotAttrs&0x0008 == 0 {
+			t.Errorf("LogAppendTime bit not set in raw attrs: %016b", gotAttrs)
+		}
+	})
+
+	t.Run("CRC is valid after rewrite", func(t *testing.T) {
+		t.Parallel()
+		raw, meta := makeBatchWithValidCRC(0, 1000, 2000, 1)
+
+		SetLogAppendTime(raw, 9999, &meta)
+
+		if !ValidateBatchCRC(raw, meta.CRC) {
+			t.Error("CRC invalid after SetLogAppendTime")
+		}
+		// Also verify against independent computation
+		want := crc32.Checksum(raw[21:], crc32cTable)
+		if meta.CRC != want {
+			t.Errorf("meta.CRC: got %x, want %x", meta.CRC, want)
+		}
+	})
+
+	t.Run("preserves existing compression bits", func(t *testing.T) {
+		t.Parallel()
+		// attrs=4 means zstd compression (bits 0-2)
+		raw, meta := makeBatchWithValidCRC(4, 1000, 2000, 1)
+
+		SetLogAppendTime(raw, 3000, &meta)
+
+		// Compression bits (0-2) should be preserved
+		if meta.Attributes&0x0007 != 4 {
+			t.Errorf("compression bits lost: got %016b, want compression=4", meta.Attributes)
+		}
+		// LogAppendTime bit should also be set
+		if meta.Attributes&0x0008 == 0 {
+			t.Errorf("LogAppendTime bit not set: %016b", meta.Attributes)
+		}
+	})
+
+	t.Run("idempotent on LogAppendTime bit", func(t *testing.T) {
+		t.Parallel()
+		// Start with LogAppendTime already set (bit 3)
+		raw, meta := makeBatchWithValidCRC(0x0008, 1000, 2000, 1)
+
+		SetLogAppendTime(raw, 7000, &meta)
+
+		// Bit should still be set, not doubled
+		if meta.Attributes != 0x0008 {
+			t.Errorf("Attributes: got %016b, want 0000000000001000", meta.Attributes)
+		}
+		if !ValidateBatchCRC(raw, meta.CRC) {
+			t.Error("CRC invalid after second SetLogAppendTime")
+		}
+	})
+}
+
+func TestValidateBatchCRC(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid CRC", func(t *testing.T) {
+		t.Parallel()
+		raw, meta := makeBatchWithValidCRC(0, 1000, 2000, 1)
+		if !ValidateBatchCRC(raw, meta.CRC) {
+			t.Error("expected valid CRC")
+		}
+	})
+
+	t.Run("invalid CRC", func(t *testing.T) {
+		t.Parallel()
+		raw, meta := makeBatchWithValidCRC(0, 1000, 2000, 1)
+		if ValidateBatchCRC(raw, meta.CRC^0x1) {
+			t.Error("expected invalid CRC with flipped bit")
+		}
+	})
+
+	t.Run("corrupted payload", func(t *testing.T) {
+		t.Parallel()
+		raw, meta := makeBatchWithValidCRC(0, 1000, 2000, 1)
+		raw[30] ^= 0xFF // flip a byte in the CRC-covered region
+		if ValidateBatchCRC(raw, meta.CRC) {
+			t.Error("expected CRC mismatch after corruption")
+		}
+	})
+
+	t.Run("too short returns false", func(t *testing.T) {
+		t.Parallel()
+		short := make([]byte, 21)
+		if ValidateBatchCRC(short, 0) {
+			t.Error("expected false for 21-byte input")
+		}
+	})
+
+	t.Run("minimum valid length", func(t *testing.T) {
+		t.Parallel()
+		// 22 bytes: CRC covers just byte 21 (one byte)
+		raw := make([]byte, 22)
+		raw[21] = 0x42
+		crc := crc32.Checksum(raw[21:], crc32cTable)
+		if !ValidateBatchCRC(raw, crc) {
+			t.Error("expected valid CRC for 22-byte batch")
+		}
+	})
+
+	t.Run("nil slice returns false", func(t *testing.T) {
+		t.Parallel()
+		if ValidateBatchCRC(nil, 0) {
+			t.Error("expected false for nil input")
 		}
 	})
 }
