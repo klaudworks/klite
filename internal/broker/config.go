@@ -6,6 +6,9 @@ import (
 	"time"
 
 	"github.com/klaudworks/klite/internal/clock"
+	"github.com/klaudworks/klite/internal/lease"
+	s3store "github.com/klaudworks/klite/internal/s3"
+	"github.com/klaudworks/klite/internal/sasl"
 )
 
 // RoleHook is called when the broker's replication role changes.
@@ -41,7 +44,7 @@ type Config struct {
 	S3FlushCheckInterval time.Duration // How often the flusher scans partitions (default 5s)
 
 	// S3API allows injecting a mock S3 client for tests.
-	S3API interface{} // s3.S3API when set
+	S3API s3store.S3API
 
 	// SASL configuration (Phase 5)
 	SASLEnabled   bool   // Enable SASL authentication
@@ -60,7 +63,7 @@ type Config struct {
 	CompactionReadRate        int           // Max S3 read bytes/sec for compaction (default 50 MiB/s, 0 = unlimited)
 
 	// SASLStore allows injecting a pre-configured SASL credential store (for tests).
-	SASLStore interface{} // *sasl.Store when set
+	SASLStore *sasl.Store
 
 	// Replication configuration
 	ReplicationAddr           string        // Listen address for replication (e.g. ":9093"). Setting enables standby mode.
@@ -77,7 +80,7 @@ type Config struct {
 	RoleChangeHook RoleHook
 
 	// LeaseElector allows injecting a lease.Elector for tests.
-	LeaseElector interface{} // lease.Elector when set
+	LeaseElector lease.Elector
 
 	// Clock allows injecting a controllable clock for tests.
 	// If nil, defaults to clock.RealClock{}.

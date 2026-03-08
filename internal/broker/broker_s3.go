@@ -23,14 +23,8 @@ import (
 )
 
 func (b *Broker) initS3() error {
-	var s3api s3store.S3API
-	if b.cfg.S3API != nil {
-		var ok bool
-		s3api, ok = b.cfg.S3API.(s3store.S3API)
-		if !ok {
-			return fmt.Errorf("S3API config field must implement s3.S3API interface")
-		}
-	} else {
+	s3api := b.cfg.S3API
+	if s3api == nil {
 		var err error
 		s3api, err = createAWSS3Client(b.cfg)
 		if err != nil {
@@ -142,14 +136,8 @@ func (b *Broker) maybeRecoverFromS3() error {
 	}
 
 	// metadata.log is missing. Try to download from S3.
-	var s3api s3store.S3API
-	if b.cfg.S3API != nil {
-		var ok bool
-		s3api, ok = b.cfg.S3API.(s3store.S3API)
-		if !ok {
-			return fmt.Errorf("S3API must implement s3.S3API")
-		}
-	} else {
+	s3api := b.cfg.S3API
+	if s3api == nil {
 		var err error
 		s3api, err = createAWSS3Client(b.cfg)
 		if err != nil {

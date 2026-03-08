@@ -1226,7 +1226,7 @@ func TestReplicationS3LeaseFailover(t *testing.T) {
 
 	memS3 := s3store.NewInMemoryS3()
 
-	buildCfg := func(ln, healthLn net.Listener, replAddr string, elector interface{}) broker.Config {
+	buildCfg := func(ln, healthLn net.Listener, replAddr string, elector lease.Elector) broker.Config {
 		cfg := broker.DefaultConfig()
 		cfg.Listener = ln
 		cfg.HealthAddr = healthLn.Addr().String()

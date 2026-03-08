@@ -114,13 +114,8 @@ func New(cfg Config) *Broker {
 
 func (b *Broker) initSASLStore() {
 	if b.cfg.SASLStore != nil {
-		store, ok := b.cfg.SASLStore.(*sasl.Store)
-		if !ok {
-			b.logger.Error("SASLStore has unexpected type, using empty store", "type", fmt.Sprintf("%T", b.cfg.SASLStore))
-		} else {
-			b.saslStore = store
-			return
-		}
+		b.saslStore = b.cfg.SASLStore
+		return
 	}
 	b.saslStore = sasl.NewStore()
 

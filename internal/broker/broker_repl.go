@@ -48,11 +48,7 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 
 	// Create the lease elector
 	if b.cfg.LeaseElector != nil {
-		elector, ok := b.cfg.LeaseElector.(lease.Elector)
-		if !ok {
-			return fmt.Errorf("LeaseElector has unexpected type %T", b.cfg.LeaseElector)
-		}
-		b.elector = elector
+		b.elector = b.cfg.LeaseElector
 	} else {
 		elector, err := b.createS3Elector()
 		if err != nil {
@@ -704,14 +700,8 @@ func (s *s3TLSStore) Get(ctx context.Context, key string) ([]byte, error) {
 
 // createS3Elector creates an S3 lease elector from broker config.
 func (b *Broker) createS3Elector() (lease.Elector, error) {
-	var s3api s3store.S3API
-	if b.cfg.S3API != nil {
-		var ok bool
-		s3api, ok = b.cfg.S3API.(s3store.S3API)
-		if !ok {
-			return nil, fmt.Errorf("S3API has unexpected type %T", b.cfg.S3API)
-		}
-	} else {
+	s3api := b.cfg.S3API
+	if s3api == nil {
 		var err error
 		s3api, err = createAWSS3Client(b.cfg)
 		if err != nil {
