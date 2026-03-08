@@ -7,15 +7,16 @@ fulfills the plan's intent.
 
 ## Workflow
 
-1. `bd show <issue-id>` and `bd comments <issue-id>` — find the plan
-2. Read the relevant source files. Understand the full picture — the plan
+1. `bd update <issue-id> --status in_progress`
+2. `bd show <issue-id>` and `bd comments <issue-id>` — find the plan
+3. Read the relevant source files. Understand the full picture — the plan
    tells you the approach, but you need to understand the code to implement
    it well. Read broadly, not just the files the plan mentions.
-3. Confirm the project builds: `go build ./...` and `go vet ./...`
-4. Implement the change. Follow the plan's intent but use your judgment on
+4. Confirm the project builds: `go build ./...` and `go vet ./...`
+5. Implement the change. Follow the plan's intent but use your judgment on
    code-level decisions. If the cleanest implementation touches more files
    than the plan anticipated, that's fine.
-5. Verify:
+6. Verify:
    - `go build ./...`
    - `go vet ./...`
    - `go test ./... -count=1`
@@ -26,7 +27,7 @@ fulfills the plan's intent.
      These deploy klite into k3s with a standby replica and exercise failover
      cycles. They require Docker and take several minutes.
    - Any additional verification from the plan
-6. If all green:
+7. If all green:
    - Commit: `improve(<scope>): <description>`
      Use a scope that fits: `lint`, `errors`, `refactor`, `tests`, `docs`,
      `naming`, `structure`, or whatever best describes the change.
@@ -39,7 +40,7 @@ fulfills the plan's intent.
        --deps discovered-from:<issue-id>
      ```
    - `bd close <issue-id> --reason "Implemented in <hash>"`
-7. If verification fails:
+8. If verification fails:
    - Fix it (up to 3 attempts)
    - If unfixable: revert and defer (see "Getting Stuck" in `ralph/03-improve.md`)
 
