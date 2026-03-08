@@ -253,10 +253,7 @@ func setupCluster(t *testing.T) *cluster {
 	logf("standby: %s", standby)
 
 	logf("waiting for standby to connect to primary...")
-	waitForStandbyConnected(t, k8sClient, primary, time.Now(), 60*time.Second)
-
-	logf("waiting %s for S3 flush after standby connected...", s3FlushInterval)
-	time.Sleep(s3FlushInterval)
+	waitForStandbyConnected(t, k8sClient, primary, 60*time.Second)
 
 	// --- Port-forward to socat proxy (stable across failovers) ---
 	pfCtx, pfCancel := context.WithCancel(ctx)
@@ -298,6 +295,22 @@ func (c *cluster) startProducer() {
 		defer close(c.producerDone)
 		c.runProducer(pCtx)
 	}()
+
+	// Periodic diagnostic logging of ack/error counts.
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pCtx.Done():
+				return
+			case <-ticker.C:
+				logf("producer heartbeat: acked=%d errors=%d",
+					c.producerAcked.Load(), c.producerErrors.Load())
+			}
+		}
+	}()
+
 	logf("background producer started")
 }
 
@@ -491,6 +504,9 @@ func (c *cluster) disrupt() {
 	logf("%s: failover took %s, new primary: %s (producer: acked=%d errors=%d)", tr,
 		time.Since(start).Round(time.Millisecond), newPrimary,
 		c.producerAcked.Load(), c.producerErrors.Load())
+
+	// Query HW from new primary right after failover for diagnostics.
+	c.logPartitionHW()
 
 	// Convergence: verify labels are correct on all pods.
 	tr.check(c.t, "labels correct", 10*time.Second, 1*time.Second, func() bool {
@@ -889,13 +905,12 @@ func waitForPrimaryLabel(t *testing.T, client *kubernetes.Clientset, timeout tim
 	}
 }
 
-func waitForStandbyConnected(t *testing.T, client *kubernetes.Clientset, primaryPod string, since time.Time, timeout time.Duration) {
+func waitForStandbyConnected(t *testing.T, client *kubernetes.Clientset, primaryPod string, timeout time.Duration) {
 	t.Helper()
-	sinceK8s := metav1.NewTime(since)
 	deadline := time.After(timeout)
 	for {
 		logReq := client.CoreV1().Pods(testNamespace).GetLogs(primaryPod, &corev1.PodLogOptions{
-			SinceTime: &sinceK8s,
+			TailLines: ptr(int64(50)),
 		})
 		logStream, err := logReq.Stream(t.Context())
 		if err == nil {
