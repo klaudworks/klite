@@ -251,6 +251,8 @@ func (b *Broker) Run(ctx context.Context) error {
 		return fmt.Errorf("init WAL: %w", err)
 	}
 
+	b.abortOrphanedTransactions()
+
 	if b.cfg.ReplicationAddr != "" {
 		return b.runReplicationMode(ctx)
 	}
@@ -568,6 +570,12 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 				"hw", hw, "s3_watermark", s3wm)
 		}
 	}
+
+	// Abort orphaned transactions that survived failover. rebuildChunksFromWAL
+	// reconstructs partition-level openTxnPIDs but not PIDManager txn state,
+	// so the timeout sweep cannot find them. Sweep them now before accepting
+	// connections.
+	b.abortOrphanedTransactions()
 
 	// Probe S3 for partition HW. The replication snapshot may skip WAL entries
 	// that were already flushed to S3 by the old primary, leaving the standby
@@ -1493,6 +1501,55 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 		)
 	}
 	return nil
+}
+
+// abortOrphanedTransactions sweeps all partitions for open transactions that
+// survived a restart. After WAL replay, any transaction still in openTxnPIDs
+// is definitionally orphaned — the producer either committed/aborted (and we'd
+// have a control record) or crashed. We write abort control batches for each
+// orphan so LSO can advance.
+func (b *Broker) abortOrphanedTransactions() {
+	topics := b.state.GetAllTopics()
+	var aborted int
+	for _, td := range topics {
+		for _, pd := range td.Partitions {
+			pd.RLock()
+			openPIDs := pd.OpenTxnPIDs()
+			pd.RUnlock()
+			if len(openPIDs) == 0 {
+				continue
+			}
+
+			for pid, firstOffset := range openPIDs {
+				controlBatch := cluster.BuildControlBatch(pid, 0, false, b.cfg.Clock.Now().UnixMilli())
+				meta, err := cluster.ParseBatchHeader(controlBatch)
+				if err != nil {
+					b.logger.Warn("abortOrphanedTransactions: failed to parse control batch", "err", err)
+					continue
+				}
+
+				raw := make([]byte, len(controlBatch))
+				copy(raw, controlBatch)
+
+				spare := pd.AcquireSpareChunk(len(raw))
+				pd.Lock()
+				baseOffset, spare := pd.PushBatch(raw, meta, spare)
+				pd.RemoveOpenTxn(pid)
+				pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+					ProducerID:  pid,
+					FirstOffset: firstOffset,
+					LastOffset:  baseOffset,
+				})
+				pd.Unlock()
+				pd.ReleaseSpareChunk(spare)
+
+				aborted++
+			}
+		}
+	}
+	if aborted > 0 {
+		b.logger.Info("aborted orphaned transactions after WAL replay", "count", aborted)
+	}
 }
 
 func (b *Broker) initS3() error {

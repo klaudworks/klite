@@ -553,6 +553,19 @@ func (pd *PartData) RemoveOpenTxn(producerID int64) {
 	delete(pd.openTxnPIDs, producerID)
 }
 
+// OpenTxnPIDs returns a copy of the open transaction map (producerID -> first offset).
+// Caller must hold pd.mu.RLock() or pd.mu.Lock().
+func (pd *PartData) OpenTxnPIDs() map[int64]int64 {
+	if len(pd.openTxnPIDs) == 0 {
+		return nil
+	}
+	cp := make(map[int64]int64, len(pd.openTxnPIDs))
+	for pid, off := range pd.openTxnPIDs {
+		cp[pid] = off
+	}
+	return cp
+}
+
 // Caller must hold pd.mu.Lock().
 func (pd *PartData) AddAbortedTxn(entry AbortedTxnEntry) {
 	pd.abortedTxns = append(pd.abortedTxns, entry)

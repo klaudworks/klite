@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -474,6 +475,120 @@ func TestRebuildChunksFromWAL(t *testing.T) {
 		if len(fr.Batches) == 0 {
 			t.Fatalf("Fetch at offset %d returned no batches", off)
 		}
+	}
+}
+
+// TestAbortOrphanedTransactions verifies that after WAL replay, open
+// transactions on partitions are aborted and LSO advances.
+func TestAbortOrphanedTransactions(t *testing.T) {
+	t.Parallel()
+	logger := slog.Default()
+
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pd := td.Partitions[0]
+
+	// Simulate post-replay state: partition has data and open transactions.
+	pd.Lock()
+	pd.SetHW(100)
+	pd.AddOpenTxn(42, 50) // PID 42 has an open txn starting at offset 50
+	pd.AddOpenTxn(99, 70) // PID 99 has an open txn starting at offset 70
+	pd.Unlock()
+
+	// Verify LSO is blocked by the open transactions.
+	pd.RLock()
+	lso := pd.LSO()
+	pd.RUnlock()
+	if lso != 50 {
+		t.Fatalf("LSO before sweep = %d, want 50", lso)
+	}
+
+	b := &Broker{
+		state:  state,
+		cfg:    Config{Clock: clock.RealClock{}},
+		logger: logger,
+	}
+
+	b.abortOrphanedTransactions()
+
+	// After sweep: no open transactions, LSO should equal HW.
+	pd.RLock()
+	openPIDs := pd.OpenTxnPIDs()
+	lso = pd.LSO()
+	hw := pd.HW()
+	pd.RUnlock()
+
+	if len(openPIDs) != 0 {
+		t.Fatalf("expected no open txns after sweep, got %d", len(openPIDs))
+	}
+	// LSO should now advance — the abort control batches advance HW beyond
+	// 100, so LSO = HW (since no more open txns).
+	if lso != hw {
+		t.Fatalf("LSO = %d, want HW = %d", lso, hw)
+	}
+	// HW should have advanced by 2 abort control batches (one per PID).
+	if hw <= 100 {
+		t.Fatalf("HW = %d, should be > 100 after abort control batches", hw)
+	}
+
+	// Verify aborted txn entries were recorded.
+	pd.RLock()
+	aborted50 := pd.AbortedTxnsInRange(50, hw)
+	pd.RUnlock()
+	if len(aborted50) != 2 {
+		t.Fatalf("expected 2 aborted txn entries, got %d", len(aborted50))
+	}
+}
+
+// TestAbortOrphanedTransactions_NoOrphans verifies the sweep is a no-op when
+// there are no open transactions.
+func TestAbortOrphanedTransactions_NoOrphans(t *testing.T) {
+	t.Parallel()
+	logger := slog.Default()
+
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pd := td.Partitions[0]
+	pd.Lock()
+	pd.SetHW(100)
+	pd.Unlock()
+
+	b := &Broker{
+		state:  state,
+		cfg:    Config{Clock: clock.RealClock{}},
+		logger: logger,
+	}
+
+	b.abortOrphanedTransactions()
+
+	// HW should not change.
+	pd.RLock()
+	hw := pd.HW()
+	lso := pd.LSO()
+	pd.RUnlock()
+	if hw != 100 {
+		t.Fatalf("HW = %d, want 100 (no change)", hw)
+	}
+	if lso != 100 {
+		t.Fatalf("LSO = %d, want 100", lso)
 	}
 }
 
