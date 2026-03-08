@@ -307,6 +307,7 @@ func (b *Broker) runSingleNodeMode(ctx context.Context) error {
 	}
 
 	go b.retentionLoop(ctx)
+	go b.txnTimeoutLoop(ctx)
 
 	if b.s3Client != nil {
 		go b.compactionLoop(ctx)
@@ -620,6 +621,7 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 
 	// Start primary-only background tasks
 	go b.retentionLoop(primaryCtx)
+	go b.txnTimeoutLoop(primaryCtx)
 	if b.s3Client != nil {
 		if b.s3Flusher != nil {
 			b.s3Flusher.Start()
@@ -1026,6 +1028,8 @@ func (b *Broker) rebuildChunksFromWAL() {
 
 		entries := b.walIndex.PartitionEntries(tp)
 		var loaded int
+		// Track open txns per-producer to reconstruct abortedTxns index.
+		openTxnFirstOffset := make(map[int64]int64) // producerID -> first data offset
 		for _, e := range entries {
 			// Skip entries already flushed to S3.
 			if e.LastOffset < s3WM {
@@ -1055,6 +1059,29 @@ func (b *Broker) rebuildChunksFromWAL() {
 
 			spare := pd.AcquireSpareChunk(len(data))
 			pd.Lock()
+
+			// Reconstruct transaction state.
+			if cluster.IsTransactionalBatch(data) && meta.ProducerID >= 0 {
+				if cluster.IsControlBatch(data) {
+					pd.RemoveOpenTxn(meta.ProducerID)
+					if !cluster.IsCommitControlBatch(data) {
+						if firstOff, ok := openTxnFirstOffset[meta.ProducerID]; ok {
+							pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+								ProducerID:  meta.ProducerID,
+								FirstOffset: firstOff,
+								LastOffset:  e.BaseOffset,
+							})
+						}
+					}
+					delete(openTxnFirstOffset, meta.ProducerID)
+				} else {
+					pd.AddOpenTxn(meta.ProducerID, e.BaseOffset)
+					if _, exists := openTxnFirstOffset[meta.ProducerID]; !exists {
+						openTxnFirstOffset[meta.ProducerID] = e.BaseOffset
+					}
+				}
+			}
+
 			spare = pd.AppendToChunk(data, chunk.ChunkBatch{
 				BaseOffset:      e.BaseOffset,
 				LastOffsetDelta: meta.LastOffsetDelta,
@@ -1324,6 +1351,13 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 	skippedBelowLogStart := 0
 	skippedCorrupt := 0
 
+	// Track open transactions across replay to reconstruct abortedTxns index.
+	type replayTxnKey struct {
+		partition  int32
+		producerID int64
+	}
+	replayOpenTxns := make(map[replayTxnKey]int64) // key -> first data offset
+
 	err := w.Replay(func(entry wal.Entry, segmentSeq uint64, fileOffset int64) error {
 		// Look up the topic by ID — metadata.log has already been replayed
 		td := b.state.GetTopicByID(entry.TopicID)
@@ -1393,6 +1427,29 @@ func (b *Broker) replayWAL(w *wal.Writer) error {
 		endOffset := lastOffset + 1
 		if endOffset > pd.HW() {
 			pd.SetHW(endOffset)
+		}
+
+		// Reconstruct transaction state from WAL entries.
+		if cluster.IsTransactionalBatch(entry.Data) && meta.ProducerID >= 0 {
+			if cluster.IsControlBatch(entry.Data) {
+				pd.RemoveOpenTxn(meta.ProducerID)
+				if !cluster.IsCommitControlBatch(entry.Data) {
+					if firstOff, ok := replayOpenTxns[replayTxnKey{entry.Partition, meta.ProducerID}]; ok {
+						pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+							ProducerID:  meta.ProducerID,
+							FirstOffset: firstOff,
+							LastOffset:  entry.Offset,
+						})
+					}
+				}
+				delete(replayOpenTxns, replayTxnKey{entry.Partition, meta.ProducerID})
+			} else {
+				pd.AddOpenTxn(meta.ProducerID, entry.Offset)
+				key := replayTxnKey{entry.Partition, meta.ProducerID}
+				if _, exists := replayOpenTxns[key]; !exists {
+					replayOpenTxns[key] = entry.Offset
+				}
+			}
 		}
 
 		// Append batch data to chunk pool (replaces ring buffer push).
@@ -2063,6 +2120,74 @@ func scramMechName(mech int8) string {
 		return sasl.MechanismScram512
 	default:
 		return ""
+	}
+}
+
+// txnTimeoutLoop periodically checks for expired transactions and writes abort
+// control batches for them. This handles the case where a transactional producer
+// crashes mid-transaction — without this sweep, the open transaction blocks LSO
+// advancement indefinitely.
+func (b *Broker) txnTimeoutLoop(ctx context.Context) {
+	ticker := b.cfg.Clock.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.abortExpiredTransactions()
+		}
+	}
+}
+
+func (b *Broker) abortExpiredTransactions() {
+	expired := b.state.PIDManager().ExpiredTransactions()
+	for _, snap := range expired {
+		endState, errCode := b.state.PIDManager().PrepareEndTxn(snap.ProducerID, snap.Epoch, false)
+		if errCode != 0 {
+			continue
+		}
+		if endState.TxnPartitions == nil {
+			continue
+		}
+
+		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, false, b.cfg.Clock.Now().UnixMilli())
+
+		for tp := range endState.TxnPartitions {
+			td := b.state.GetTopic(tp.Topic)
+			if td == nil || int(tp.Partition) >= len(td.Partitions) {
+				continue
+			}
+			pd := td.Partitions[tp.Partition]
+
+			meta, err := cluster.ParseBatchHeader(controlBatch)
+			if err != nil {
+				continue
+			}
+
+			raw := make([]byte, len(controlBatch))
+			copy(raw, controlBatch)
+
+			spare := pd.AcquireSpareChunk(len(raw))
+			pd.Lock()
+			baseOffset, spare := pd.PushBatch(raw, meta, spare)
+			pd.RemoveOpenTxn(endState.ProducerID)
+			if firstOffset, ok := endState.TxnFirstOffsets[tp]; ok {
+				pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+					ProducerID:  endState.ProducerID,
+					FirstOffset: firstOffset,
+					LastOffset:  baseOffset,
+				})
+			}
+			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
+			pd.NotifyWaiters()
+		}
+
+		b.logger.Info("aborted expired transaction",
+			"producer_id", snap.ProducerID,
+			"txn_id", snap.TxnID,
+			"partitions", len(endState.TxnPartitions))
 	}
 }
 

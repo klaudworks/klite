@@ -703,3 +703,86 @@ func IsTransactionalBatch(raw []byte) bool {
 	attrs := binary.BigEndian.Uint16(raw[21:23])
 	return attrs&0x0010 != 0
 }
+
+// IsCommitControlBatch returns true if the raw batch is a COMMIT control record.
+// Returns false for ABORT control records and non-control batches.
+// The control type is stored in the first record's key at bytes 2-3: 0=ABORT, 1=COMMIT.
+func IsCommitControlBatch(raw []byte) bool {
+	if len(raw) < 62 {
+		return false
+	}
+	if !IsControlBatch(raw) {
+		return false
+	}
+	// Records start at offset 61. Record format:
+	//   varint(recordLen), byte(attrs), varint(tsDelta), varint(offDelta), varint(keyLen), key...
+	pos := 61
+	// Skip record length varint
+	for pos < len(raw) && raw[pos]&0x80 != 0 {
+		pos++
+	}
+	pos++ // final byte of varint
+	if pos >= len(raw) {
+		return false
+	}
+	pos++ // skip attributes byte
+	// Skip timestamp delta varint
+	for pos < len(raw) && raw[pos]&0x80 != 0 {
+		pos++
+	}
+	pos++
+	// Skip offset delta varint
+	for pos < len(raw) && raw[pos]&0x80 != 0 {
+		pos++
+	}
+	pos++
+	// Read key length varint (zigzag-encoded)
+	keyLen, n := decodeVarint(raw[pos:])
+	if n == 0 || keyLen < 4 {
+		return false
+	}
+	pos += n
+	if pos+4 > len(raw) {
+		return false
+	}
+	// Key bytes: [version(2)][controlType(2)]
+	controlType := binary.BigEndian.Uint16(raw[pos+2 : pos+4])
+	return controlType == 1
+}
+
+func decodeVarint(buf []byte) (int64, int) {
+	var uv uint64
+	for i, b := range buf {
+		if i >= 10 {
+			return 0, 0
+		}
+		uv |= uint64(b&0x7f) << (7 * uint(i))
+		if b&0x80 == 0 {
+			// zigzag decode
+			v := int64((uv >> 1) ^ -(uv & 1))
+			return v, i + 1
+		}
+	}
+	return 0, 0
+}
+
+// ExpiredTransactions returns snapshots of producers with ongoing transactions
+// that have exceeded their timeout. The caller is responsible for aborting
+// these transactions by writing abort control batches.
+func (m *ProducerIDManager) ExpiredTransactions() []ProducerSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.clk.Now()
+	var result []ProducerSnapshot
+	for _, ps := range m.producers {
+		if ps.TxnState != TxnOngoing || ps.TxnTimeoutMs <= 0 {
+			continue
+		}
+		deadline := ps.TxnStartTime.Add(time.Duration(ps.TxnTimeoutMs) * time.Millisecond)
+		if now.After(deadline) {
+			result = append(result, snapshotProducer(ps))
+		}
+	}
+	return result
+}

@@ -2,6 +2,9 @@ package cluster
 
 import (
 	"testing"
+	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 func TestSequenceWindowReplay(t *testing.T) {
@@ -326,5 +329,115 @@ func TestReplayBatchMultiplePartitions(t *testing.T) {
 	errCode, isDup, _ = m.ValidateAndDedup(1, 0, tp1, 3, 1, 103)
 	if errCode != 0 || isDup {
 		t.Fatalf("tp1 seq=3: errCode=%d isDup=%v", errCode, isDup)
+	}
+}
+
+func TestIsCommitControlBatch(t *testing.T) {
+	t.Parallel()
+
+	commitBatch := BuildControlBatch(42, 0, true, 1000)
+	if !IsCommitControlBatch(commitBatch) {
+		t.Fatal("expected commit control batch to return true")
+	}
+
+	abortBatch := BuildControlBatch(42, 0, false, 1000)
+	if IsCommitControlBatch(abortBatch) {
+		t.Fatal("expected abort control batch to return false")
+	}
+}
+
+func TestIsCommitControlBatchNonControl(t *testing.T) {
+	t.Parallel()
+
+	// A regular (non-control) batch should return false.
+	raw := make([]byte, 65)
+	raw[16] = 2 // magic
+	// attributes = 0 (no control bit)
+	if IsCommitControlBatch(raw) {
+		t.Fatal("expected non-control batch to return false")
+	}
+}
+
+func TestIsCommitControlBatchTooShort(t *testing.T) {
+	t.Parallel()
+
+	if IsCommitControlBatch(nil) {
+		t.Fatal("expected nil to return false")
+	}
+	if IsCommitControlBatch(make([]byte, 30)) {
+		t.Fatal("expected short batch to return false")
+	}
+}
+
+func TestExpiredTransactionsReturnsExpired(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	// Create a transactional producer with 5s timeout.
+	pid, epoch, _ := m.InitProducerID("txn-1", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// Not expired yet.
+	expired := m.ExpiredTransactions()
+	if len(expired) != 0 {
+		t.Fatalf("expected 0 expired, got %d", len(expired))
+	}
+
+	// Advance past the timeout.
+	fc.Advance(6 * time.Second)
+
+	expired = m.ExpiredTransactions()
+	if len(expired) != 1 {
+		t.Fatalf("expected 1 expired, got %d", len(expired))
+	}
+	if expired[0].ProducerID != pid {
+		t.Fatalf("expired producer ID = %d, want %d", expired[0].ProducerID, pid)
+	}
+}
+
+func TestExpiredTransactionsIgnoresCompletedTxns(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	pid, epoch, _ := m.InitProducerID("txn-2", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// Complete the transaction.
+	m.PrepareEndTxn(pid, epoch, true)
+
+	// Advance past timeout.
+	fc.Advance(6 * time.Second)
+
+	expired := m.ExpiredTransactions()
+	if len(expired) != 0 {
+		t.Fatalf("expected 0 expired after commit, got %d", len(expired))
+	}
+}
+
+func TestExpiredTransactionsIgnoresZeroTimeout(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	// Timeout of 0 should not be treated as expired.
+	pid, epoch, _ := m.InitProducerID("txn-3", 0)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	fc.Advance(time.Hour)
+
+	expired := m.ExpiredTransactions()
+	if len(expired) != 0 {
+		t.Fatalf("expected 0 expired with zero timeout, got %d", len(expired))
 	}
 }
