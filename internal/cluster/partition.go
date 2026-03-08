@@ -451,7 +451,16 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 
 func readFromWAL(walW *wal.Writer, entries []wal.IndexEntry) []StoredBatch {
 	var result []StoredBatch
+	var nextExpected int64 = -1
 	for _, e := range entries {
+		// Stop at offset gaps — the missing data lives in S3, not WAL.
+		if nextExpected >= 0 && e.BaseOffset > nextExpected {
+			slog.Warn("readFromWAL: stopping at offset gap",
+				"gap_start", nextExpected, "gap_end", e.BaseOffset,
+				"gap_size", e.BaseOffset-nextExpected,
+				"batches_so_far", len(result))
+			break
+		}
 		data, err := walW.ReadBatch(e)
 		if err != nil {
 			break
@@ -467,6 +476,7 @@ func readFromWAL(walW *wal.Writer, entries []wal.IndexEntry) []StoredBatch {
 			MaxTimestamp:    meta.MaxTimestamp,
 			NumRecords:      meta.NumRecords,
 		})
+		nextExpected = e.BaseOffset + int64(meta.LastOffsetDelta) + 1
 	}
 	return result
 }
