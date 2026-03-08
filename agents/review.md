@@ -51,10 +51,11 @@ You are reviewing a change made by a previous iteration.
 ## Discovering Issues
 
 If the review reveals problems beyond "revert or approve" — e.g., the code
-was correct but exposed a deeper structural issue — file a new issue:
+was correct but exposed a deeper structural issue — file a followup issue
+at **P1** so it gets planned in the next iteration (depth-first chaining):
 
 ```
-bd create "title" -d "description" -p 2 -l needs-plan --deps discovered-from:<review-issue-id>
+bd create "title" -d "description" -p 1 -l needs-plan --deps discovered-from:<review-issue-id>
 ```
 
 ## Do NOT
