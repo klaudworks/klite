@@ -256,7 +256,18 @@ func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPar
 		if epoch < ps.Epoch {
 			return 35, false, 0 // PRODUCER_FENCED
 		}
-		return 47, false, 0 // INVALID_PRODUCER_EPOCH
+		// KIP-360: accept a higher epoch from the same PID. The client
+		// bumps the epoch locally after a disconnect/failover and resets
+		// sequences to 0. We must accept this and clear old dedup state.
+		if firstSeq != 0 {
+			return 45, false, 0 // OUT_OF_ORDER_SEQUENCE_NUMBER — new epoch must start at seq 0
+		}
+		ps.Epoch = epoch
+		ps.Sequences = map[TopicPartition]*SequenceWindow{}
+		w := &SequenceWindow{}
+		ps.Sequences[tp] = w
+		w.PushAndValidate(epoch, firstSeq, numRecords, baseOffset)
+		return 0, false, 0
 	}
 
 	w, ok := ps.Sequences[tp]

@@ -184,6 +184,121 @@ func TestReplayBatchAdvancesEpoch(t *testing.T) {
 	}
 }
 
+func TestValidateAndDedupAcceptsHigherEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	// Produce a few batches at epoch 0.
+	m.InitProducerID("", 0)
+	errCode, _, _ := m.ValidateAndDedup(1, 0, tp, 0, 5, 0)
+	if errCode != 0 {
+		t.Fatalf("initial produce: errCode=%d", errCode)
+	}
+	errCode, _, _ = m.ValidateAndDedup(1, 0, tp, 5, 5, 5)
+	if errCode != 0 {
+		t.Fatalf("second produce: errCode=%d", errCode)
+	}
+
+	// Epoch bump to 1 with seq=0 (KIP-360 client-side epoch bump).
+	errCode, isDup, _ := m.ValidateAndDedup(1, 1, tp, 0, 3, 100)
+	if errCode != 0 {
+		t.Fatalf("epoch bump: errCode=%d, want 0", errCode)
+	}
+	if isDup {
+		t.Fatal("epoch bump should not be a duplicate")
+	}
+
+	// Verify epoch was updated.
+	ps := m.GetProducer(1)
+	if ps.Epoch != 1 {
+		t.Fatalf("Epoch = %d, want 1", ps.Epoch)
+	}
+
+	// Next produce at new epoch should work.
+	errCode, _, _ = m.ValidateAndDedup(1, 1, tp, 3, 2, 103)
+	if errCode != 0 {
+		t.Fatalf("post-bump produce: errCode=%d", errCode)
+	}
+}
+
+func TestValidateAndDedupRejectsHigherEpochNonZeroSeq(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	m.InitProducerID("", 0)
+	m.ValidateAndDedup(1, 0, tp, 0, 5, 0)
+
+	// Epoch bump with non-zero seq must be rejected.
+	errCode, _, _ := m.ValidateAndDedup(1, 1, tp, 5, 3, 100)
+	if errCode != 45 {
+		t.Fatalf("errCode = %d, want 45 (OUT_OF_ORDER_SEQUENCE_NUMBER)", errCode)
+	}
+}
+
+func TestValidateAndDedupEpochBumpClearsAllPartitions(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp0 := TopicPartition{Topic: "t", Partition: 0}
+	tp1 := TopicPartition{Topic: "t", Partition: 1}
+
+	m.InitProducerID("", 0)
+	m.ValidateAndDedup(1, 0, tp0, 0, 5, 0)
+	m.ValidateAndDedup(1, 0, tp1, 0, 3, 100)
+
+	// Epoch bump on tp0 should clear all partition windows.
+	errCode, _, _ := m.ValidateAndDedup(1, 1, tp0, 0, 2, 200)
+	if errCode != 0 {
+		t.Fatalf("epoch bump on tp0: errCode=%d", errCode)
+	}
+
+	// tp1 sequence window was cleared — seq=0 should work at new epoch.
+	errCode, _, _ = m.ValidateAndDedup(1, 1, tp1, 0, 1, 300)
+	if errCode != 0 {
+		t.Fatalf("tp1 post-bump: errCode=%d", errCode)
+	}
+}
+
+func TestValidateAndDedupReplayThenEpochBump(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	// Simulate WAL replay: PID 2 at epoch 0 with sequences up to 10000.
+	m.ReplayBatch(tp, BatchMeta{ProducerID: 2, ProducerEpoch: 0, BaseSequence: 0, NumRecords: 5000}, 0)
+	m.ReplayBatch(tp, BatchMeta{ProducerID: 2, ProducerEpoch: 0, BaseSequence: 5000, NumRecords: 5000}, 5000)
+
+	// After failover, client sends epoch=1 seq=0 (KIP-360).
+	errCode, isDup, _ := m.ValidateAndDedup(2, 1, tp, 0, 5, 50000)
+	if errCode != 0 {
+		t.Fatalf("post-failover epoch bump: errCode=%d, want 0", errCode)
+	}
+	if isDup {
+		t.Fatal("should not be a duplicate")
+	}
+
+	// Continue producing at new epoch.
+	errCode, _, _ = m.ValidateAndDedup(2, 1, tp, 5, 5, 50005)
+	if errCode != 0 {
+		t.Fatalf("continued produce: errCode=%d", errCode)
+	}
+}
+
+func TestValidateAndDedupFencesLowerEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	m.ReplayBatch(tp, BatchMeta{ProducerID: 1, ProducerEpoch: 3, BaseSequence: 0, NumRecords: 5}, 0)
+
+	// Lower epoch should be fenced.
+	errCode, _, _ := m.ValidateAndDedup(1, 2, tp, 0, 1, 100)
+	if errCode != 35 {
+		t.Fatalf("errCode = %d, want 35 (PRODUCER_FENCED)", errCode)
+	}
+}
+
 func TestReplayBatchMultiplePartitions(t *testing.T) {
 	t.Parallel()
 	m := NewProducerIDManager()
