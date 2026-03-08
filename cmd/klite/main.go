@@ -92,22 +92,26 @@ func main() {
 			&cli.IntFlag{
 				Name:        "wal-sync-interval",
 				Usage:       "WAL fsync batch window in milliseconds (default: 2)",
+				Value:       cfg.WALSyncIntervalMs,
 				Destination: &cfg.WALSyncIntervalMs,
 			},
 			&cli.Int64Flag{
 				Name:        "wal-segment-max-bytes",
 				Usage:       "Max WAL segment size before rotation in bytes (default: 64 MiB)",
+				Value:       cfg.WALSegmentMaxBytes,
 				Destination: &cfg.WALSegmentMaxBytes,
 			},
 			&cli.Int64Flag{
 				Name:        "wal-max-disk-size",
 				Usage:       "Max total WAL on disk in bytes (default: 4 GiB)",
+				Value:       cfg.WALMaxDiskSize,
 				Destination: &cfg.WALMaxDiskSize,
 				Sources:     cli.EnvVars("KLITE_WAL_MAX_DISK_SIZE"),
 			},
 			&cli.Int64Flag{
 				Name:        "chunk-pool-memory",
 				Usage:       "Global memory budget for chunk pool in bytes (default: 512 MiB)",
+				Value:       cfg.ChunkPoolMemory,
 				Destination: &cfg.ChunkPoolMemory,
 			},
 
@@ -135,16 +139,19 @@ func main() {
 			&cli.DurationFlag{
 				Name:        "s3-flush-interval",
 				Usage:       "Max age of unflushed partition data before flush (default: 60s)",
+				Value:       cfg.S3FlushInterval,
 				Destination: &cfg.S3FlushInterval,
 			},
 			&cli.Int64Flag{
 				Name:        "s3-target-object-size",
 				Usage:       "Flush partition when unflushed bytes reach this size (default: 64 MiB)",
+				Value:       cfg.S3TargetObjectSize,
 				Destination: &cfg.S3TargetObjectSize,
 			},
 			&cli.DurationFlag{
 				Name:        "s3-flush-check-interval",
 				Usage:       "How often the flusher scans partitions (default: 1s)",
+				Value:       cfg.S3FlushCheckInterval,
 				Destination: &cfg.S3FlushCheckInterval,
 			},
 
@@ -152,6 +159,7 @@ func main() {
 			&cli.DurationFlag{
 				Name:        "retention-check-interval",
 				Usage:       "How often the retention goroutine runs (default: 1h)",
+				Value:       cfg.RetentionCheckInterval,
 				Destination: &cfg.RetentionCheckInterval,
 			},
 
@@ -159,11 +167,13 @@ func main() {
 			&cli.DurationFlag{
 				Name:        "compaction-check-interval",
 				Usage:       "How often to scan dirty counters (default: 30s)",
+				Value:       cfg.CompactionCheckInterval,
 				Destination: &cfg.CompactionCheckInterval,
 			},
 			&cli.IntFlag{
 				Name:        "compaction-min-dirty-objects",
 				Usage:       "Min dirty S3 objects before compaction triggers (default: 4)",
+				Value:       cfg.CompactionMinDirtyObjects,
 				Destination: &cfg.CompactionMinDirtyObjects,
 			},
 			&cli.IntFlag{
