@@ -58,25 +58,6 @@ func makeTestChunk(pool *chunk.Pool, batches []chunk.ChunkBatch) *chunk.Chunk {
 	return c
 }
 
-// failingClient wraps an InMemoryS3 but can be made to fail on PutObject.
-type failingClient struct {
-	mu       sync.Mutex
-	failNext int // number of PutObject calls to fail before succeeding
-	err      error
-	calls    int
-}
-
-func (f *failingClient) shouldFail() (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls++
-	if f.failNext > 0 {
-		f.failNext--
-		return true, f.err
-	}
-	return false, nil
-}
-
 // newTestFlusher creates a Flusher wired to an InMemoryS3 and FakeClock for
 // unit testing. Returns the flusher, in-memory S3, clock, and chunk pool.
 func newTestFlusher(t *testing.T, provider PartitionProvider) (*Flusher, *InMemoryS3, *clock.FakeClock, *chunk.Pool) {
