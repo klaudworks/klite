@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithy "github.com/aws/smithy-go"
 
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/lease"
 )
 
@@ -45,34 +46,8 @@ type Config struct {
 	RenewInterval time.Duration
 	RetryInterval time.Duration
 	Logger        *slog.Logger
-	Clock         Clock // If nil, uses real clock
+	Clock         clock.Clock // If nil, uses real clock
 }
-
-// Clock abstracts time for testing.
-type Clock interface {
-	Now() time.Time
-	Since(t time.Time) time.Duration
-	NewTicker(d time.Duration) Ticker
-}
-
-// Ticker abstracts time.Ticker for testing.
-type Ticker interface {
-	C() <-chan time.Time
-	Stop()
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time                  { return time.Now() }
-func (realClock) Since(t time.Time) time.Duration { return time.Since(t) }
-func (realClock) NewTicker(d time.Duration) Ticker {
-	t := time.NewTicker(d)
-	return &realTicker{t}
-}
-
-type realTicker struct{ *time.Ticker }
-
-func (t *realTicker) C() <-chan time.Time { return t.Ticker.C }
 
 // Elector implements lease.Elector using S3 conditional writes.
 type Elector struct {
@@ -101,7 +76,7 @@ func New(cfg Config) *Elector {
 		cfg.Logger = slog.Default()
 	}
 	if cfg.Clock == nil {
-		cfg.Clock = realClock{}
+		cfg.Clock = clock.RealClock{}
 	}
 	return &Elector{
 		cfg:  cfg,
@@ -153,7 +128,7 @@ func (e *Elector) Run(ctx context.Context, cb lease.Callbacks) error {
 		case <-ctx.Done():
 			ticker.Stop()
 			return ctx.Err()
-		case <-ticker.C():
+		case <-ticker.C:
 			ticker.Stop()
 		}
 
@@ -250,11 +225,26 @@ func (e *Elector) probeConditionalWrites(ctx context.Context) error {
 	return nil
 }
 
+// s3CallTimeout returns a context with a deadline for a single S3 call.
+// The timeout is the renew interval (or retry interval for standbys) to
+// ensure the lease loop never gets stuck on a hanging S3 call (e.g. when
+// packets are silently dropped by a network partition).
+func (e *Elector) s3CallTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := e.cfg.RenewInterval
+	if timeout > e.cfg.RetryInterval {
+		timeout = e.cfg.RetryInterval
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func (e *Elector) tryAcquire(ctx context.Context, cb lease.Callbacks) {
-	body, etag, err := e.getLease(ctx)
+	callCtx, cancel := e.s3CallTimeout(ctx)
+	defer cancel()
+
+	body, etag, err := e.getLease(callCtx)
 	if err != nil {
 		if isNoSuchKey(err) {
-			e.claimEmpty(ctx, cb)
+			e.claimEmpty(callCtx, cb)
 			return
 		}
 		e.cfg.Logger.Warn("s3 lease: get failed", "err", err)
@@ -291,7 +281,7 @@ func (e *Elector) tryAcquire(ctx context.Context, cb lease.Callbacks) {
 		return
 	}
 
-	out, err := e.cfg.S3.PutObject(ctx, &s3.PutObjectInput{
+	out, err := e.cfg.S3.PutObject(callCtx, &s3.PutObjectInput{
 		Bucket:  &e.cfg.Bucket,
 		Key:     &e.cfg.Key,
 		Body:    bytes.NewReader(data),
@@ -380,7 +370,10 @@ func (e *Elector) tryRenew(ctx context.Context, cb lease.Callbacks) {
 		return
 	}
 
-	out, err := e.cfg.S3.PutObject(ctx, &s3.PutObjectInput{
+	callCtx, cancel := e.s3CallTimeout(ctx)
+	defer cancel()
+
+	out, err := e.cfg.S3.PutObject(callCtx, &s3.PutObjectInput{
 		Bucket:  &e.cfg.Bucket,
 		Key:     &e.cfg.Key,
 		Body:    bytes.NewReader(data),

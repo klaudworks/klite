@@ -400,6 +400,68 @@ func TestS3LeaseReleaseNotPrimary(t *testing.T) {
 	require.False(t, ok, "no lease object should exist")
 }
 
+// hangingS3 wraps S3API to simulate a network partition where packets are
+// silently dropped (no TCP RST). PutObject blocks until the context is
+// cancelled. GetObject continues to work so the standby can still read the
+// lease.
+type hangingS3 struct {
+	S3API
+	mu      sync.Mutex
+	hangPut bool
+}
+
+func (h *hangingS3) PutObject(ctx context.Context, input *s3svc.PutObjectInput, opts ...func(*s3svc.Options)) (*s3svc.PutObjectOutput, error) {
+	h.mu.Lock()
+	shouldHang := h.hangPut
+	h.mu.Unlock()
+
+	key := aws.ToString(input.Key)
+	if shouldHang && key == testKey {
+		if input.Body != nil {
+			io.Copy(io.Discard, input.Body) //nolint:errcheck
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return h.S3API.PutObject(ctx, input, opts...)
+}
+
+func TestS3LeaseRenewHangingS3Demotes(t *testing.T) {
+	mem := s3client.NewInMemoryS3()
+	cfg := fastCfg(mem, "node1")
+	cfg.LeaseDuration = 300 * time.Millisecond
+	cfg.RenewInterval = 50 * time.Millisecond
+
+	hangS3 := &hangingS3{S3API: mem}
+	cfg.S3 = hangS3
+
+	e := New(cfg)
+	elected := make(chan struct{}, 1)
+	demoted := make(chan struct{}, 1)
+
+	startElector(t, e, lease.Callbacks{
+		OnElected: func(ctx context.Context) {
+			elected <- struct{}{}
+		},
+		OnDemoted: func() {
+			demoted <- struct{}{}
+		},
+	})
+
+	waitFor(t, elected, 2*time.Second, "OnElected")
+
+	// Simulate network partition: PutObject now blocks until context timeout.
+	// Without per-call timeouts, the elector would hang indefinitely.
+	hangS3.mu.Lock()
+	hangS3.hangPut = true
+	hangS3.mu.Unlock()
+
+	// Should be demoted within leaseDuration + a few renew intervals
+	// (each hanging call is cancelled after renewInterval by s3CallTimeout).
+	waitFor(t, demoted, 2*time.Second, "OnDemoted after hanging S3")
+	require.Equal(t, lease.RoleStandby, e.Role())
+}
+
 // failingS3 wraps S3API to inject transient errors on PutObject.
 type failingS3 struct {
 	S3API
