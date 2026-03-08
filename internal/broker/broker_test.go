@@ -887,3 +887,388 @@ func TestRebuildChunksFromWAL_PIDState(t *testing.T) {
 		t.Fatalf("seq=15: errCode=%d isDup=%v, expected accept", errCode, isDup)
 	}
 }
+
+// TestRebuildHWFromWAL verifies that rebuildHWFromWAL advances the HW
+// for partitions present in the WAL index and leaves others unchanged.
+func TestRebuildHWFromWAL(t *testing.T) {
+	t.Parallel()
+	logger := slog.Default()
+
+	topicID := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+	idx := wal.NewIndex()
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 2,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td.ID = topicID
+
+	// Set initial HW for both partitions.
+	td.Partitions[0].Lock()
+	td.Partitions[0].TopicID = topicID
+	td.Partitions[0].SetHW(5)
+	td.Partitions[0].Unlock()
+
+	td.Partitions[1].Lock()
+	td.Partitions[1].TopicID = topicID
+	td.Partitions[1].SetHW(10)
+	td.Partitions[1].Unlock()
+
+	// Add WAL index entries only for partition 0 with offsets up to 49.
+	tp0 := wal.TopicPartition{TopicID: topicID, Partition: 0}
+	for i := 0; i < 10; i++ {
+		baseOff := int64(i * 5)
+		idx.Add(tp0, wal.IndexEntry{
+			BaseOffset: baseOff,
+			LastOffset: baseOff + 4,
+		})
+	}
+	// MaxOffset for tp0 = 49+1 = 50
+
+	b := &Broker{
+		walIndex: idx,
+		state:    state,
+		logger:   logger,
+	}
+
+	b.rebuildHWFromWAL()
+
+	// Partition 0: HW should advance from 5 to 50 (WAL max offset).
+	td.Partitions[0].RLock()
+	hw0 := td.Partitions[0].HW()
+	td.Partitions[0].RUnlock()
+	if hw0 != 50 {
+		t.Fatalf("partition 0 HW = %d, want 50", hw0)
+	}
+
+	// Partition 1: HW should remain at 10 (not in WAL index).
+	td.Partitions[1].RLock()
+	hw1 := td.Partitions[1].HW()
+	td.Partitions[1].RUnlock()
+	if hw1 != 10 {
+		t.Fatalf("partition 1 HW = %d, want 10 (unchanged)", hw1)
+	}
+}
+
+// TestRebuildHWFromWAL_NoRegression verifies that rebuildHWFromWAL does not
+// lower the HW when WAL max offset is below the current HW.
+func TestRebuildHWFromWAL_NoRegression(t *testing.T) {
+	t.Parallel()
+	logger := slog.Default()
+
+	topicID := [16]byte{2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+
+	idx := wal.NewIndex()
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td.ID = topicID
+
+	// Set HW to 100, higher than WAL data.
+	td.Partitions[0].Lock()
+	td.Partitions[0].TopicID = topicID
+	td.Partitions[0].SetHW(100)
+	td.Partitions[0].Unlock()
+
+	// WAL index has data up to offset 49 → MaxOffset = 50.
+	tp := wal.TopicPartition{TopicID: topicID, Partition: 0}
+	for i := 0; i < 10; i++ {
+		baseOff := int64(i * 5)
+		idx.Add(tp, wal.IndexEntry{
+			BaseOffset: baseOff,
+			LastOffset: baseOff + 4,
+		})
+	}
+
+	b := &Broker{
+		walIndex: idx,
+		state:    state,
+		logger:   logger,
+	}
+
+	b.rebuildHWFromWAL()
+
+	td.Partitions[0].RLock()
+	hw := td.Partitions[0].HW()
+	td.Partitions[0].RUnlock()
+	if hw != 100 {
+		t.Fatalf("HW = %d, want 100 (should not regress)", hw)
+	}
+}
+
+// TestRebuildHWFromWAL_NilIndex verifies that rebuildHWFromWAL is a no-op
+// when walIndex is nil.
+func TestRebuildHWFromWAL_NilIndex(t *testing.T) {
+	t.Parallel()
+
+	b := &Broker{
+		walIndex: nil,
+		logger:   slog.Default(),
+	}
+
+	// Should not panic.
+	b.rebuildHWFromWAL()
+}
+
+// makeTestBatchTxn builds a transactional data batch (not a control batch)
+// with the transactional attribute bit set.
+func makeTestBatchTxn(baseOffset int64, numRecords int32, pid int64, epoch int16, baseSeq int32) []byte {
+	raw := makeTestBatchPID(baseOffset, numRecords, pid, epoch, baseSeq)
+	// Set transactional attribute bit (bit 4 = 0x0010).
+	attrs := binary.BigEndian.Uint16(raw[21:23])
+	attrs |= 0x0010
+	binary.BigEndian.PutUint16(raw[21:23], attrs)
+	return raw
+}
+
+// TestRebuildChunksFromWAL_TxnState verifies that rebuildChunksFromWAL
+// reconstructs transaction state: open transactions are tracked and
+// abort control records produce aborted txn entries.
+func TestRebuildChunksFromWAL_TxnState(t *testing.T) {
+	t.Parallel()
+	walDir := t.TempDir()
+
+	topicID := [16]byte{3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+	logger := slog.Default()
+
+	idx := wal.NewIndex()
+	walCfg := wal.DefaultWriterConfig()
+	walCfg.Dir = walDir
+	walCfg.S3Configured = true
+	walCfg.Logger = logger
+	w, err := wal.NewWriter(walCfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Stop() })
+
+	pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td.ID = topicID
+
+	pd := td.Partitions[0]
+	pd.Lock()
+	pd.TopicID = topicID
+	pd.InitWAL(pool, w, idx)
+	pd.Unlock()
+
+	const pid1 int64 = 100
+	const pid2 int64 = 200
+	const epoch int16 = 0
+
+	// Write txn data batches for PID 100 at offsets 0-4 and 5-9.
+	appendReplicated := func(batch []byte, baseOffset, lastOffset int64, seq uint64) {
+		t.Helper()
+		entry := &wal.Entry{
+			Sequence:  seq,
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    baseOffset,
+			Data:      batch,
+		}
+		serialized := wal.MarshalEntry(entry)
+		info, written, err := w.AppendReplicated(serialized)
+		if err != nil {
+			t.Fatalf("AppendReplicated failed: %v", err)
+		}
+		if !written {
+			t.Fatalf("entry seq=%d was not written", seq)
+		}
+		pd.Lock()
+		if info.EndOffset > pd.HW() {
+			pd.SetHW(info.EndOffset)
+		}
+		pd.Unlock()
+	}
+
+	// PID 100: two data batches then abort.
+	txnBatch1 := makeTestBatchTxn(0, 5, pid1, epoch, 0)
+	appendReplicated(txnBatch1, 0, 4, 1)
+
+	txnBatch2 := makeTestBatchTxn(5, 5, pid1, epoch, 5)
+	appendReplicated(txnBatch2, 5, 9, 2)
+
+	// PID 200: one data batch (will remain open — no control record).
+	txnBatch3 := makeTestBatchTxn(10, 5, pid2, epoch, 0)
+	appendReplicated(txnBatch3, 10, 14, 3)
+
+	// Abort control record for PID 100.
+	abortCtrl := cluster.BuildControlBatch(pid1, epoch, false, 1000)
+	appendReplicated(abortCtrl, 15, 15, 4)
+
+	b := &Broker{
+		walWriter: w,
+		walIndex:  idx,
+		chunkPool: pool,
+		state:     state,
+		logger:    logger,
+	}
+
+	b.rebuildChunksFromWAL()
+
+	// Verify: PID 200 should have an open txn.
+	pd.RLock()
+	openPIDs := pd.OpenTxnPIDs()
+	pd.RUnlock()
+	if _, ok := openPIDs[pid2]; !ok {
+		t.Fatalf("expected PID %d to have open txn, got openPIDs=%v", pid2, openPIDs)
+	}
+
+	// Verify: PID 100 should NOT have an open txn (was aborted).
+	if _, ok := openPIDs[pid1]; ok {
+		t.Fatalf("expected PID %d to NOT have open txn after abort", pid1)
+	}
+
+	// Verify: aborted txn entry exists for PID 100.
+	pd.RLock()
+	aborted := pd.AbortedTxnsInRange(0, 20)
+	pd.RUnlock()
+	if len(aborted) != 1 {
+		t.Fatalf("expected 1 aborted txn entry, got %d", len(aborted))
+	}
+	if aborted[0].ProducerID != pid1 {
+		t.Fatalf("aborted txn PID = %d, want %d", aborted[0].ProducerID, pid1)
+	}
+	if aborted[0].FirstOffset != 0 {
+		t.Fatalf("aborted txn FirstOffset = %d, want 0", aborted[0].FirstOffset)
+	}
+}
+
+// TestRebuildChunksFromWAL_DetachOldChunks verifies that rebuildChunksFromWAL
+// detaches existing chunks before rebuilding from WAL data.
+func TestRebuildChunksFromWAL_DetachOldChunks(t *testing.T) {
+	t.Parallel()
+	walDir := t.TempDir()
+
+	topicID := [16]byte{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+	logger := slog.Default()
+
+	idx := wal.NewIndex()
+	walCfg := wal.DefaultWriterConfig()
+	walCfg.Dir = walDir
+	walCfg.S3Configured = true
+	walCfg.Logger = logger
+	w, err := wal.NewWriter(walCfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Stop() })
+
+	pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td.ID = topicID
+
+	pd := td.Partitions[0]
+	pd.Lock()
+	pd.TopicID = topicID
+	pd.InitWAL(pool, w, idx)
+	pd.Unlock()
+
+	// Pre-populate chunks with stale data via PushBatch (simulating
+	// startup WAL replay that populated chunks from partial data).
+	staleBatch := makeTestBatch(0, 3)
+	meta, err := cluster.ParseBatchHeader(staleBatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spare := pd.AcquireSpareChunk(len(staleBatch))
+	pd.Lock()
+	pd.PushBatch(staleBatch, meta, spare)
+	pd.Unlock()
+
+	// Verify stale data is present.
+	pd.RLock()
+	hasDataBefore := pd.HasChunkData()
+	pd.RUnlock()
+	if !hasDataBefore {
+		t.Fatal("expected chunk data before rebuild")
+	}
+
+	// Now write different WAL data (offsets 0-9 with 2 batches of 5 records).
+	for i := 0; i < 2; i++ {
+		baseOffset := int64(i * 5)
+		batch := makeTestBatch(baseOffset, 5)
+		entry := &wal.Entry{
+			Sequence:  uint64(i + 1),
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    baseOffset,
+			Data:      batch,
+		}
+		serialized := wal.MarshalEntry(entry)
+		info, written, err := w.AppendReplicated(serialized)
+		if err != nil {
+			t.Fatalf("AppendReplicated failed: %v", err)
+		}
+		if !written {
+			t.Fatalf("entry %d was not written", i)
+		}
+		pd.Lock()
+		if info.EndOffset > pd.HW() {
+			pd.SetHW(info.EndOffset)
+		}
+		pd.Unlock()
+	}
+
+	b := &Broker{
+		walWriter: w,
+		walIndex:  idx,
+		chunkPool: pool,
+		state:     state,
+		logger:    logger,
+	}
+
+	b.rebuildChunksFromWAL()
+
+	// Fetch at offset 0: should return WAL data, not stale chunk data.
+	// The stale batch had 3 records (offsets 0-2), the WAL batch has 5 records (offsets 0-4).
+	fr := pd.Fetch(0, 1024*1024)
+	if fr.Err != 0 {
+		t.Fatalf("Fetch returned error code %d", fr.Err)
+	}
+	if len(fr.Batches) == 0 {
+		t.Fatal("Fetch returned no batches")
+	}
+
+	// The first batch should have 5 records (from WAL), not 3 (from stale chunks).
+	if fr.Batches[0].NumRecords != 5 {
+		t.Fatalf("first batch NumRecords = %d, want 5 (WAL data, not stale)", fr.Batches[0].NumRecords)
+	}
+}
