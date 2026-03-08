@@ -3,13 +3,14 @@ package handler
 import (
 	"time"
 
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handler {
+func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, clk clock.Clock) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.FetchRequest)
 		resp := r.ResponseKind().(*kmsg.FetchResponse)
@@ -188,7 +189,7 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}) server.Handle
 			// If no partitions were registered, skip the wait entirely —
 			// nothing can wake us, so we'd always hit the timer.
 			if regCount > 0 {
-				timer := time.NewTimer(time.Duration(r.MaxWaitMillis) * time.Millisecond)
+				timer := clk.NewTimer(time.Duration(r.MaxWaitMillis) * time.Millisecond)
 				select {
 				case <-w.Ch():
 				case <-timer.C:

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -64,7 +65,7 @@ type groupMember struct {
 	waitSyncCh  chan groupResponse
 	syncVersion int16 // version of the SyncGroup request for response encoding
 
-	sessionTimer *time.Timer
+	sessionTimer *clock.Timer
 	lastSeen     time.Time
 }
 
@@ -86,8 +87,8 @@ type Group struct {
 	offsets  map[TopicPartition]CommittedOffset
 	nJoining int
 
-	rebalanceTimer   *time.Timer
-	pendingSyncTimer *time.Timer
+	rebalanceTimer   *clock.Timer
+	pendingSyncTimer *clock.Timer
 
 	reqCh     chan groupRequest
 	controlCh chan func()
@@ -96,6 +97,7 @@ type Group struct {
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
 	metaLog    *metadata.Log
+	clk        clock.Clock
 }
 
 type TopicPartition struct {
@@ -110,7 +112,10 @@ type CommittedOffset struct {
 	CommitTime  time.Time
 }
 
-func NewGroup(id string, shutdownCh <-chan struct{}, logger *slog.Logger) *Group {
+func NewGroup(id string, shutdownCh <-chan struct{}, logger *slog.Logger, clk clock.Clock) *Group {
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 	g := &Group{
 		id:            id,
 		state:         GroupEmpty,
@@ -124,6 +129,7 @@ func NewGroup(id string, shutdownCh <-chan struct{}, logger *slog.Logger) *Group
 		quitCh:        make(chan struct{}),
 		shutdownCh:    shutdownCh,
 		logger:        logger.With("group", id),
+		clk:           clk,
 	}
 	go g.manage()
 	return g
@@ -474,7 +480,7 @@ func (g *Group) addPending(m *groupMember) {
 	if timeout <= 0 {
 		timeout = 45 * time.Second
 	}
-	m.sessionTimer = time.AfterFunc(timeout, func() {
+	m.sessionTimer = g.clk.AfterFunc(timeout, func() {
 		g.timerControl(func() {
 			if _, ok := g.pending[m.memberID]; ok {
 				delete(g.pending, m.memberID)
@@ -603,7 +609,7 @@ func (g *Group) rebalance() {
 	if g.rebalanceTimer != nil {
 		g.rebalanceTimer.Stop()
 	}
-	g.rebalanceTimer = time.AfterFunc(maxTimeout, func() {
+	g.rebalanceTimer = g.clk.AfterFunc(maxTimeout, func() {
 		g.timerControl(g.completeRebalance)
 	})
 }
@@ -675,7 +681,7 @@ func (g *Group) completeRebalance() {
 	}
 
 	maxTimeout := g.maxRebalanceTimeout()
-	g.pendingSyncTimer = time.AfterFunc(maxTimeout, func() {
+	g.pendingSyncTimer = g.clk.AfterFunc(maxTimeout, func() {
 		g.timerControl(func() {
 			for id, m := range g.members {
 				if m.waitSyncCh == nil && m.assignment == nil {
@@ -981,7 +987,7 @@ func (g *Group) handleOffsetCommit(req *kmsg.OffsetCommitRequest) kmsg.Response 
 					Offset:      rp.Offset,
 					LeaderEpoch: rp.LeaderEpoch,
 					Metadata:    derefStr(rp.Metadata),
-					CommitTime:  time.Now(),
+					CommitTime:  g.clk.Now(),
 				}
 				if g.metaLog != nil {
 					entry := metadata.MarshalOffsetCommit(&metadata.OffsetCommitEntry{
@@ -1215,11 +1221,11 @@ func (g *Group) startSessionTimer(m *groupMember) {
 	if timeout <= 0 {
 		timeout = 45 * time.Second
 	}
-	m.lastSeen = time.Now()
-	m.sessionTimer = time.AfterFunc(timeout, func() {
+	m.lastSeen = g.clk.Now()
+	m.sessionTimer = g.clk.AfterFunc(timeout, func() {
 		g.timerControl(func() {
 			if m2, ok := g.members[m.memberID]; ok && m2 == m {
-				if time.Since(m.lastSeen) >= timeout {
+				if g.clk.Since(m.lastSeen) >= timeout {
 					g.logger.Debug("session timeout", "member", m.memberID)
 					g.removeMemberAndRebalance(m)
 				}
@@ -1255,7 +1261,7 @@ func (g *Group) ApplyTxnOffset(tp TopicPartition, po PendingTxnOffset) {
 		Offset:      po.Offset,
 		LeaderEpoch: po.LeaderEpoch,
 		Metadata:    po.Metadata,
-		CommitTime:  time.Now(),
+		CommitTime:  g.clk.Now(),
 	}
 	if g.metaLog != nil {
 		entry := metadata.MarshalOffsetCommit(&metadata.OffsetCommitEntry{

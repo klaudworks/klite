@@ -24,6 +24,7 @@ import (
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/klaudworks/klite/internal/chunk"
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/handler"
 	"github.com/klaudworks/klite/internal/lease"
@@ -71,6 +72,9 @@ type Broker struct {
 }
 
 func New(cfg Config) *Broker {
+	if cfg.Clock == nil {
+		cfg.Clock = clock.RealClock{}
+	}
 	logger := setupLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 	handlers := server.NewHandlerRegistry()
@@ -84,6 +88,7 @@ func New(cfg Config) *Broker {
 	})
 	state.SetShutdownCh(shutdownCh)
 	state.SetLogger(logger)
+	state.SetClock(cfg.Clock)
 
 	b := &Broker{
 		cfg:        cfg,
@@ -143,8 +148,8 @@ func (b *Broker) registerBaseHandlers() {
 }
 
 func (b *Broker) registerRuntimeHandlers(advAddr string) {
-	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter))
-	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh))
+	b.handlers.Register(0, handler.HandleProduce(b.state, b.walWriter, b.cfg.Clock))
+	b.handlers.Register(1, handler.HandleFetch(b.state, b.shutdownCh, b.cfg.Clock))
 	b.handlers.Register(2, handler.HandleListOffsets(b.state))
 	b.handlers.Register(3, handler.HandleMetadata(handler.MetadataConfig{
 		NodeID:         b.cfg.NodeID,
@@ -193,7 +198,7 @@ func (b *Broker) registerRuntimeHandlers(advAddr string) {
 	b.handlers.Register(22, handler.HandleInitProducerID(b.state))
 	b.handlers.Register(24, handler.HandleAddPartitionsToTxn(b.state))
 	b.handlers.Register(25, handler.HandleAddOffsetsToTxn(b.state))
-	b.handlers.Register(26, handler.HandleEndTxn(b.state))
+	b.handlers.Register(26, handler.HandleEndTxn(b.state, b.cfg.Clock))
 	b.handlers.Register(28, handler.HandleTxnOffsetCommit(b.state))
 	b.handlers.Register(61, handler.HandleDescribeProducers(b.state))
 	b.handlers.Register(65, handler.HandleDescribeTransactions(b.state))
@@ -377,6 +382,7 @@ func (b *Broker) runReplicationMode(ctx context.Context) error {
 			CacheDir:  filepath.Join(b.cfg.DataDir, "repl-tls"),
 			ExtraSANs: b.cfg.ReplicationTLSSANs,
 			Logger:    b.logger,
+			Clock:     b.cfg.Clock,
 		})
 		if err != nil {
 			return fmt.Errorf("ensure TLS: %w", err)
@@ -511,11 +517,26 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 	// Stop any running receiver (was standby before)
 	b.stopReceiver()
 
-	// Rebuild high watermarks from WAL index. Replicated WAL entries are
-	// indexed but don't update the in-memory HW, so after promotion the
-	// new primary must advance HW to make replicated data visible to
-	// consumers.
+	// Rebuild high watermarks from WAL index. The receiver advances HW as
+	// entries arrive, but WAL replay at startup does not set HW for entries
+	// that predate the receiver (e.g. local WAL from a previous primary tenure).
 	b.rebuildHWFromWAL()
+
+	// Rebuild chunks from WAL entries received during the standby phase.
+	// The replication receiver writes WAL entries to disk but does NOT
+	// populate in-memory chunks. Without this step, the S3 flusher would
+	// only flush chunk data (from startup replay + new produces), advancing
+	// the S3 watermark past replicated-but-unchunked data. When WAL segments
+	// are then cleaned, that data is permanently lost.
+	b.rebuildChunksFromWAL()
+
+	// Probe S3 for partition HW. The replication snapshot may skip WAL entries
+	// that were already flushed to S3 by the old primary, leaving the standby
+	// with no WAL data for those offsets. This probe discovers the S3 HW and
+	// ensures nextReserve starts past any data already in S3.
+	if b.s3Client != nil {
+		b.probeS3Watermarks()
+	}
 
 	// Set up replication sender: start replication listener
 	b.startReplicationListener(primaryCtx)
@@ -714,7 +735,8 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 		b.replSender.Close()
 	}
 
-	sender := repl.NewSender(conn, ackTimeout, b.logger)
+	sender := repl.NewSender(conn, ackTimeout, b.logger, b.cfg.Clock)
+	sender.S3FlushWatermarkFn = b.walWriter.S3FlushWatermark
 	b.replSender = sender
 
 	b.walWriter.SetReplicator(sender)
@@ -750,7 +772,7 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 
 // keepaliveLoop sends empty WAL_BATCH (keepalive) every 5s while the sender is connected.
 func (b *Broker) keepaliveLoop(ctx context.Context, sender *repl.Sender) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := b.cfg.Clock.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -794,13 +816,25 @@ func (b *Broker) startReceiverFromLease() {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(100 * time.Millisecond):
+			case <-b.cfg.Clock.After(100 * time.Millisecond):
 			}
 			primaryAddr = b.elector.PrimaryAddr()
 		}
 
 		epoch := b.elector.Epoch()
-		receiver := repl.NewReceiver(b.walWriter, b.metaLog, epoch, b.logger)
+		hwAdvancer := func(topicID [16]byte, partition int32, endOffset int64) {
+			td := b.state.GetTopicByID(topicID)
+			if td == nil || int(partition) >= len(td.Partitions) {
+				return
+			}
+			pd := td.Partitions[partition]
+			pd.Lock()
+			if endOffset > pd.HW() {
+				pd.SetHW(endOffset)
+			}
+			pd.Unlock()
+		}
+		receiver := repl.NewReceiver(b.walWriter, b.metaLog, hwAdvancer, epoch, b.logger)
 
 		for {
 			b.logger.Info("repl receiver: connecting to primary", "addr", primaryAddr)
@@ -813,7 +847,7 @@ func (b *Broker) startReceiverFromLease() {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(2 * time.Second):
+			case <-b.cfg.Clock.After(2 * time.Second):
 			}
 
 			// Re-read primary address in case it changed
@@ -837,9 +871,8 @@ func (b *Broker) stopReceiver() {
 }
 
 // rebuildHWFromWAL scans the WAL index and advances the high watermark
-// for every partition that has replicated data. This is needed because
-// AppendReplicated writes WAL entries and indexes them, but does not
-// update the in-memory partition high watermark.
+// for every partition that has WAL data. This catches entries from a
+// previous primary tenure that were written before the receiver was active.
 func (b *Broker) rebuildHWFromWAL() {
 	if b.walIndex == nil {
 		return
@@ -872,6 +905,93 @@ func (b *Broker) rebuildHWFromWAL() {
 		b.logger.Info("rebuilt high watermarks from WAL index", "partitions", rebuilt)
 	} else if len(allTP) > 0 {
 		b.logger.Debug("rebuildHW: no HW changes needed", "wal_partitions", len(allTP))
+	}
+}
+
+// rebuildChunksFromWAL repopulates in-memory chunks from WAL entries that are
+// above the partition's S3 flush watermark. This is necessary on promotion
+// because the replication receiver writes WAL entries to disk without adding
+// them to chunks. Without this, the S3 flusher skips WAL-only data, creating
+// a gap between what S3 has and what chunks cover.
+//
+// Called during onElected, before the Kafka listener or S3 flusher starts,
+// so no concurrent produce or flush activity exists.
+func (b *Broker) rebuildChunksFromWAL() {
+	if b.walIndex == nil || b.chunkPool == nil {
+		return
+	}
+
+	allTP := b.walIndex.AllPartitions()
+	var rebuilt int
+	for _, tp := range allTP {
+		td := b.state.GetTopicByID(tp.TopicID)
+		if td == nil {
+			continue
+		}
+		if int(tp.Partition) >= len(td.Partitions) {
+			continue
+		}
+		pd := td.Partitions[tp.Partition]
+
+		pd.Lock()
+		s3WM := pd.S3FlushWatermark()
+
+		// Detach all existing chunks — they were populated from WAL replay
+		// at startup and may cover a subset of what's now in the WAL. We
+		// rebuild from scratch using the full WAL index.
+		oldChunks := pd.DetachSealedChunks(true)
+		pd.Unlock()
+		if len(oldChunks) > 0 {
+			b.chunkPool.ReleaseMany(oldChunks)
+		}
+
+		entries := b.walIndex.PartitionEntries(tp)
+		var loaded int
+		for _, e := range entries {
+			// Skip entries already flushed to S3.
+			if e.LastOffset < s3WM {
+				continue
+			}
+
+			data, err := b.walWriter.ReadBatch(e)
+			if err != nil {
+				b.logger.Warn("rebuildChunks: skipping unreadable WAL entry",
+					"topic_id", tp.TopicID, "partition", tp.Partition,
+					"base_offset", e.BaseOffset, "err", err)
+				continue
+			}
+
+			meta, err := cluster.ParseBatchHeader(data)
+			if err != nil {
+				b.logger.Warn("rebuildChunks: skipping corrupt batch",
+					"topic_id", tp.TopicID, "partition", tp.Partition,
+					"base_offset", e.BaseOffset, "err", err)
+				continue
+			}
+
+			spare := pd.AcquireSpareChunk(len(data))
+			pd.Lock()
+			spare = pd.AppendToChunk(data, chunk.ChunkBatch{
+				BaseOffset:      e.BaseOffset,
+				LastOffsetDelta: meta.LastOffsetDelta,
+				MaxTimestamp:    meta.MaxTimestamp,
+				NumRecords:      meta.NumRecords,
+			}, spare)
+			pd.Unlock()
+			pd.ReleaseSpareChunk(spare)
+			loaded++
+		}
+
+		if loaded > 0 {
+			rebuilt++
+			b.logger.Debug("rebuildChunks: loaded WAL entries into chunks",
+				"topic", td.Name, "partition", tp.Partition,
+				"entries", loaded, "s3_watermark", s3WM)
+		}
+	}
+
+	if rebuilt > 0 {
+		b.logger.Info("rebuilt chunks from WAL entries", "partitions", rebuilt)
 	}
 }
 
@@ -1064,6 +1184,7 @@ func (b *Broker) initWAL() error {
 		SegmentMaxBytes: segMaxBytes,
 		MaxDiskSize:     maxDiskSize,
 		FsyncEnabled:    true,
+		S3Configured:    b.cfg.S3Bucket != "",
 		Logger:          b.logger,
 	}
 
@@ -1277,6 +1398,10 @@ func (b *Broker) initS3() error {
 		b.chunkPool.SetTriggerCh(triggerCh)
 	}
 
+	partAdapter := &s3PartitionAdapter{
+		state: b.state,
+	}
+
 	flusherCfg := s3store.FlusherConfig{
 		Client:            b.s3Client,
 		WALWriter:         b.walWriter,
@@ -1289,11 +1414,9 @@ func (b *Broker) initS3() error {
 		TriggerCh:         triggerCh,
 		MetadataUploader:  b.uploadMetadataLog,
 		Reader:            b.s3Reader,
+		WatermarkProvider: partAdapter,
 	}
 
-	partAdapter := &s3PartitionAdapter{
-		state: b.state,
-	}
 	b.s3Flusher = s3store.NewFlusher(flusherCfg, partAdapter)
 
 	// In replication mode, the flusher is started/stopped by onElected/shutdownPrimary.
@@ -1572,7 +1695,6 @@ func (b *Broker) probeS3Watermarks() {
 	for _, td := range topics {
 		for _, pd := range td.Partitions {
 			pd.RLock()
-			hw := pd.HW()
 			flushWM := pd.S3FlushWatermark()
 			pd.RUnlock()
 
@@ -1587,7 +1709,7 @@ func (b *Broker) probeS3Watermarks() {
 			}
 			if s3HW > 0 {
 				pd.Lock()
-				if hw == 0 {
+				if s3HW > pd.HW() {
 					pd.SetHW(s3HW)
 				}
 				pd.SetS3FlushWatermark(s3HW)
@@ -1667,15 +1789,23 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 				pd.SetS3FlushWatermark(newWatermark)
 				pd.IncrementDirtyObjects()
 				pd.Unlock()
-
-				if walIdx := pd.WalIndex(); walIdx != nil {
-					tp := wal.TopicPartition{TopicID: fp.TopicID, Partition: fp.Partition}
-					walIdx.PruneBefore(tp, newWatermark)
-				}
 			},
 		})
 	}
 
+	return result
+}
+
+func (a *s3PartitionAdapter) AllPartitionWatermarks() []s3store.PartitionWatermarkInfo {
+	wms := a.state.AllPartitionWatermarks()
+	result := make([]s3store.PartitionWatermarkInfo, len(wms))
+	for i, w := range wms {
+		result[i] = s3store.PartitionWatermarkInfo{
+			TopicID:     w.TopicID,
+			Partition:   w.Partition,
+			S3Watermark: w.S3Watermark,
+		}
+	}
 	return result
 }
 
@@ -1875,7 +2005,7 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 		ReadRateLimit: b.cfg.CompactionReadRate,
 	})
 
-	ticker := time.NewTicker(interval)
+	ticker := b.cfg.Clock.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1923,7 +2053,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 							maxLagMs = parsed
 						}
 					}
-					if maxLagMs < 9223372036854775807 && time.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
+					if maxLagMs < 9223372036854775807 && b.cfg.Clock.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
 						// Stale — eligible
 					} else {
 						continue
@@ -1981,7 +2111,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 	if newWatermark > cleanedUpTo {
 		bestPD.Lock()
 		bestPD.SetCleanedUpTo(newWatermark)
-		bestPD.ResetDirtyObjects(time.Now())
+		bestPD.ResetDirtyObjects(b.cfg.Clock.Now())
 		bestPD.Unlock()
 		b.logger.Info("compaction complete",
 			"topic", bestTD.Name, "partition", bestPD.Index,

@@ -1,12 +1,13 @@
 package handler
 
 import (
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func HandleEndTxn(state *cluster.State) server.Handler {
+func HandleEndTxn(state *cluster.State, clk clock.Clock) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.EndTxnRequest)
 		resp := r.ResponseKind().(*kmsg.EndTxnResponse)
@@ -27,7 +28,7 @@ func HandleEndTxn(state *cluster.State) server.Handler {
 			return resp, nil
 		}
 
-		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, endState.Commit)
+		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, endState.Commit, clk.Now().UnixMilli())
 
 		for tp := range endState.TxnPartitions {
 			td := state.GetTopic(tp.Topic)

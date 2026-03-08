@@ -6,13 +6,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 func TestSenderSendAndACK(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 	defer s.Close()
 
 	// Read WAL_BATCH in background (net.Pipe is synchronous)
@@ -51,7 +53,7 @@ func TestSenderACKTimeout(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 100*time.Millisecond, slog.Default())
+	s := NewSender(client, 100*time.Millisecond, slog.Default(), nil)
 	defer s.Close()
 
 	// Read the frame in background but don't ACK
@@ -75,7 +77,7 @@ func TestSenderACKCoalesced(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 	defer s.Close()
 
 	// Read all frames in background
@@ -119,7 +121,7 @@ func TestSenderSendMeta(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 	defer s.Close()
 
 	entry := []byte("meta-entry-data")
@@ -151,7 +153,7 @@ func TestSenderSendMeta(t *testing.T) {
 func TestSenderSendMetaWriteError(t *testing.T) {
 	server, client := net.Pipe()
 
-	s := NewSender(client, 100*time.Millisecond, slog.Default())
+	s := NewSender(client, 100*time.Millisecond, slog.Default(), nil)
 
 	// Close the server side to cause write errors
 	_ = server.Close()
@@ -168,7 +170,7 @@ func TestSenderSendMetaWriteError(t *testing.T) {
 func TestSenderDisconnect(t *testing.T) {
 	server, client := net.Pipe()
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 
 	// Read the WAL_BATCH in background
 	go func() {
@@ -195,7 +197,7 @@ func TestSenderConcurrentSendAndSendMeta(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 	defer s.Close()
 
 	// Read all frames in background
@@ -226,7 +228,7 @@ func TestSenderConcurrentSendAndSendMeta(t *testing.T) {
 func TestSenderWriteDeadline(t *testing.T) {
 	server, client := net.Pipe()
 
-	s := NewSender(client, 100*time.Millisecond, slog.Default())
+	s := NewSender(client, 100*time.Millisecond, slog.Default(), nil)
 
 	// net.Pipe() is synchronous: writes block until the other side reads.
 	// Don't read the server side, so the write blocks and hits the deadline.
@@ -253,7 +255,8 @@ func TestSenderKeepaliveNoTimeout(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 100*time.Millisecond, slog.Default())
+	clk := clock.NewFakeClock(time.Now())
+	s := NewSender(client, 100*time.Millisecond, slog.Default(), clk)
 	defer s.Close()
 
 	// Read the keepalive frame in background
@@ -269,7 +272,7 @@ func TestSenderKeepaliveNoTimeout(t *testing.T) {
 			t.Errorf("expected MsgWALBatch, got %#x", msgType)
 			return
 		}
-		_, _, entryCount, _, err := UnmarshalWALBatch(payload)
+		_, _, entryCount, _, _, err := UnmarshalWALBatch(payload)
 		if err != nil {
 			t.Errorf("UnmarshalWALBatch: %v", err)
 			return
@@ -282,10 +285,10 @@ func TestSenderKeepaliveNoTimeout(t *testing.T) {
 	s.SendKeepalive()
 	<-readDone
 
-	// Wait longer than the ack timeout — should NOT produce any timeout error.
+	// Advance past the ack timeout — should NOT produce any timeout error.
 	// If SendKeepalive were using Send(nil,0,0), a pending[0] entry + AfterFunc
-	// timer would fire after 100ms and log a spurious timeout.
-	time.Sleep(200 * time.Millisecond)
+	// timer would fire after 100ms and disconnect the sender.
+	clk.Advance(200 * time.Millisecond)
 
 	// Verify the sender is still connected (no spurious disconnect from timeout)
 	if !s.Connected() {
@@ -297,7 +300,7 @@ func TestSendEntryCount(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close() //nolint:errcheck
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 	defer s.Close()
 
 	// Build a batch with 3 WAL entries
@@ -315,7 +318,7 @@ func TestSendEntryCount(t *testing.T) {
 			t.Errorf("ReadFrame: %v", err)
 			return
 		}
-		_, _, gotEntryCount, _, err = UnmarshalWALBatch(payload)
+		_, _, gotEntryCount, _, _, err = UnmarshalWALBatch(payload)
 		if err != nil {
 			t.Errorf("UnmarshalWALBatch: %v", err)
 			return
@@ -362,7 +365,7 @@ func TestCountEntries(t *testing.T) {
 func TestSenderConnected(t *testing.T) {
 	server, client := net.Pipe()
 
-	s := NewSender(client, 5*time.Second, slog.Default())
+	s := NewSender(client, 5*time.Second, slog.Default(), nil)
 
 	if !s.Connected() {
 		t.Fatal("expected Connected() to be true after creation")

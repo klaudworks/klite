@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 const (
@@ -42,6 +44,7 @@ type PodLabeler struct {
 	podName       string
 	labelSelector string // scopes sibling pod lookups (e.g. "app.kubernetes.io/name=klite")
 	logger        *slog.Logger
+	clk           clock.Clock
 }
 
 // NewPodLabeler creates a labeler that will patch the pod identified by
@@ -92,7 +95,19 @@ func NewPodLabeler(podName, namespace, labelSelector string, logger *slog.Logger
 		podName:       podName,
 		labelSelector: labelSelector,
 		logger:        logger,
+		clk:           clock.RealClock{},
 	}
+}
+
+func (p *PodLabeler) SetClock(c clock.Clock) {
+	p.clk = c
+}
+
+func (p *PodLabeler) getClock() clock.Clock {
+	if p.clk != nil {
+		return p.clk
+	}
+	return clock.RealClock{}
 }
 
 // readToken re-reads the service account token from disk on every call.
@@ -190,7 +205,7 @@ func (p *PodLabeler) clearSiblingLabels() {
 func (p *PodLabeler) patchLabelWithRetry(podName, patch, action string) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(retryBackoff * time.Duration(attempt))
+			p.getClock().Sleep(retryBackoff * time.Duration(attempt))
 		}
 		if p.patchLabel(podName, patch, action) {
 			return

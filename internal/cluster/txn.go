@@ -5,6 +5,8 @@ import (
 	"hash/crc32"
 	"sync"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 type TxnState int8
@@ -108,6 +110,32 @@ func (w *SequenceWindow) LastSequence() int32 {
 	return w.seq[w.at] - 1
 }
 
+// Replay unconditionally updates the window from a committed WAL entry.
+// Unlike PushAndValidate, no validation is performed — the batch is
+// already durably committed. Replaying the same entries twice is safe
+// (idempotent) because each call overwrites the current slot.
+func (w *SequenceWindow) Replay(epoch int16, firstSeq, numRecords int32, baseOffset int64) {
+	nextSeq := firstSeq + numRecords
+	if !w.filled || epoch != w.epoch {
+		w.epoch = epoch
+		w.filled = true
+		w.at = 0
+		for i := range w.seq {
+			w.seq[i] = 0
+			w.offsets[i] = 0
+		}
+		w.seq[0] = firstSeq
+		w.offsets[0] = baseOffset
+		w.at = 1
+		w.seq[1] = nextSeq
+		return
+	}
+	w.offsets[w.at] = baseOffset
+	w.seq[w.at] = firstSeq
+	w.at = (w.at + 1) % 5
+	w.seq[w.at] = nextSeq
+}
+
 type AbortedTxnEntry struct {
 	ProducerID  int64
 	FirstOffset int64 // first data offset of the txn on this partition
@@ -119,6 +147,7 @@ type ProducerIDManager struct {
 	nextPID   int64                     // monotonic counter
 	producers map[int64]*ProducerState  // PID -> state
 	byTxnID   map[string]*ProducerState // txnID -> state
+	clk       clock.Clock
 }
 
 func NewProducerIDManager() *ProducerIDManager {
@@ -126,7 +155,14 @@ func NewProducerIDManager() *ProducerIDManager {
 		nextPID:   1,
 		producers: make(map[int64]*ProducerState),
 		byTxnID:   make(map[string]*ProducerState),
+		clk:       clock.RealClock{},
 	}
+}
+
+func (m *ProducerIDManager) SetClock(c clock.Clock) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clk = c
 }
 
 func (m *ProducerIDManager) SetNextPID(next int64) {
@@ -260,6 +296,40 @@ func (m *ProducerIDManager) UpdateDedupOffset(pid int64, tp TopicPartition, firs
 	w.offsets[prev] = actualOffset
 }
 
+// ReplayBatch reconstructs producer dedup state from a committed WAL entry.
+// Called during WAL replay (startup) and chunk rebuild (promotion) so that
+// duplicate detection works after restart or failover. Only processes
+// idempotent batches (ProducerID >= 0) that are not control records
+// (BaseSequence >= 0).
+func (m *ProducerIDManager) ReplayBatch(tp TopicPartition, meta BatchMeta, baseOffset int64) {
+	if meta.ProducerID < 0 || meta.BaseSequence < 0 {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ps, ok := m.producers[meta.ProducerID]
+	if !ok {
+		ps = &ProducerState{
+			ProducerID: meta.ProducerID,
+			Epoch:      meta.ProducerEpoch,
+			Sequences:  make(map[TopicPartition]*SequenceWindow),
+		}
+		m.producers[meta.ProducerID] = ps
+	}
+	if meta.ProducerEpoch > ps.Epoch {
+		ps.Epoch = meta.ProducerEpoch
+	}
+
+	w, ok := ps.Sequences[tp]
+	if !ok {
+		w = &SequenceWindow{}
+		ps.Sequences[tp] = w
+	}
+	w.Replay(meta.ProducerEpoch, meta.BaseSequence, meta.NumRecords, baseOffset)
+}
+
 func (m *ProducerIDManager) AddPartitionsToTxn(pid int64, epoch int16, partitions []TopicPartition) int16 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -280,7 +350,7 @@ func (m *ProducerIDManager) AddPartitionsToTxn(pid int64, epoch int16, partition
 
 	if ps.TxnState != TxnOngoing {
 		ps.TxnState = TxnOngoing
-		ps.TxnStartTime = time.Now()
+		ps.TxnStartTime = m.clk.Now()
 		ps.TxnPartitions = make(map[TopicPartition]bool)
 		ps.TxnBatches = nil
 		ps.TxnGroups = nil
@@ -314,7 +384,7 @@ func (m *ProducerIDManager) AddOffsetsToTxn(pid int64, epoch int16, groupID stri
 
 	if ps.TxnState != TxnOngoing {
 		ps.TxnState = TxnOngoing
-		ps.TxnStartTime = time.Now()
+		ps.TxnStartTime = m.clk.Now()
 		ps.TxnPartitions = make(map[TopicPartition]bool)
 		ps.TxnBatches = nil
 		ps.TxnGroups = nil
@@ -520,8 +590,8 @@ func (m *ProducerIDManager) GetProducersForPartition(topic string, partition int
 	return result
 }
 
-func BuildControlBatch(producerID int64, producerEpoch int16, commit bool) []byte {
-	now := time.Now().UnixMilli()
+func BuildControlBatch(producerID int64, producerEpoch int16, commit bool, nowMs int64) []byte {
+	now := nowMs
 
 	var controlType int16
 	if commit {

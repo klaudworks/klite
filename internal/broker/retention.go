@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	s3store "github.com/klaudworks/klite/internal/s3"
 )
@@ -16,7 +15,7 @@ func (b *Broker) retentionLoop(ctx context.Context) {
 	if interval == 0 {
 		interval = 1 * time.Hour
 	}
-	ticker := time.NewTicker(interval)
+	ticker := b.cfg.Clock.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -33,11 +32,7 @@ func (b *Broker) enforceRetention(ctx context.Context) {
 		return
 	}
 
-	clk := b.cfg.Clock
-	if clk == nil {
-		clk = clock.RealClock{}
-	}
-	nowMs := clk.Now().UnixMilli()
+	nowMs := b.cfg.Clock.Now().UnixMilli()
 	topics := b.state.GetAllTopics()
 
 	for _, td := range topics {
@@ -204,7 +199,7 @@ func (b *Broker) s3GCLoop(ctx context.Context) {
 	pending := b.state.DrainDeletedTopics()
 	b.deleteTopicObjects(ctx, append(pending, orphans...))
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := b.cfg.Clock.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {

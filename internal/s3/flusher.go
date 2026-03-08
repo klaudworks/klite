@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -17,6 +18,18 @@ import (
 // Implemented by a broker-level adapter to avoid circular dependencies.
 type PartitionProvider interface {
 	FlushablePartitions() []FlushPartition
+}
+
+// WatermarkProvider returns the S3 flush watermark for every partition.
+type WatermarkProvider interface {
+	AllPartitionWatermarks() []PartitionWatermarkInfo
+}
+
+// PartitionWatermarkInfo holds the S3 flush watermark for a single partition.
+type PartitionWatermarkInfo struct {
+	TopicID     [16]byte
+	Partition   int32
+	S3Watermark int64
 }
 
 type FlushPartition struct {
@@ -61,6 +74,10 @@ type FlusherConfig struct {
 
 	// Reader is used to invalidate listing caches after new objects are uploaded.
 	Reader *Reader
+
+	// WatermarkProvider returns all partition S3 watermarks for computing
+	// the global WAL flush watermark.
+	WatermarkProvider WatermarkProvider
 }
 
 // Flusher periodically scans partitions and flushes those that exceed size
@@ -247,7 +264,7 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 	}
 
 	f.logger.Info("S3 flush: flushing partitions", "count", len(jobs), "flush_all", flushAll)
-	start := time.Now()
+	start := f.cfg.Clock.Now()
 
 	sem := make(chan struct{}, f.cfg.UploadConcurrency)
 	var wg sync.WaitGroup
@@ -308,19 +325,46 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 
 	wg.Wait()
 
-	if f.cfg.WALWriter != nil {
-		f.cfg.WALWriter.TryCleanupSegments()
+	// Compute and set the global S3 flush watermark on the WAL writer.
+	// This replaces the old TryCleanupSegments call — SetS3FlushWatermark
+	// triggers cleanup internally.
+	if f.cfg.WALWriter != nil && f.cfg.WatermarkProvider != nil && f.cfg.WALIndex != nil {
+		f.updateGlobalFlushWatermark()
 	}
 
 	f.logger.Info("S3 flush complete",
 		"partitions", len(jobs),
-		"duration", time.Since(start).Round(time.Millisecond))
+		"duration", f.cfg.Clock.Since(start).Round(time.Millisecond))
 
 	if firstErr != nil {
 		return fmt.Errorf("partition flush: %w", firstErr)
 	}
 
 	return nil
+}
+
+// updateGlobalFlushWatermark computes the minimum unflushed WAL sequence across
+// all partitions and sets it on the WAL writer. This determines which WAL segments
+// are eligible for deletion.
+func (f *Flusher) updateGlobalFlushWatermark() {
+	partitions := f.cfg.WatermarkProvider.AllPartitionWatermarks()
+
+	globalMin := uint64(math.MaxUint64)
+	for _, pw := range partitions {
+		tp := wal.TopicPartition{TopicID: pw.TopicID, Partition: pw.Partition}
+		oldest := f.cfg.WALIndex.OldestUnflushedSequence(tp, pw.S3Watermark)
+		if oldest > 0 && oldest < globalMin {
+			globalMin = oldest
+		}
+	}
+
+	// If all partitions are fully flushed, the watermark equals the writer's
+	// next sequence (everything is flushed).
+	if globalMin == math.MaxUint64 {
+		globalMin = f.cfg.WALWriter.NextSequence()
+	}
+
+	f.cfg.WALWriter.SetS3FlushWatermark(globalMin)
 }
 
 func collectBatchesFromChunks(chunks []*chunk.Chunk) []BatchData {

@@ -4,10 +4,10 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/klaudworks/klite/internal/chunk"
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/wal"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -30,6 +30,7 @@ type State struct {
 
 	shutdownCh <-chan struct{}
 	logger     *slog.Logger
+	clock      clock.Clock
 
 	// WAL-related state (Phase 3+)
 	walWriter *wal.Writer
@@ -73,6 +74,18 @@ func (s *State) SetShutdownCh(ch <-chan struct{}) {
 
 func (s *State) SetLogger(l *slog.Logger) {
 	s.logger = l
+}
+
+func (s *State) SetClock(c clock.Clock) {
+	s.clock = c
+	s.pidManager.SetClock(c)
+}
+
+func (s *State) getClock() clock.Clock {
+	if s.clock != nil {
+		return s.clock
+	}
+	return clock.RealClock{}
 }
 
 func (s *State) SetWALConfig(w *wal.Writer, idx *wal.Index, pool *chunk.Pool) {
@@ -312,7 +325,7 @@ func (s *State) GetOrCreateGroup(groupID string) *Group {
 	if g, ok := s.groups[groupID]; ok {
 		return g
 	}
-	g = NewGroup(groupID, s.shutdownCh, s.logger)
+	g = NewGroup(groupID, s.shutdownCh, s.logger, s.getClock())
 	if s.metaLog != nil {
 		g.SetMetadataLog(s.metaLog)
 	}
@@ -556,7 +569,7 @@ func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition in
 	s.mu.Lock()
 	g, ok := s.groups[groupID]
 	if !ok {
-		g = NewGroup(groupID, s.shutdownCh, s.logger)
+		g = NewGroup(groupID, s.shutdownCh, s.logger, s.getClock())
 		if s.metaLog != nil {
 			g.SetMetadataLog(s.metaLog)
 		}
@@ -568,7 +581,7 @@ func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition in
 		g.offsets[TopicPartition{Topic: topic, Partition: partition}] = CommittedOffset{
 			Offset:     offset,
 			Metadata:   metadataStr,
-			CommitTime: time.Now(),
+			CommitTime: s.getClock().Now(),
 		}
 	})
 }
@@ -680,4 +693,35 @@ type FlushablePartition struct {
 	S3Watermark int64
 	HW          int64
 	Partition_  *PartData // reference to the partition for watermark update
+}
+
+// PartitionWatermark holds the S3 flush watermark for a partition.
+type PartitionWatermark struct {
+	TopicID     [16]byte
+	Partition   int32
+	S3Watermark int64
+}
+
+// AllPartitionWatermarks returns the S3 flush watermark for every partition.
+func (s *State) AllPartitionWatermarks() []PartitionWatermark {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []PartitionWatermark
+	for _, td := range s.topics {
+		for _, pd := range td.Partitions {
+			pd.mu.RLock()
+			wm := pd.s3FlushWatermark
+			topicID := pd.TopicID
+			pd.mu.RUnlock()
+
+			result = append(result, PartitionWatermark{
+				TopicID:     topicID,
+				Partition:   pd.Index,
+				S3Watermark: wm,
+			})
+		}
+	}
+
+	return result
 }

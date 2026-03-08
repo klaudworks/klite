@@ -3,9 +3,9 @@ package handler
 import (
 	"log/slog"
 	"strconv"
-	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/klaudworks/klite/internal/wal"
@@ -13,7 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
+func HandleProduce(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.ProduceRequest)
 
@@ -31,7 +31,7 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer) server.Handler {
 			return resp, nil
 		}
 
-		now := time.Now().UnixMilli()
+		now := clk.Now().UnixMilli()
 
 		// Two-phase produce: submit all WAL writes (phase 1), then wait for
 		// a single fsync and commit all batches (phase 2). This batches all

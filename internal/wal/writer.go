@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,8 +14,6 @@ import (
 
 	"github.com/klaudworks/klite/internal/clock"
 )
-
-const diskCleanupThreshold = 0.9
 
 // wrappedReplicator wraps a Replicator in a concrete type so atomic.Value
 // always stores the same type. A nil Replicator is represented by a
@@ -40,6 +39,7 @@ type WriterConfig struct {
 	SegmentMaxBytes int64         // Max segment size before rotation (default 64 MiB)
 	MaxDiskSize     int64         // Max total WAL on disk (default 1 GiB)
 	FsyncEnabled    bool          // Whether to fsync (default true)
+	S3Configured    bool          // Whether S3 is configured; controls unflushed-segment protection
 	Clock           clock.Clock   // Clock for ticker (default RealClock)
 	Logger          *slog.Logger
 
@@ -84,7 +84,10 @@ type Writer struct {
 	stopCh    chan struct{}
 	done      chan struct{}
 
-	// Segment state (owned exclusively by the writer goroutine)
+	// Segment state. Most access is from the writer goroutine, but
+	// AppendReplicated (receiver goroutine) also calls appendEntry/rotateSegment
+	// which mutates segments/current. segMu protects concurrent access.
+	segMu    sync.Mutex
 	segments []*segmentInfo
 	current  *segmentInfo
 	nextSeq  atomic.Uint64
@@ -103,6 +106,15 @@ type Writer struct {
 	// Disk usage tracking (for segment cleanup)
 	diskUsage atomic.Int64 // total bytes across all WAL segment files
 
+	// S3 flush watermark (WAL-sequence-based). Any WAL entry with sequence
+	// below this value is guaranteed to be in S3. 0 means S3 not configured
+	// or nothing flushed yet.
+	s3FlushWatermark atomic.Uint64
+
+	// Back-pressure flag: set when WAL is over max and all remaining segments
+	// are unflushed. Append/AppendAsync return ErrWALFull when true.
+	walFull atomic.Bool
+
 	// For external callers to check
 	mu      sync.Mutex
 	stopped bool
@@ -114,6 +126,11 @@ type Writer struct {
 	// so SetReplicator (called from the broker goroutine) and run()
 	// (the writer goroutine) don't race. Stores nil or a Replicator.
 	replicator atomic.Value // holds Replicator (or wrappedReplicator)
+
+	// replayedMinMax stores per-segment minSeq/maxSeq discovered during
+	// Replay(). Since Replay runs before Start() populates w.segments,
+	// we stash the values here and apply them in Start().
+	replayedMinMax map[uint64][2]uint64 // segSeq → [minSeq, maxSeq]
 }
 
 func NewWriter(cfg WriterConfig, idx *Index) (*Writer, error) {
@@ -193,6 +210,16 @@ func (w *Writer) Start() error {
 		w.segSeq = 1
 	}
 
+	// Apply minSeq/maxSeq discovered during Replay() (which runs before
+	// Start, when w.segments was still empty).
+	for _, seg := range w.segments {
+		if mm, ok := w.replayedMinMax[seg.seq]; ok {
+			seg.minSeq = mm[0]
+			seg.maxSeq = mm[1]
+		}
+	}
+	w.replayedMinMax = nil // free memory
+
 	var totalSize int64
 	for _, seg := range w.segments {
 		totalSize += seg.size
@@ -211,6 +238,10 @@ func (w *Writer) Append(entry *Entry) error {
 		return ErrClosed
 	}
 	w.mu.Unlock()
+
+	if w.walFull.Load() {
+		return ErrWALFull
+	}
 
 	seq := w.nextSeq.Add(1) - 1
 	entry.Sequence = seq
@@ -240,6 +271,10 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 	}
 	w.mu.Unlock()
 
+	if w.walFull.Load() {
+		return nil, ErrWALFull
+	}
+
 	seq := w.nextSeq.Add(1) - 1
 	entry.Sequence = seq
 
@@ -263,28 +298,45 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 //
 // Returns written=true if the entry was appended to disk, written=false if
 // skipped (duplicate).
-func (w *Writer) AppendReplicated(serializedEntry []byte) (written bool, err error) {
+// ReplicatedEntryInfo contains parsed metadata from a replicated WAL entry,
+// returned by AppendReplicated so callers can advance partition state (e.g. HW).
+type ReplicatedEntryInfo struct {
+	TopicID   [16]byte
+	Partition int32
+	EndOffset int64 // lastOffset + 1 (the new HW if this is the latest entry)
+}
+
+func (w *Writer) AppendReplicated(serializedEntry []byte) (info ReplicatedEntryInfo, written bool, err error) {
 	if len(serializedEntry) <= 8+8 {
-		return false, fmt.Errorf("replicated entry too short: %d bytes", len(serializedEntry))
+		return info, false, fmt.Errorf("replicated entry too short: %d bytes", len(serializedEntry))
 	}
 
 	seq := parseSequence(serializedEntry)
 	currentNext := w.nextSeq.Load()
 	if currentNext > 0 && seq < currentNext {
-		return false, nil // duplicate, skip
+		return info, false, nil // duplicate, skip
 	}
 
 	if err := w.appendEntry(serializedEntry); err != nil {
-		return false, err
+		return info, false, err
 	}
 
 	w.nextSeq.Store(seq + 1)
 
-	if w.DiskPressure() >= diskCleanupThreshold {
-		w.TryCleanupSegments()
+	// Parse entry metadata for the caller (e.g. to advance HW).
+	if len(serializedEntry) > 4 {
+		if entry, parseErr := UnmarshalEntry(serializedEntry[4:]); parseErr == nil {
+			info.TopicID = entry.TopicID
+			info.Partition = entry.Partition
+			info.EndOffset = entry.Offset + 1
+			if len(entry.Data) >= 27 {
+				lastOffsetDelta := int32(binary.BigEndian.Uint32(entry.Data[23:27]))
+				info.EndOffset = entry.Offset + int64(lastOffsetDelta) + 1
+			}
+		}
 	}
 
-	return true, nil
+	return info, true, nil
 }
 
 // Sync fsyncs the current segment file.
@@ -319,6 +371,25 @@ func (w *Writer) getReplicator() Replicator {
 	return v.(wrappedReplicator).inner
 }
 
+// SetS3FlushWatermark stores the global S3 flush watermark and triggers
+// cleanup, since a watermark advance may make previously ineligible segments
+// eligible for deletion.
+func (w *Writer) SetS3FlushWatermark(seq uint64) {
+	w.s3FlushWatermark.Store(seq)
+	w.TryCleanupSegments()
+}
+
+// S3FlushWatermark returns the current S3 flush watermark.
+func (w *Writer) S3FlushWatermark() uint64 {
+	return w.s3FlushWatermark.Load()
+}
+
+// IsWALFull returns true when the WAL is at max capacity and all remaining
+// segments contain unflushed data.
+func (w *Writer) IsWALFull() bool {
+	return w.walFull.Load()
+}
+
 func (w *Writer) Stop() {
 	w.mu.Lock()
 	if w.stopped {
@@ -338,11 +409,6 @@ func (w *Writer) Index() *Index {
 
 func (w *Writer) Dir() string {
 	return w.walDir
-}
-
-// DiskPressure returns the fraction of MaxDiskSize currently used (0.0 to 1.0+).
-func (w *Writer) DiskPressure() float64 {
-	return float64(w.diskUsage.Load()) / float64(w.cfg.MaxDiskSize)
 }
 
 func (w *Writer) run() {
@@ -365,7 +431,7 @@ func (w *Writer) run() {
 			w.preCreateInflight = false
 			continue
 		case <-w.cleanupCh:
-			w.tryCleanupSegmentsLocked()
+			w.cleanSegments()
 			continue
 		case <-w.stopCh:
 			w.flushAndSync(pending)
@@ -450,6 +516,7 @@ func (w *Writer) run() {
 		}
 		pending = pending[:0]
 		w.maybePreCreateSegment()
+		w.cleanSegments()
 	}
 }
 
@@ -494,6 +561,9 @@ func (w *Writer) appendEntry(serialized []byte) error {
 			}
 			w.idx.Add(tp, idxEntry)
 
+			if entry.Sequence < w.current.minSeq {
+				w.current.minSeq = entry.Sequence
+			}
 			if entry.Sequence > w.current.maxSeq {
 				w.current.maxSeq = entry.Sequence
 			}
@@ -533,7 +603,7 @@ func (w *Writer) flushAndSync(pending []writeRequest) {
 		replCh := repl.Replicate(batch, firstSeq, lastSeq)
 		select {
 		case <-replCh:
-		case <-time.After(2 * time.Second):
+		case <-w.cfg.Clock.After(2 * time.Second):
 			w.logger.Warn("standby replication timed out during shutdown")
 		}
 	}
@@ -587,6 +657,7 @@ func (w *Writer) rotateSegment() error {
 		w.logger.Warn("WAL segment rotation: close error on old segment", "err", err)
 	}
 
+	w.segMu.Lock()
 	if w.preCreated != nil {
 		w.current = w.preCreated
 		w.segments = append(w.segments, w.preCreated)
@@ -598,6 +669,7 @@ func (w *Writer) rotateSegment() error {
 		w.segSeq++
 		seg, err := w.createSegment(seq)
 		if err != nil {
+			w.segMu.Unlock()
 			return err
 		}
 		w.current = seg
@@ -609,8 +681,8 @@ func (w *Writer) rotateSegment() error {
 			_ = dir.Close()
 		}
 	}
+	w.segMu.Unlock()
 
-	w.tryCleanupSegmentsLocked()
 	return nil
 }
 
@@ -659,67 +731,60 @@ func (w *Writer) TryCleanupSegments() {
 	}
 }
 
-func (w *Writer) tryCleanupSegmentsLocked() {
+// cleanSegments removes eligible segments when disk usage exceeds MaxDiskSize.
+// A segment is eligible if its entire content has been flushed to S3 (determined
+// by comparing maxSeq against the S3 flush watermark), or if S3 is not configured.
+// After cleanup, sets the walFull flag if still over max (all remaining segments
+// are unflushed).
+func (w *Writer) cleanSegments() {
+	w.segMu.Lock()
+	defer w.segMu.Unlock()
+
 	if len(w.segments) <= 1 {
+		w.walFull.Store(false)
 		return
 	}
 
-	var kept []*segmentInfo
-	for _, seg := range w.segments {
-		if seg == w.current {
-			kept = append(kept, seg)
-			continue
-		}
+	watermark := w.s3FlushWatermark.Load()
+	s3Mode := w.cfg.S3Configured
 
-		if w.idx.SegmentReferenced(seg.seq) {
-			kept = append(kept, seg)
-			continue
-		}
+	// Step 1 (disk-pressure path): if over max, delete oldest eligible segments.
+	if w.diskUsage.Load() > w.cfg.MaxDiskSize {
+		for len(w.segments) > 1 && w.diskUsage.Load() > w.cfg.MaxDiskSize {
+			oldest := w.segments[0]
+			if oldest == w.current {
+				break
+			}
 
-		deletedSize := seg.size
-		if seg.file != nil {
-			_ = seg.file.Close()
-			seg.file = nil
-		}
-		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
-			w.logger.Warn("failed to delete WAL segment", "path", seg.path, "err", err)
-			kept = append(kept, seg) // keep on failure
-		} else {
-			w.diskUsage.Add(-deletedSize)
-			w.logger.Info("deleted unreferenced WAL segment", "seq", seg.seq, "path", seg.path)
+			// Check eligibility: segment's data must be in S3, or S3 not configured.
+			// A segment is empty if minSeq == MaxUint64 (never had entries written).
+			// An empty segment is always eligible for deletion.
+			empty := oldest.minSeq == math.MaxUint64
+			if s3Mode && !empty && oldest.maxSeq >= watermark {
+				// Unflushed — cannot delete. All newer segments are also
+				// unflushed (sequences are monotonic), so stop.
+				break
+			}
+
+			w.idx.PruneSegment(oldest.seq)
+			if oldest.file != nil {
+				_ = oldest.file.Close()
+				oldest.file = nil
+			}
+			if err := os.Remove(oldest.path); err != nil && !os.IsNotExist(err) {
+				w.logger.Warn("failed to delete WAL segment", "path", oldest.path, "err", err)
+				break
+			}
+			w.diskUsage.Add(-oldest.size)
+			w.logger.Info("deleted WAL segment (disk pressure)",
+				"seq", oldest.seq, "path", oldest.path)
+			w.segments = w.segments[1:]
 		}
 	}
-	w.segments = kept
 
-	w.cleanByDiskPressure(diskCleanupThreshold)
-}
-
-// cleanByDiskPressure force-deletes the oldest segments (pruning their index
-// entries) until disk usage drops below limit × MaxDiskSize.
-func (w *Writer) cleanByDiskPressure(limit float64) {
-	maxBytes := int64(float64(w.cfg.MaxDiskSize) * limit)
-	for len(w.segments) > 1 && w.TotalDiskSize() > maxBytes {
-		oldest := w.segments[0]
-		if oldest == w.current {
-			break
-		}
-
-		deletedSegSize := oldest.size
-		w.idx.PruneSegment(oldest.seq)
-		if oldest.file != nil {
-			_ = oldest.file.Close()
-			oldest.file = nil
-		}
-		if err := os.Remove(oldest.path); err != nil && !os.IsNotExist(err) {
-			w.logger.Warn("failed to force-delete WAL segment", "path", oldest.path, "err", err)
-			break
-		}
-		w.diskUsage.Add(-deletedSegSize)
-		w.logger.Warn("force-deleted WAL segment (disk pressure)",
-			"seq", oldest.seq, "path", oldest.path,
-			"limit", limit)
-		w.segments = w.segments[1:]
-	}
+	// Set walFull if still over max (couldn't free enough space — remaining
+	// segments are unflushed).
+	w.walFull.Store(w.diskUsage.Load() > w.cfg.MaxDiskSize)
 }
 
 func (w *Writer) createSegment(seq uint64) (*segmentInfo, error) {
@@ -736,8 +801,8 @@ func (w *Writer) createSegment(seq uint64) (*segmentInfo, error) {
 		file:   f,
 		size:   0,
 		path:   path,
-		minSeq: seq,
-		maxSeq: seq,
+		minSeq: math.MaxUint64,
+		maxSeq: 0,
 	}, nil
 }
 
@@ -766,8 +831,8 @@ func (w *Writer) openSegment(seq uint64, forAppend bool) (*segmentInfo, error) {
 		file:   f,
 		size:   stat.Size(),
 		path:   path,
-		minSeq: seq,
-		maxSeq: seq,
+		minSeq: math.MaxUint64,
+		maxSeq: 0,
 	}, nil
 }
 
@@ -784,8 +849,8 @@ func (w *Writer) openSegmentReadOnly(seq uint64) (*segmentInfo, error) {
 		seq:    seq,
 		size:   stat.Size(),
 		path:   path,
-		minSeq: seq,
-		maxSeq: seq,
+		minSeq: math.MaxUint64,
+		maxSeq: 0,
 	}, nil
 }
 
@@ -910,6 +975,24 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 				maxSeq = entry.Sequence + 1
 			}
 
+			// Record segment minSeq/maxSeq for Start() to apply later
+			// (w.segments is not populated yet during Replay).
+			if w.replayedMinMax == nil {
+				w.replayedMinMax = make(map[uint64][2]uint64)
+			}
+			mm, exists := w.replayedMinMax[seq]
+			if !exists {
+				mm = [2]uint64{entry.Sequence, entry.Sequence}
+			} else {
+				if entry.Sequence < mm[0] {
+					mm[0] = entry.Sequence
+				}
+				if entry.Sequence > mm[1] {
+					mm[1] = entry.Sequence
+				}
+			}
+			w.replayedMinMax[seq] = mm
+
 			offset += entrySize
 			lastValid = offset
 			return true
@@ -946,6 +1029,8 @@ func (w *Writer) Replay(fn func(entry Entry, segmentSeq uint64, fileOffset int64
 }
 
 func (w *Writer) TotalDiskSize() int64 {
+	w.segMu.Lock()
+	defer w.segMu.Unlock()
 	var total int64
 	for _, seg := range w.segments {
 		total += seg.size
@@ -954,5 +1039,7 @@ func (w *Writer) TotalDiskSize() int64 {
 }
 
 func (w *Writer) SegmentCount() int {
+	w.segMu.Lock()
+	defer w.segMu.Unlock()
 	return len(w.segments)
 }

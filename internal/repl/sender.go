@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/klaudworks/klite/internal/clock"
 )
 
 var errDisconnected = errors.New("repl: standby disconnected")
@@ -34,6 +36,11 @@ type Sender struct {
 	logger     *slog.Logger
 	ackTimeout time.Duration
 	connected  bool
+	clk        clock.Clock
+
+	// S3FlushWatermarkFn returns the current S3 flush watermark. If nil,
+	// the watermark is always 0. Set by the caller who owns the WAL writer.
+	S3FlushWatermarkFn func() uint64
 
 	closeOnce sync.Once
 	done      chan struct{} // closed when ackReader exits
@@ -41,12 +48,15 @@ type Sender struct {
 
 // NewSender creates a Sender for the given connection. It starts the ACK
 // reader goroutine. The caller must call Close() when done.
-func NewSender(conn net.Conn, ackTimeout time.Duration, logger *slog.Logger) *Sender {
+func NewSender(conn net.Conn, ackTimeout time.Duration, logger *slog.Logger, clk clock.Clock) *Sender {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if ackTimeout == 0 {
 		ackTimeout = 5 * time.Second
+	}
+	if clk == nil {
+		clk = clock.RealClock{}
 	}
 	s := &Sender{
 		conn:       conn,
@@ -54,6 +64,7 @@ func NewSender(conn net.Conn, ackTimeout time.Duration, logger *slog.Logger) *Se
 		logger:     logger,
 		ackTimeout: ackTimeout,
 		connected:  true,
+		clk:        clk,
 		done:       make(chan struct{}),
 	}
 	go s.ackReader()
@@ -65,7 +76,11 @@ func NewSender(conn net.Conn, ackTimeout time.Duration, logger *slog.Logger) *Se
 func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 	ch := make(chan error, 1)
 
-	payload := MarshalWALBatch(firstSeq, lastSeq, countEntries(batch), batch)
+	var watermark uint64
+	if s.S3FlushWatermarkFn != nil {
+		watermark = s.S3FlushWatermarkFn()
+	}
+	payload := MarshalWALBatch(firstSeq, lastSeq, countEntries(batch), watermark, batch)
 
 	// Register the pending ACK entry BEFORE writing to the wire.
 	// If the write succeeds, the ackReader may receive the ACK
@@ -82,7 +97,7 @@ func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 
 	s.writeMu.Lock()
 	if s.conn != nil {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.ackTimeout))
+		_ = s.conn.SetWriteDeadline(s.clk.Now().Add(s.ackTimeout))
 	}
 	writeErr := WriteFrame(s.conn, MsgWALBatch, payload)
 	s.writeMu.Unlock()
@@ -100,7 +115,7 @@ func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 	}
 
 	// Start ACK timeout timer
-	time.AfterFunc(s.ackTimeout, func() {
+	s.clk.AfterFunc(s.ackTimeout, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.pending == nil {
@@ -120,7 +135,7 @@ func (s *Sender) Send(batch []byte, firstSeq, lastSeq uint64) <-chan error {
 func (s *Sender) SendMeta(entry []byte) {
 	s.writeMu.Lock()
 	if s.conn != nil {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.ackTimeout))
+		_ = s.conn.SetWriteDeadline(s.clk.Now().Add(s.ackTimeout))
 	}
 	err := WriteFrame(s.conn, MsgMetaEntry, entry)
 	s.writeMu.Unlock()
@@ -136,7 +151,7 @@ func (s *Sender) SendSnapshot(walSeqAfter uint64, metadataLog []byte) error {
 
 	s.writeMu.Lock()
 	if s.conn != nil {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.ackTimeout))
+		_ = s.conn.SetWriteDeadline(s.clk.Now().Add(s.ackTimeout))
 	}
 	err := WriteFrame(s.conn, MsgSnapshot, payload)
 	s.writeMu.Unlock()
@@ -147,11 +162,15 @@ func (s *Sender) SendSnapshot(walSeqAfter uint64, metadataLog []byte) error {
 // SendKeepalive writes an empty WAL_BATCH frame (keepalive) to the standby.
 // Unlike Send, it does not register a pending entry or start a timeout timer.
 func (s *Sender) SendKeepalive() {
-	payload := MarshalWALBatch(0, 0, 0, nil)
+	var watermark uint64
+	if s.S3FlushWatermarkFn != nil {
+		watermark = s.S3FlushWatermarkFn()
+	}
+	payload := MarshalWALBatch(0, 0, 0, watermark, nil)
 
 	s.writeMu.Lock()
 	if s.conn != nil {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.ackTimeout))
+		_ = s.conn.SetWriteDeadline(s.clk.Now().Add(s.ackTimeout))
 	}
 	err := WriteFrame(s.conn, MsgWALBatch, payload)
 	s.writeMu.Unlock()
