@@ -123,13 +123,10 @@ func (e *Elector) Run(ctx context.Context, cb lease.Callbacks) error {
 			interval = e.cfg.RenewInterval
 		}
 
-		ticker := e.cfg.Clock.NewTicker(interval)
 		select {
 		case <-ctx.Done():
-			ticker.Stop()
 			return ctx.Err()
-		case <-ticker.C:
-			ticker.Stop()
+		case <-e.cfg.Clock.After(interval):
 		}
 
 		e.mu.Lock()

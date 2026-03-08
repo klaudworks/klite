@@ -6,4 +6,5 @@ var (
 	ErrCRCMismatch = errors.New("wal: CRC mismatch")
 	ErrCorrupted   = errors.New("wal: corrupted entry")
 	ErrClosed      = errors.New("wal: writer closed")
+	ErrWALFull     = errors.New("wal: disk full, unflushed segments prevent cleanup")
 )

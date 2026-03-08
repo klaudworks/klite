@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -757,14 +758,16 @@ func TestWriteErrorSignalsAllWaitersAsSuccessful(t *testing.T) {
 	}
 }
 
-func TestTryCleanupSegments(t *testing.T) {
+func TestCleanSegments_NoS3DeletesAll(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
 	idx := NewIndex()
 	cfg := DefaultWriterConfig()
 	cfg.Dir = dir
-	cfg.SegmentMaxBytes = 200 // small segments to force rotation
+	cfg.SegmentMaxBytes = 200  // small segments to force rotation
+	cfg.MaxDiskSize = 500      // small max to trigger disk pressure
+	cfg.S3Configured = false   // no S3 — all segments are eligible
 	cfg.FsyncEnabled = false
 	cfg.Clock = &clock.FakeClock{}
 
@@ -778,9 +781,8 @@ func TestTryCleanupSegments(t *testing.T) {
 	defer w.Stop()
 
 	topicID := [16]byte{1, 2, 3}
-	tp := TopicPartition{TopicID: topicID, Partition: 0}
 
-	// Write enough entries to force segment rotation
+	// Write enough entries to force segment rotation and exceed max disk
 	for i := 0; i < 20; i++ {
 		batch := makeTestBatch(1, int64(1000+i))
 		entry := &Entry{
@@ -794,26 +796,17 @@ func TestTryCleanupSegments(t *testing.T) {
 		}
 	}
 
-	// Count WAL files on disk before cleanup
-	filesBefore := countWALFiles(t, dir)
-	if filesBefore < 2 {
-		t.Skipf("need at least 2 segment files for test, got %d", filesBefore)
-	}
-
-	// Prune all entries from the index for this partition
-	idx.PruneBefore(tp, 100) // prune everything (all offsets < 100)
-
 	// Signal cleanup and wait for it to process
 	w.TryCleanupSegments()
-	time.Sleep(50 * time.Millisecond) // allow writer goroutine to process
+	time.Sleep(50 * time.Millisecond)
 
-	// Verify by counting files on disk (avoids racing on w.segments)
-	filesAfter := countWALFiles(t, dir)
-	if filesAfter >= filesBefore {
-		t.Errorf("expected WAL files to be cleaned up: before=%d, after=%d", filesBefore, filesAfter)
+	// Verify disk usage dropped to around MaxDiskSize
+	if w.diskUsage.Load() > cfg.MaxDiskSize+cfg.SegmentMaxBytes {
+		t.Errorf("expected disk usage near max, got %d (max=%d)", w.diskUsage.Load(), cfg.MaxDiskSize)
 	}
 
 	// The current segment should always be preserved
+	filesAfter := countWALFiles(t, dir)
 	if filesAfter < 1 {
 		t.Error("current segment was deleted")
 	}
@@ -904,7 +897,7 @@ func TestUnflushedBytes(t *testing.T) {
 	})
 }
 
-func TestDiskPressure(t *testing.T) {
+func TestDiskUsageTracking(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -915,7 +908,7 @@ func TestDiskPressure(t *testing.T) {
 		Dir:             walDir,
 		SyncInterval:    1 * time.Millisecond,
 		SegmentMaxBytes: 64 * 1024 * 1024,
-		MaxDiskSize:     10000, // small for testing
+		MaxDiskSize:     10000,
 		FsyncEnabled:    false,
 		Clock:           clock.RealClock{},
 	}
@@ -929,14 +922,12 @@ func TestDiskPressure(t *testing.T) {
 	}
 	defer w.Stop()
 
-	// Initially zero pressure
-	p := w.DiskPressure()
-	if p != 0 {
-		t.Errorf("initial DiskPressure: got %f, want 0", p)
+	// Initially zero usage
+	if w.diskUsage.Load() != 0 {
+		t.Errorf("initial diskUsage: got %d, want 0", w.diskUsage.Load())
 	}
 
 	topicID := [16]byte{1, 2, 3}
-	// Write entries to increase disk usage
 	for i := 0; i < 10; i++ {
 		entry := &Entry{
 			TopicID:   topicID,
@@ -949,31 +940,40 @@ func TestDiskPressure(t *testing.T) {
 		}
 	}
 
-	// Pressure should be positive
-	p = w.DiskPressure()
-	if p <= 0 {
-		t.Errorf("DiskPressure after writes: got %f, want > 0", p)
-	}
-
 	usage := w.diskUsage.Load()
 	total := w.TotalDiskSize()
+	if usage <= 0 {
+		t.Errorf("diskUsage after writes: got %d, want > 0", usage)
+	}
 	if usage != total {
 		t.Errorf("diskUsage (%d) != TotalDiskSize (%d)", usage, total)
 	}
 }
 
-func TestWALCleanupAfterPrune(t *testing.T) {
+func TestCleanSegments_DeletesEligibleOverMax(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
 
 	idx := NewIndex()
+	// Each entry is ~105 bytes. SegmentMaxBytes=200 means ~2 entries per segment.
+	// 20 entries = ~10 segments = ~2100 bytes total. MaxDiskSize=2100 lets us
+	// write everything, then setting watermark makes segments eligible, and the
+	// writer goroutine will cleanup on the next cycle since diskUsage > maxDisk
+	// won't be true. Instead, use MaxDiskSize=1500 so we're over max once we
+	// have ~15+ segments-worth of data. The walFull flag will be set, but since
+	// we're not S3-eligible yet, writes would block. Instead use a simpler
+	// approach: write entries, stop the writer, modify MaxDiskSize, restart.
+	//
+	// Actually the simplest approach: set MaxDiskSize small, set watermark high
+	// BEFORE writing so segments become eligible as they rotate.
 	cfg := WriterConfig{
 		Dir:             walDir,
 		SyncInterval:    1 * time.Millisecond,
-		SegmentMaxBytes: 200, // small to force rotation
-		MaxDiskSize:     100 * 1024 * 1024,
+		SegmentMaxBytes: 200,
+		MaxDiskSize:     500,
+		S3Configured:    true,
 		FsyncEnabled:    false,
 		Clock:           clock.RealClock{},
 	}
@@ -987,10 +987,12 @@ func TestWALCleanupAfterPrune(t *testing.T) {
 	}
 	defer w.Stop()
 
-	topicID := [16]byte{1, 2, 3}
-	tp := TopicPartition{TopicID: topicID, Partition: 0}
+	// Set watermark very high so all segments are eligible from the start
+	w.SetS3FlushWatermark(1000000)
+	time.Sleep(20 * time.Millisecond) // let cleanup signal process
 
-	// Write enough to create multiple segments
+	topicID := [16]byte{1, 2, 3}
+
 	for i := 0; i < 20; i++ {
 		entry := &Entry{
 			TopicID:   topicID,
@@ -1003,30 +1005,19 @@ func TestWALCleanupAfterPrune(t *testing.T) {
 		}
 	}
 
-	// Track disk usage before prune
-	usageBefore := w.diskUsage.Load()
-
-	filesBefore := countWALFiles(t, walDir)
-	if filesBefore < 2 {
-		t.Skipf("need at least 2 segments, got %d", filesBefore)
-	}
-
-	// Simulate S3 flush: prune the WAL index
-	idx.PruneBefore(tp, 100)
-
-	// Trigger cleanup
-	w.TryCleanupSegments()
+	// Wait for cleanup to process (triggered after each write batch)
 	time.Sleep(100 * time.Millisecond)
 
-	filesAfter := countWALFiles(t, walDir)
-	if filesAfter >= filesBefore {
-		t.Errorf("expected cleanup to delete segments: before=%d, after=%d", filesBefore, filesAfter)
+	// Disk usage should be around MaxDiskSize (segments were deleted as disk filled)
+	usage := w.diskUsage.Load()
+	if usage > cfg.MaxDiskSize+cfg.SegmentMaxBytes {
+		t.Errorf("expected disk usage near max %d, got %d", cfg.MaxDiskSize, usage)
 	}
 
-	// diskUsage should have decreased
-	usageAfter := w.diskUsage.Load()
-	if usageAfter >= usageBefore {
-		t.Errorf("diskUsage should decrease after cleanup: before=%d, after=%d", usageBefore, usageAfter)
+	// Should have fewer files than if nothing was cleaned up
+	filesAfter := countWALFiles(t, walDir)
+	if filesAfter > 10 {
+		t.Errorf("expected cleanup to keep files near max disk, got %d files", filesAfter)
 	}
 }
 
@@ -1228,5 +1219,294 @@ func TestIndexConcurrentAccess(t *testing.T) {
 	// Sanity check: MaxOffset should be positive (entries were added).
 	if idx.MaxOffset(tp) == 0 {
 		t.Error("MaxOffset should be > 0 after concurrent adds")
+	}
+}
+
+// TestCleanSegments_DoesNotDeleteUnflushed verifies that with S3 configured,
+// segments whose maxSeq >= s3FlushWatermark are NOT deleted even under disk
+// pressure. Only segments fully flushed to S3 (maxSeq < watermark) are eligible.
+func TestCleanSegments_DoesNotDeleteUnflushed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	idx := NewIndex()
+	cfg := WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    1 * time.Millisecond,
+		SegmentMaxBytes: 200,  // small segments to force rotation
+		MaxDiskSize:     500,  // small max to trigger disk pressure
+		S3Configured:    true, // S3 mode: must respect watermark
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+	}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// Watermark at 0: nothing is flushed to S3, no segments are eligible.
+	// (Default watermark is 0.)
+
+	topicID := [16]byte{1, 2, 3}
+
+	// Write enough to exceed MaxDiskSize and cause rotation.
+	for i := 0; i < 20; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		// Once walFull is set, Append returns ErrWALFull. That's expected.
+		err := w.Append(entry)
+		if err == ErrWALFull {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// WAL should be full since no segments are eligible for deletion.
+	if !w.IsWALFull() {
+		// Might not be full if we didn't write enough — but we should at
+		// least verify no segments were wrongly deleted.
+		t.Log("WAL not full yet (few segments written)")
+	}
+
+	// All segments should still exist — none should have been deleted.
+	segCount := w.SegmentCount()
+	if segCount < 2 {
+		t.Errorf("expected multiple segments, got %d (segments were wrongly deleted)", segCount)
+	}
+
+	diskUsage := w.diskUsage.Load()
+	if diskUsage < cfg.MaxDiskSize {
+		t.Errorf("expected disk usage >= max (%d), got %d (segments deleted despite being unflushed)", cfg.MaxDiskSize, diskUsage)
+	}
+}
+
+// TestWALFull_BackPressure verifies that Append and AppendAsync return
+// ErrWALFull when the WAL is at max capacity with unflushed segments,
+// and that the flag clears after advancing the watermark.
+func TestWALFull_BackPressure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+
+	idx := NewIndex()
+	cfg := WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    1 * time.Millisecond,
+		SegmentMaxBytes: 200,
+		MaxDiskSize:     500,
+		S3Configured:    true,
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+	}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	topicID := [16]byte{1, 2, 3}
+
+	// Write until WAL full.
+	var lastSeq uint64
+	for i := 0; i < 100; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		err := w.Append(entry)
+		if err == ErrWALFull {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+		lastSeq = entry.Sequence
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	if !w.IsWALFull() {
+		t.Fatal("expected WAL to be full")
+	}
+
+	// Both Append and AppendAsync should return ErrWALFull.
+	entry := &Entry{
+		TopicID:   topicID,
+		Partition: 0,
+		Offset:    999,
+		Data:      makeTestBatch(1, 1000),
+	}
+	if err := w.Append(entry); err != ErrWALFull {
+		t.Errorf("Append: expected ErrWALFull, got %v", err)
+	}
+	if _, err := w.AppendAsync(entry); err != ErrWALFull {
+		t.Errorf("AppendAsync: expected ErrWALFull, got %v", err)
+	}
+
+	// Advance watermark past all written entries — this makes segments eligible.
+	w.SetS3FlushWatermark(lastSeq + 1)
+	time.Sleep(100 * time.Millisecond) // let cleanup run
+
+	// walFull should clear after cleanup freed space.
+	if w.IsWALFull() {
+		t.Error("expected WAL full to clear after watermark advance")
+	}
+
+	// Should be able to write again.
+	entry = &Entry{
+		TopicID:   topicID,
+		Partition: 0,
+		Offset:    1000,
+		Data:      makeTestBatch(1, 1000),
+	}
+	if err := w.Append(entry); err != nil {
+		t.Errorf("Append after recovery: %v", err)
+	}
+}
+
+// TestSegmentMinMaxSeq_Append verifies that segment minSeq/maxSeq are
+// correctly updated as entries are appended.
+func TestSegmentMinMaxSeq_Append(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	idx := NewIndex()
+	cfg := DefaultWriterConfig()
+	cfg.Dir = dir
+	cfg.SegmentMaxBytes = 1024 * 1024 // large so no rotation
+	cfg.FsyncEnabled = false
+	cfg.Clock = &clock.FakeClock{}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	topicID := [16]byte{1, 2, 3}
+
+	// Write a few entries.
+	for i := 0; i < 5; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	// Check the current segment's minSeq/maxSeq.
+	w.segMu.Lock()
+	seg := w.current
+	minSeq := seg.minSeq
+	maxSeq := seg.maxSeq
+	w.segMu.Unlock()
+
+	// Sequences start from 0 (first Append gets seq 0).
+	if minSeq != 0 {
+		t.Errorf("minSeq: got %d, want 0", minSeq)
+	}
+	if maxSeq != 4 {
+		t.Errorf("maxSeq: got %d, want 4", maxSeq)
+	}
+}
+
+// TestSegmentMinMaxSeq_Replay verifies that segment minSeq/maxSeq are
+// correctly rebuilt from actual entries during Replay().
+func TestSegmentMinMaxSeq_Replay(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	idx := NewIndex()
+	cfg := DefaultWriterConfig()
+	cfg.Dir = dir
+	cfg.SegmentMaxBytes = 200 // small to force rotation
+	cfg.FsyncEnabled = false
+	cfg.Clock = &clock.FakeClock{}
+
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	topicID := [16]byte{1, 2, 3}
+
+	// Write enough entries to create multiple segments.
+	for i := 0; i < 10; i++ {
+		entry := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	w.Stop()
+
+	// Create a fresh writer and replay.
+	idx2 := NewIndex()
+	w2, err := NewWriter(cfg, idx2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w2.Replay(func(entry Entry, segmentSeq uint64, fileOffset int64) error {
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// After replay, all segments should have valid minSeq/maxSeq
+	// (not the initial math.MaxUint64/0).
+	for _, seg := range w2.segments {
+		// Skip truly empty segments (if any).
+		if seg.minSeq == math.MaxUint64 {
+			continue
+		}
+		if seg.minSeq > seg.maxSeq {
+			t.Errorf("segment %d: minSeq (%d) > maxSeq (%d)", seg.seq, seg.minSeq, seg.maxSeq)
+		}
+	}
+
+	// The first segment should have minSeq = 0 (first WAL entry).
+	if len(w2.segments) > 0 && w2.segments[0].minSeq != 0 {
+		t.Errorf("first segment minSeq: got %d, want 0", w2.segments[0].minSeq)
 	}
 }

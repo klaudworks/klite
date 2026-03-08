@@ -519,7 +519,7 @@ func TestAppendReplicated(t *testing.T) {
 	}
 	serialized := MarshalEntry(entry)
 
-	written, err := w.AppendReplicated(serialized)
+	_, written, err := w.AppendReplicated(serialized)
 	if err != nil {
 		t.Fatalf("AppendReplicated: %v", err)
 	}
@@ -577,7 +577,7 @@ func TestAppendReplicatedSegmentRotation(t *testing.T) {
 			Offset:    int64(i),
 			Data:      makeTestBatch(1, 1000),
 		}
-		written, err := w.AppendReplicated(MarshalEntry(entry))
+		_, written, err := w.AppendReplicated(MarshalEntry(entry))
 		if err != nil {
 			t.Fatalf("AppendReplicated %d: %v", i, err)
 		}
@@ -633,7 +633,7 @@ func TestAppendReplicatedDuplicateSkip(t *testing.T) {
 		Offset:    50,
 		Data:      makeTestBatch(1, 1000),
 	}
-	written, err := w.AppendReplicated(MarshalEntry(old))
+	_, written, err := w.AppendReplicated(MarshalEntry(old))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +649,7 @@ func TestAppendReplicatedDuplicateSkip(t *testing.T) {
 		Offset:    100,
 		Data:      makeTestBatch(1, 1000),
 	}
-	written, err = w.AppendReplicated(MarshalEntry(cur))
+	_, written, err = w.AppendReplicated(MarshalEntry(cur))
 	if err != nil {
 		t.Fatal(err)
 	}

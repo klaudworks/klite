@@ -16,6 +16,7 @@ import (
 	smithy "github.com/aws/smithy-go"
 	"github.com/stretchr/testify/require"
 
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/lease"
 	s3client "github.com/klaudworks/klite/internal/s3"
 )
@@ -94,7 +95,9 @@ func TestS3LeaseAcquireEmpty(t *testing.T) {
 
 func TestS3LeaseRenew(t *testing.T) {
 	mem := s3client.NewInMemoryS3()
+	clk := clock.NewFakeClock(time.Now())
 	cfg := fastCfg(mem, "node1")
+	cfg.Clock = clk
 
 	e := New(cfg)
 	elected := make(chan struct{}, 1)
@@ -105,22 +108,30 @@ func TestS3LeaseRenew(t *testing.T) {
 		},
 	})
 
+	// Advance past RetryInterval so the standby fires its first acquire attempt.
+	clk.WaitForTimers(1, time.Second)
+	clk.Advance(cfg.RetryInterval)
+
 	waitFor(t, elected, 2*time.Second, "OnElected")
 
-	// Get the initial ETag
+	// Get the initial lease body
 	data, _ := mem.GetRaw(testKey)
 	var body1 LeaseBody
 	require.NoError(t, json.Unmarshal(data, &body1))
 
-	// Wait for at least one renewal
-	time.Sleep(cfg.RenewInterval * 3)
+	// Advance past RenewInterval to trigger a renewal.
+	clk.WaitForTimers(1, time.Second)
+	clk.Advance(cfg.RenewInterval)
+
+	// Let the elector goroutine process the renewal.
+	clk.WaitForTimers(1, time.Second)
 
 	data2, _ := mem.GetRaw(testKey)
 	var body2 LeaseBody
 	require.NoError(t, json.Unmarshal(data2, &body2))
 
 	require.Equal(t, body1.Epoch, body2.Epoch, "epoch should NOT change on renewal")
-	require.True(t, body2.RenewedAt.After(body1.RenewedAt) || body2.RenewedAt.Equal(body1.RenewedAt),
+	require.True(t, body2.RenewedAt.After(body1.RenewedAt),
 		"renewedAt should be updated")
 }
 
@@ -304,7 +315,9 @@ func TestS3LeaseRenewTransientError(t *testing.T) {
 
 func TestS3LeaseEpochIncrement(t *testing.T) {
 	mem := s3client.NewInMemoryS3()
+	clk := clock.NewFakeClock(time.Now())
 	cfg := fastCfg(mem, "node1")
+	cfg.Clock = clk
 
 	e := New(cfg)
 	elected := make(chan struct{}, 1)
@@ -315,6 +328,10 @@ func TestS3LeaseEpochIncrement(t *testing.T) {
 		},
 	})
 
+	// Advance past RetryInterval so the standby fires its first acquire attempt.
+	clk.WaitForTimers(1, time.Second)
+	clk.Advance(cfg.RetryInterval)
+
 	waitFor(t, elected, 2*time.Second, "OnElected")
 
 	// Check initial epoch
@@ -323,8 +340,12 @@ func TestS3LeaseEpochIncrement(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &body))
 	require.Equal(t, int64(1), body.Epoch)
 
-	// Wait for a renewal
-	time.Sleep(cfg.RenewInterval * 3)
+	// Advance past RenewInterval to trigger a renewal.
+	clk.WaitForTimers(1, time.Second)
+	clk.Advance(cfg.RenewInterval)
+
+	// Let the elector goroutine process the renewal.
+	clk.WaitForTimers(1, time.Second)
 
 	data2, _ := mem.GetRaw(testKey)
 	var body2 LeaseBody

@@ -625,15 +625,6 @@ func (pd *PartData) AdvanceLogStartOffset(newOffset int64, metaLog *metadata.Log
 	pd.trimBatchesLocked(newOffset)
 	pd.mu.Unlock()
 
-	if pd.walIndex != nil {
-		tp := wal.TopicPartition{TopicID: pd.TopicID, Partition: pd.Index}
-		pd.walIndex.PruneBefore(tp, newOffset)
-	}
-
-	if pd.walWriter != nil {
-		pd.walWriter.TryCleanupSegments()
-	}
-
 	return nil
 }
 
