@@ -1,11 +1,16 @@
 package cluster
 
 import (
+	"context"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/klaudworks/klite/internal/chunk"
+	"github.com/klaudworks/klite/internal/clock"
+	"github.com/klaudworks/klite/internal/wal"
 )
 
 var testPool = chunk.NewPool(64*1024*1024, DefaultMaxMessageBytes)
@@ -1730,4 +1735,599 @@ func TestReattachSealedChunks(t *testing.T) {
 	if allSealed[0] != detached[0] {
 		t.Error("reattached chunk should be first (prepended)")
 	}
+}
+
+// --- Cold-path tests (WAL and S3 fallback) ---
+
+// mockS3Fetcher implements S3Fetcher for unit testing.
+type mockS3Fetcher struct {
+	batches []S3BatchData
+	err     error
+	called  bool
+}
+
+func (m *mockS3Fetcher) FetchBatches(_ context.Context, _ string, _ [16]byte, _ int32, _ int64, _ int32) ([]S3BatchData, error) {
+	m.called = true
+	return m.batches, m.err
+}
+
+// newTestWAL creates a WAL writer and index in a temp dir for testing.
+// The writer is started and must be stopped by the caller.
+func newTestWAL(t *testing.T) (*wal.Writer, *wal.Index) {
+	t.Helper()
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	idx := wal.NewIndex()
+	w, err := wal.NewWriter(wal.WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    1 * time.Millisecond,
+		SegmentMaxBytes: 64 * 1024 * 1024,
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+	}, idx)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { w.Stop() })
+	return w, idx
+}
+
+// appendToWAL writes a batch to the WAL and returns the raw data used.
+func appendToWAL(t *testing.T, w *wal.Writer, topicID [16]byte, partition int32, baseOffset int64, numRecords int32, maxTS int64) []byte {
+	t.Helper()
+	raw := makeSimpleBatch(numRecords, maxTS)
+	AssignOffset(raw, baseOffset)
+	entry := &wal.Entry{
+		TopicID:   topicID,
+		Partition: partition,
+		Offset:    baseOffset,
+		Data:      raw,
+	}
+	if err := w.Append(entry); err != nil {
+		t.Fatalf("WAL Append: %v", err)
+	}
+	return raw
+}
+
+func TestReadFromWAL(t *testing.T) {
+	t.Parallel()
+
+	topicID := [16]byte{10, 20, 30}
+
+	t.Run("single batch", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		raw := appendToWAL(t, w, topicID, 0, 0, 3, 1000)
+
+		tp := wal.TopicPartition{TopicID: topicID, Partition: 0}
+		entries := idx.Lookup(tp, 0, 1024*1024)
+		if len(entries) != 1 {
+			t.Fatalf("index entries: got %d, want 1", len(entries))
+		}
+
+		result := readFromWAL(w, entries)
+		if len(result) != 1 {
+			t.Fatalf("readFromWAL: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", result[0].BaseOffset)
+		}
+		if result[0].LastOffsetDelta != 2 {
+			t.Errorf("LastOffsetDelta: got %d, want 2", result[0].LastOffsetDelta)
+		}
+		if result[0].NumRecords != 3 {
+			t.Errorf("NumRecords: got %d, want 3", result[0].NumRecords)
+		}
+		if len(result[0].RawBytes) != len(raw) {
+			t.Errorf("RawBytes length: got %d, want %d", len(result[0].RawBytes), len(raw))
+		}
+	})
+
+	t.Run("multiple batches", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		appendToWAL(t, w, topicID, 0, 0, 3, 1000) // offsets 0-2
+		appendToWAL(t, w, topicID, 0, 3, 2, 2000) // offsets 3-4
+		appendToWAL(t, w, topicID, 0, 5, 1, 3000) // offset 5
+
+		tp := wal.TopicPartition{TopicID: topicID, Partition: 0}
+		entries := idx.Lookup(tp, 0, 1024*1024)
+		if len(entries) != 3 {
+			t.Fatalf("index entries: got %d, want 3", len(entries))
+		}
+
+		result := readFromWAL(w, entries)
+		if len(result) != 3 {
+			t.Fatalf("readFromWAL: got %d batches, want 3", len(result))
+		}
+		if result[0].BaseOffset != 0 || result[1].BaseOffset != 3 || result[2].BaseOffset != 5 {
+			t.Errorf("BaseOffsets: got [%d,%d,%d], want [0,3,5]",
+				result[0].BaseOffset, result[1].BaseOffset, result[2].BaseOffset)
+		}
+	})
+
+	t.Run("lookup from middle offset", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		appendToWAL(t, w, topicID, 0, 0, 3, 1000) // offsets 0-2
+		appendToWAL(t, w, topicID, 0, 3, 2, 2000) // offsets 3-4
+
+		tp := wal.TopicPartition{TopicID: topicID, Partition: 0}
+		entries := idx.Lookup(tp, 3, 1024*1024)
+		if len(entries) != 1 {
+			t.Fatalf("index entries from offset 3: got %d, want 1", len(entries))
+		}
+
+		result := readFromWAL(w, entries)
+		if len(result) != 1 {
+			t.Fatalf("readFromWAL: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 3 {
+			t.Errorf("BaseOffset: got %d, want 3", result[0].BaseOffset)
+		}
+	})
+
+	t.Run("empty entries returns nil", func(t *testing.T) {
+		t.Parallel()
+		w, _ := newTestWAL(t)
+		result := readFromWAL(w, nil)
+		if len(result) != 0 {
+			t.Errorf("readFromWAL(nil entries): got %d batches, want 0", len(result))
+		}
+	})
+}
+
+func TestReadFromS3(t *testing.T) {
+	t.Parallel()
+
+	topicID := [16]byte{10, 20, 30}
+
+	t.Run("returns batches from S3", func(t *testing.T) {
+		t.Parallel()
+		raw := makeSimpleBatch(3, 1000)
+		AssignOffset(raw, 0)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 0, LastOffsetDelta: 2},
+			},
+		}
+
+		result := readFromS3(mock, "test-topic", topicID, 0, 0, 1024*1024)
+		if !mock.called {
+			t.Fatal("S3Fetcher.FetchBatches was not called")
+		}
+		if len(result) != 1 {
+			t.Fatalf("readFromS3: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", result[0].BaseOffset)
+		}
+		if result[0].NumRecords != 3 {
+			t.Errorf("NumRecords: got %d, want 3", result[0].NumRecords)
+		}
+	})
+
+	t.Run("multiple batches from S3", func(t *testing.T) {
+		t.Parallel()
+		raw0 := makeSimpleBatch(3, 1000)
+		AssignOffset(raw0, 0)
+		raw1 := makeSimpleBatch(2, 2000)
+		AssignOffset(raw1, 3)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw0, BaseOffset: 0, LastOffsetDelta: 2},
+				{RawBytes: raw1, BaseOffset: 3, LastOffsetDelta: 1},
+			},
+		}
+
+		result := readFromS3(mock, "test-topic", topicID, 0, 0, 1024*1024)
+		if len(result) != 2 {
+			t.Fatalf("readFromS3: got %d batches, want 2", len(result))
+		}
+		if result[1].BaseOffset != 3 {
+			t.Errorf("second batch BaseOffset: got %d, want 3", result[1].BaseOffset)
+		}
+	})
+
+	t.Run("S3 error returns nil", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockS3Fetcher{err: fmt.Errorf("network error")}
+
+		result := readFromS3(mock, "test-topic", topicID, 0, 0, 1024*1024)
+		if len(result) != 0 {
+			t.Errorf("readFromS3 on error: got %d batches, want 0", len(result))
+		}
+	})
+
+	t.Run("S3 empty response returns nil", func(t *testing.T) {
+		t.Parallel()
+		mock := &mockS3Fetcher{batches: nil}
+
+		result := readFromS3(mock, "test-topic", topicID, 0, 0, 1024*1024)
+		if len(result) != 0 {
+			t.Errorf("readFromS3 empty: got %d batches, want 0", len(result))
+		}
+	})
+
+	t.Run("S3 skips unparseable batches", func(t *testing.T) {
+		t.Parallel()
+		goodRaw := makeSimpleBatch(2, 1000)
+		AssignOffset(goodRaw, 0)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: []byte{0x00}, BaseOffset: 0, LastOffsetDelta: 0}, // too short to parse
+				{RawBytes: goodRaw, BaseOffset: 2, LastOffsetDelta: 1},
+			},
+		}
+
+		result := readFromS3(mock, "test-topic", topicID, 0, 0, 1024*1024)
+		if len(result) != 1 {
+			t.Fatalf("readFromS3: got %d batches, want 1 (bad batch skipped)", len(result))
+		}
+		if result[0].BaseOffset != 2 {
+			t.Errorf("BaseOffset: got %d, want 2", result[0].BaseOffset)
+		}
+	})
+}
+
+func TestFetchFromCold(t *testing.T) {
+	t.Parallel()
+
+	topicID := [16]byte{10, 20, 30}
+
+	t.Run("WAL has data at requested offset", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		appendToWAL(t, w, topicID, 0, 0, 3, 1000)
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", idx, w, nil)
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", result[0].BaseOffset)
+		}
+	})
+
+	t.Run("WAL empty falls through to S3", func(t *testing.T) {
+		t.Parallel()
+		idx := wal.NewIndex()
+
+		raw := makeSimpleBatch(3, 1000)
+		AssignOffset(raw, 0)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 0, LastOffsetDelta: 2},
+			},
+		}
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", idx, nil, mock)
+		if !mock.called {
+			t.Fatal("S3Fetcher was not called when WAL had no data")
+		}
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", result[0].BaseOffset)
+		}
+	})
+
+	t.Run("WAL preferred over S3 when WAL has exact offset", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		appendToWAL(t, w, topicID, 0, 0, 3, 1000)
+
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: makeSimpleBatch(3, 1000), BaseOffset: 0, LastOffsetDelta: 2},
+			},
+		}
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", idx, w, mock)
+		if mock.called {
+			t.Error("S3 should not be called when WAL has data at exact offset")
+		}
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1", len(result))
+		}
+	})
+
+	t.Run("WAL index hit but data starts after offset falls through to S3", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		// WAL only has data at offset 5, consumer requests offset 0
+		appendToWAL(t, w, topicID, 0, 5, 2, 2000)
+
+		raw := makeSimpleBatch(3, 1000)
+		AssignOffset(raw, 0)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 0, LastOffsetDelta: 2},
+			},
+		}
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", idx, w, mock)
+		if !mock.called {
+			t.Fatal("S3 should be called when WAL entry starts after requested offset")
+		}
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", result[0].BaseOffset)
+		}
+	})
+
+	t.Run("S3 empty triggers WAL fallback", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		// WAL has data at offset 5 (starts after requested offset 0)
+		appendToWAL(t, w, topicID, 0, 5, 2, 2000)
+
+		mock := &mockS3Fetcher{batches: nil} // S3 has nothing
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", idx, w, mock)
+		if !mock.called {
+			t.Fatal("S3 should have been tried")
+		}
+		// WAL fallback: WAL has offset 5 which is the best available
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1 (WAL fallback)", len(result))
+		}
+		if result[0].BaseOffset != 5 {
+			t.Errorf("BaseOffset: got %d, want 5 (WAL fallback)", result[0].BaseOffset)
+		}
+	})
+
+	t.Run("nil WAL and nil S3 returns nil", func(t *testing.T) {
+		t.Parallel()
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", nil, nil, nil)
+		if len(result) != 0 {
+			t.Errorf("fetchFromCold(nil, nil): got %d batches, want 0", len(result))
+		}
+	})
+
+	t.Run("nil WAL with S3 data", func(t *testing.T) {
+		t.Parallel()
+		raw := makeSimpleBatch(2, 1000)
+		AssignOffset(raw, 0)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 0, LastOffsetDelta: 1},
+			},
+		}
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", nil, nil, mock)
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1", len(result))
+		}
+	})
+
+	t.Run("WAL has data but no S3 configured", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+		// WAL data starts after requested offset, but no S3 to fall back to
+		appendToWAL(t, w, topicID, 0, 5, 2, 2000)
+
+		result := fetchFromCold(0, 1024*1024, topicID, 0, "test-topic", idx, w, nil)
+		// Without S3, WAL data is returned even if it starts after the requested offset
+		if len(result) != 1 {
+			t.Fatalf("fetchFromCold: got %d batches, want 1", len(result))
+		}
+		if result[0].BaseOffset != 5 {
+			t.Errorf("BaseOffset: got %d, want 5", result[0].BaseOffset)
+		}
+	})
+}
+
+func TestFetchColdPathIntegration(t *testing.T) {
+	t.Parallel()
+
+	topicID := [16]byte{10, 20, 30}
+
+	t.Run("Fetch returns WAL data when chunks are empty", func(t *testing.T) {
+		t.Parallel()
+		w, idx := newTestWAL(t)
+
+		// Write data to WAL but not to chunks
+		raw := makeSimpleBatch(3, 1000)
+		AssignOffset(raw, 0)
+		if err := w.Append(&wal.Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    0,
+			Data:      raw,
+		}); err != nil {
+			t.Fatalf("WAL Append: %v", err)
+		}
+
+		pd := &PartData{
+			Topic:     "test-topic",
+			Index:     0,
+			TopicID:   topicID,
+			chunkPool: testPool,
+			walWriter: w,
+			walIndex:  idx,
+			hw:        3,
+		}
+
+		fr := pd.Fetch(0, 1024*1024)
+		if fr.Err != 0 {
+			t.Errorf("Fetch err: got %d, want 0", fr.Err)
+		}
+		if len(fr.Batches) != 1 {
+			t.Fatalf("Fetch: got %d batches, want 1", len(fr.Batches))
+		}
+		if fr.Batches[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", fr.Batches[0].BaseOffset)
+		}
+		if fr.HW != 3 {
+			t.Errorf("HW: got %d, want 3", fr.HW)
+		}
+	})
+
+	t.Run("Fetch returns S3 data when chunks and WAL are empty", func(t *testing.T) {
+		t.Parallel()
+
+		raw := makeSimpleBatch(3, 1000)
+		AssignOffset(raw, 0)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 0, LastOffsetDelta: 2},
+			},
+		}
+
+		pd := &PartData{
+			Topic:            "test-topic",
+			Index:            0,
+			TopicID:          topicID,
+			chunkPool:        testPool,
+			s3Fetch:          mock,
+			s3FlushWatermark: 3,
+			hw:               3,
+		}
+
+		fr := pd.Fetch(0, 1024*1024)
+		if fr.Err != 0 {
+			t.Errorf("Fetch err: got %d, want 0", fr.Err)
+		}
+		if !mock.called {
+			t.Fatal("S3Fetcher was not called")
+		}
+		if len(fr.Batches) != 1 {
+			t.Fatalf("Fetch: got %d batches, want 1", len(fr.Batches))
+		}
+		if fr.Batches[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", fr.Batches[0].BaseOffset)
+		}
+	})
+
+	t.Run("Fetch returns OffsetOutOfRange for offset below logStart", func(t *testing.T) {
+		t.Parallel()
+
+		pd := &PartData{
+			Topic:     "test-topic",
+			Index:     0,
+			TopicID:   topicID,
+			chunkPool: testPool,
+			logStart:  5,
+			hw:        10,
+		}
+
+		fr := pd.Fetch(3, 1024*1024)
+		if fr.Err != ErrCodeOffsetOutOfRange {
+			t.Errorf("Fetch below logStart: got err=%d, want %d", fr.Err, ErrCodeOffsetOutOfRange)
+		}
+	})
+
+	t.Run("cold-path batches filtered by HW", func(t *testing.T) {
+		t.Parallel()
+
+		raw0 := makeSimpleBatch(3, 1000)
+		AssignOffset(raw0, 0)
+		raw1 := makeSimpleBatch(3, 2000)
+		AssignOffset(raw1, 3)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw0, BaseOffset: 0, LastOffsetDelta: 2},
+				{RawBytes: raw1, BaseOffset: 3, LastOffsetDelta: 2}, // extends to offset 5, past HW=4
+			},
+		}
+
+		pd := &PartData{
+			Topic:            "test-topic",
+			Index:            0,
+			TopicID:          topicID,
+			chunkPool:        testPool,
+			s3Fetch:          mock,
+			s3FlushWatermark: 6,
+			hw:               4,
+		}
+
+		fr := pd.Fetch(0, 1024*1024)
+		if fr.Err != 0 {
+			t.Errorf("Fetch err: got %d, want 0", fr.Err)
+		}
+		// Only the first batch (offsets 0-2) should be returned; second batch (offsets 3-5) extends past HW=4
+		if len(fr.Batches) != 1 {
+			t.Fatalf("Fetch: got %d batches, want 1 (HW filter)", len(fr.Batches))
+		}
+		if fr.Batches[0].BaseOffset != 0 {
+			t.Errorf("BaseOffset: got %d, want 0", fr.Batches[0].BaseOffset)
+		}
+	})
+
+	t.Run("cold-path gap suppression above S3 watermark", func(t *testing.T) {
+		t.Parallel()
+
+		// S3 returns data starting at offset 5, but consumer requests offset 0.
+		// The s3FlushWatermark is 0 (data not flushed to S3), so the gap is
+		// above the watermark and should be suppressed.
+		raw := makeSimpleBatch(3, 2000)
+		AssignOffset(raw, 5)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 5, LastOffsetDelta: 2},
+			},
+		}
+
+		pd := &PartData{
+			Topic:            "test-topic",
+			Index:            0,
+			TopicID:          topicID,
+			chunkPool:        testPool,
+			s3Fetch:          mock,
+			s3FlushWatermark: 0,
+			hw:               10,
+		}
+
+		fr := pd.Fetch(0, 1024*1024)
+		// Gap suppression: cold data starts after requested offset and gap is above S3 watermark
+		if fr.Err != 0 {
+			t.Errorf("Fetch err: got %d, want 0", fr.Err)
+		}
+		if len(fr.Batches) != 0 {
+			t.Errorf("Fetch with cold-path gap: got %d batches, want 0 (gap suppressed)", len(fr.Batches))
+		}
+	})
+
+	t.Run("cold-path data returned when gap is below S3 watermark", func(t *testing.T) {
+		t.Parallel()
+
+		// S3 returns data starting at offset 5, consumer requests offset 0.
+		// The s3FlushWatermark is 10 (all data was flushed), so the gap is
+		// below the watermark and the data should be returned.
+		raw := makeSimpleBatch(3, 2000)
+		AssignOffset(raw, 5)
+		mock := &mockS3Fetcher{
+			batches: []S3BatchData{
+				{RawBytes: raw, BaseOffset: 5, LastOffsetDelta: 2},
+			},
+		}
+
+		pd := &PartData{
+			Topic:            "test-topic",
+			Index:            0,
+			TopicID:          topicID,
+			chunkPool:        testPool,
+			s3Fetch:          mock,
+			s3FlushWatermark: 10,
+			hw:               10,
+		}
+
+		fr := pd.Fetch(0, 1024*1024)
+		if fr.Err != 0 {
+			t.Errorf("Fetch err: got %d, want 0", fr.Err)
+		}
+		if len(fr.Batches) != 1 {
+			t.Fatalf("Fetch: got %d batches, want 1", len(fr.Batches))
+		}
+		if fr.Batches[0].BaseOffset != 5 {
+			t.Errorf("BaseOffset: got %d, want 5", fr.Batches[0].BaseOffset)
+		}
+	})
 }
