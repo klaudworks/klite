@@ -31,7 +31,7 @@ type Config struct {
 	// WAL configuration
 	WALSyncIntervalMs  int   // Fsync batch window in milliseconds (default 2)
 	WALSegmentMaxBytes int64 // Max segment size before rotation (default 64 MiB)
-	WALMaxDiskSize     int64 // Max total WAL on disk (default 4 GiB)
+	WALMaxDiskSize     int64 // Max total WAL on disk (default 1 GiB)
 	ChunkPoolMemory    int64 // Global memory budget for chunk pool (default 512 MiB)
 
 	// S3 configuration (Phase 4)
