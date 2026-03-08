@@ -314,8 +314,8 @@ func TestSessionTimeout(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int16(0), syncResp.ErrorCode)
 
-	// Wait for session timeout
-	time.Sleep(2 * time.Second)
+	// Wait for session timeout (configured to 1s above)
+	time.Sleep(1500 * time.Millisecond)
 
 	// Heartbeat should fail with UNKNOWN_MEMBER_ID (member was removed)
 	hbResp := sendHeartbeat(t, tb.Addr, group, resp2.Generation, resp2.MemberID, nil)

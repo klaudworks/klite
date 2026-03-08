@@ -374,7 +374,8 @@ func TestReplicationDataContinuity(t *testing.T) {
 	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
 
 	// Wait for B to connect as standby receiver
-	time.Sleep(1 * time.Second)
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond)
 
 	// Produce records to A
 	topic := "test-data-continuity"
@@ -387,7 +388,7 @@ func TestReplicationDataContinuity(t *testing.T) {
 	cl.Close()
 
 	// Allow replication to catch up
-	time.Sleep(1 * time.Second)
+	time.Sleep(300 * time.Millisecond)
 
 	// Failover: demote A, promote B
 	pair.ElectorA.Demote()
@@ -421,7 +422,8 @@ func TestReplicationDoubleFailover(t *testing.T) {
 	// Phase 1: A is primary, produce 50 records
 	pair.ElectorA.Elect()
 	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
-	time.Sleep(1 * time.Second) // let standby connect
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
 
 	cl := NewClient(t, pair.Primary.Addr,
 		kgo.AllowAutoTopicCreation(),
@@ -430,14 +432,15 @@ func TestReplicationDoubleFailover(t *testing.T) {
 	)
 	ProduceN(t, cl, topic, 50)
 	cl.Close()
-	time.Sleep(500 * time.Millisecond) // replication catch-up
+	time.Sleep(300 * time.Millisecond) // replication catch-up
 
 	// Phase 2: Failover to B, produce 50 more
 	pair.ElectorA.Demote()
 	waitStandby(t, pair.HealthAddrA, 5*time.Second)
 	pair.ElectorB.Elect()
 	waitPrimary(t, pair.HealthAddrB, 5*time.Second)
-	time.Sleep(1 * time.Second) // let A connect as standby
+	waitStandby(t, pair.HealthAddrA, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
 
 	cl2 := NewClient(t, pair.Standby.Addr,
 		kgo.AllowAutoTopicCreation(),
@@ -452,7 +455,7 @@ func TestReplicationDoubleFailover(t *testing.T) {
 		})
 	}
 	cl2.Close()
-	time.Sleep(500 * time.Millisecond) // replication catch-up
+	time.Sleep(300 * time.Millisecond) // replication catch-up
 
 	// Phase 3: Failover back to A, produce 50 more
 	pair.ElectorB.Demote()
@@ -645,7 +648,8 @@ func TestReplicationGracefulShutdownFastFailover(t *testing.T) {
 	// Elect A as primary
 	pair.ElectorA.Elect()
 	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
-	time.Sleep(1 * time.Second) // let standby connect
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
 
 	// Produce records
 	topic := "test-graceful-failover"
@@ -656,7 +660,7 @@ func TestReplicationGracefulShutdownFastFailover(t *testing.T) {
 	)
 	ProduceN(t, cl, topic, 50)
 	cl.Close()
-	time.Sleep(500 * time.Millisecond) // replication catch-up
+	time.Sleep(300 * time.Millisecond) // replication catch-up
 
 	// Gracefully stop A (calls Release(), standby should promote quickly)
 	pair.Primary.Stop()
@@ -690,7 +694,8 @@ func TestReplicationPromotionWithS3Data(t *testing.T) {
 
 	pair.ElectorA.Elect()
 	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
-	time.Sleep(1 * time.Second) // let standby connect
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
 
 	topic := "test-repl-s3-promotion"
 	cl := NewClient(t, pair.Primary.Addr,
@@ -719,7 +724,7 @@ func TestReplicationPromotionWithS3Data(t *testing.T) {
 		})
 	}
 	cl.Close()
-	time.Sleep(1 * time.Second) // replication catch-up
+	time.Sleep(300 * time.Millisecond) // replication catch-up
 
 	// Failover: demote A, promote B
 	pair.ElectorA.Demote()
@@ -887,7 +892,8 @@ func TestReplicationS3LeaseFailover(t *testing.T) {
 
 	// Wait for primary to start its Kafka listener
 	waitPrimary(t, primary.healthAddr, 5*time.Second)
-	time.Sleep(1 * time.Second) // let standby connect
+	waitStandby(t, standby.healthAddr, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
 
 	// Produce records to the primary
 	topic := "test-s3lease-failover"
@@ -900,7 +906,7 @@ func TestReplicationS3LeaseFailover(t *testing.T) {
 	cl.Close()
 
 	// Allow replication to catch up
-	time.Sleep(2 * time.Second)
+	time.Sleep(300 * time.Millisecond)
 
 	// Kill the primary — standby detects expired lease and promotes
 	primary.cancel()

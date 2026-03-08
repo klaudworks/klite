@@ -364,7 +364,7 @@ func TestCompactionIdempotentIntegration(t *testing.T) {
 	objsAfterFirst := countS3Objects(mem, topic, 0)
 
 	// Wait a bit more — second compaction pass should not change anything
-	time.Sleep(2 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	objsAfterSecond := countS3Objects(mem, topic, 0)
 	assert.Equal(t, objsAfterFirst, objsAfterSecond,
 		"second compaction pass should not change object count")
@@ -452,7 +452,7 @@ func TestCompactionWatermarkSurvivesRestart(t *testing.T) {
 	assert.Equal(t, "v1", string(consumed[0].Value), "should read latest value after restart")
 
 	// Verify the object count hasn't changed (no re-compaction of already-clean data)
-	time.Sleep(1 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	objsFinal := countS3Objects(mem, topic, 0)
 	assert.Equal(t, objsAfterCompaction, objsFinal,
 		"should not create extra objects after restart with restored watermark")

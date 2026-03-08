@@ -252,8 +252,7 @@ func TestDescribeGroupsStable(t *testing.T) {
 	defer pcancel()
 	cl.PollFetches(pctx)
 
-	// Give the group time to stabilize
-	time.Sleep(500 * time.Millisecond)
+	waitGroupState(t, tb.Addr, "desc-grp", "Stable", 5*time.Second)
 
 	// Describe the group
 	groups, err := admin.DescribeGroups(ctx, "desc-grp")
@@ -303,7 +302,8 @@ func TestListGroups(t *testing.T) {
 	defer pcancel()
 	cl1.PollFetches(pctx)
 	cl2.PollFetches(pctx)
-	time.Sleep(500 * time.Millisecond)
+	waitGroupState(t, tb.Addr, "list-grp-1", "Stable", 5*time.Second)
+	waitGroupState(t, tb.Addr, "list-grp-2", "Stable", 5*time.Second)
 
 	listed, err := admin.ListGroups(ctx)
 	require.NoError(t, err)
@@ -332,11 +332,11 @@ func TestDeleteGroupEmpty(t *testing.T) {
 	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
 	defer pcancel()
 	cl.PollFetches(pctx)
-	time.Sleep(500 * time.Millisecond)
+	waitGroupState(t, tb.Addr, "del-grp", "Stable", 5*time.Second)
 
 	// Leave the group
 	cl.LeaveGroup()
-	time.Sleep(500 * time.Millisecond)
+	waitGroupState(t, tb.Addr, "del-grp", "Empty", 5*time.Second)
 
 	// Delete the now-empty group
 	resps, err := admin.DeleteGroups(ctx, "del-grp")
@@ -361,7 +361,7 @@ func TestDeleteGroupActive(t *testing.T) {
 	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
 	defer pcancel()
 	cl.PollFetches(pctx)
-	time.Sleep(500 * time.Millisecond)
+	waitGroupState(t, tb.Addr, "active-grp", "Stable", 5*time.Second)
 
 	// Try to delete while active
 	resps, err := admin.DeleteGroups(ctx, "active-grp")

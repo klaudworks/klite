@@ -57,6 +57,16 @@ func WithWALSegmentMaxBytes(n int64) BrokerOpt {
 	return func(c *broker.Config) { c.WALSegmentMaxBytes = n }
 }
 
+// WithWALMaxDiskSize sets the max total WAL on disk.
+func WithWALMaxDiskSize(n int64) BrokerOpt {
+	return func(c *broker.Config) { c.WALMaxDiskSize = n }
+}
+
+// WithS3TargetObjectSize sets the S3 target object size for flushing.
+func WithS3TargetObjectSize(n int64) BrokerOpt {
+	return func(c *broker.Config) { c.S3TargetObjectSize = n }
+}
+
 // WithS3 configures S3 storage with an in-memory S3 backend.
 func WithS3(s3api s3store.S3API, bucket, prefix string) BrokerOpt {
 	return func(c *broker.Config) {
@@ -213,6 +223,53 @@ func ProduceN(t *testing.T, cl *kgo.Client, topic string, n int) []*kgo.Record {
 	}
 	ProduceSync(t, cl, records...)
 	return records
+}
+
+// waitEndOffset polls ListEndOffsets on the broker until the end offset for the
+// given topic/partition reaches at least minOffset. This replaces fixed
+// time.Sleep calls for replication catch-up.
+func waitEndOffset(t *testing.T, addr, topic string, partition int32, minOffset int64, timeout time.Duration) {
+	t.Helper()
+	cl := NewClient(t, addr)
+	defer cl.Close()
+	admin := kadm.NewClient(cl)
+	deadline := time.After(timeout)
+	for {
+		offsets, err := admin.ListEndOffsets(context.Background(), topic)
+		if err == nil {
+			if lo, ok := offsets.Lookup(topic, partition); ok && lo.Err == nil && lo.Offset >= minOffset {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("end offset for %s/%d did not reach %d within %s", topic, partition, minOffset, timeout)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// waitGroupState polls DescribeGroups until the group reaches the desired
+// state. This replaces fixed time.Sleep calls for group stabilization.
+func waitGroupState(t *testing.T, addr, group, wantState string, timeout time.Duration) {
+	t.Helper()
+	cl := NewClient(t, addr)
+	defer cl.Close()
+	admin := kadm.NewClient(cl)
+	deadline := time.After(timeout)
+	for {
+		groups, err := admin.DescribeGroups(context.Background(), group)
+		if err == nil {
+			if g, ok := groups[group]; ok && g.State == wantState {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("group %s did not reach state %q within %s", group, wantState, timeout)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // ConsumeN consumes n records from the client with a timeout.
