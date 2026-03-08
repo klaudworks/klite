@@ -526,6 +526,18 @@ func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32
 			walHasOffset = true
 			result := readFromWAL(walW, walEntries)
 			if len(result) > 0 {
+				// Log the returned batch range if it doesn't start at the
+				// requested offset (potential gap source).
+				last := result[len(result)-1]
+				lastOff := last.BaseOffset + int64(last.LastOffsetDelta)
+				if result[0].BaseOffset > offset {
+					slog.Warn("fetchFromCold: WAL returned gap",
+						"topic", topic, "partition", partIdx,
+						"fetch_offset", offset,
+						"wal_first_base", result[0].BaseOffset,
+						"wal_last_end", lastOff,
+						"batches", len(result))
+				}
 				return result
 			}
 			// WAL index had entries but read failed (segment deleted?).
@@ -543,7 +555,16 @@ func fetchFromCold(offset int64, maxBytes int32, topicID [16]byte, partIdx int32
 	}
 
 	if s3Fetch != nil {
-		if result := readFromS3(s3Fetch, topic, topicID, partIdx, offset, maxBytes); len(result) > 0 {
+		result := readFromS3(s3Fetch, topic, topicID, partIdx, offset, maxBytes)
+		if len(result) > 0 {
+			// Log S3 result if it starts after the requested offset.
+			if result[0].BaseOffset > offset {
+				slog.Warn("fetchFromCold: S3 returned gap",
+					"topic", topic, "partition", partIdx,
+					"fetch_offset", offset,
+					"s3_first_base", result[0].BaseOffset,
+					"batches", len(result))
+			}
 			return result
 		}
 	}
