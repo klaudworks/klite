@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	lastEmptyFetchLog   atomic.Int64
-	lastColdGapLog      atomic.Int64
+	lastEmptyFetchLog    atomic.Int64
+	lastColdGapLog       atomic.Int64
 	lastChunkFallbackLog atomic.Int64
 )
 
@@ -396,10 +396,11 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	if len(coldBatches) > 0 {
 		coldBatches = filterBatchesByHW(coldBatches, hw)
 		if len(coldBatches) > 0 {
-			if coldBatches[0].BaseOffset > fetchOffset {
+			if coldBatches[0].BaseOffset > fetchOffset && fetchOffset >= s3WM {
 				// Cold path returned data starting after the requested
-				// offset — suppress to avoid the consumer skipping the
-				// gap. Return empty so the consumer retries.
+				// offset, and the gap is above the S3 watermark (data
+				// that should be in chunks/WAL but hasn't been flushed).
+				// Suppress to avoid the consumer skipping the gap.
 				if now := time.Now().UnixNano(); now-lastColdGapLog.Load() > int64(time.Second) {
 					lastColdGapLog.Store(now)
 					slog.Warn("fetch: suppressing cold path gap",

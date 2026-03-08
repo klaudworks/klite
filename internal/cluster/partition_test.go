@@ -996,9 +996,11 @@ func TestSkipOffsetsOutOfOrder(t *testing.T) {
 	}
 }
 
-// TestFetchGapReturnsNextAvailableBatch verifies that Fetch skips past offset
-// gaps (from WAL failures) by returning the next available chunk data.
-func TestFetchGapReturnsNextAvailableBatch(t *testing.T) {
+// TestFetchGapSuppressesChunkFallback verifies that Fetch returns empty when
+// the requested offset falls in a gap before chunk data. This prevents the
+// consumer from skipping ahead past offsets that may exist in S3 but haven't
+// been fetched yet. The consumer will retry, giving S3 time to serve the gap.
+func TestFetchGapSuppressesChunkFallback(t *testing.T) {
 	t.Parallel()
 
 	pd := newTestPartitionWithChunks()
@@ -1020,11 +1022,8 @@ func TestFetchGapReturnsNextAvailableBatch(t *testing.T) {
 
 	fr := pd.Fetch(3, 1024*1024)
 
-	if len(fr.Batches) == 0 {
-		t.Fatal("Fetch(3) returned no batches; expected batch at offset 5 (skip gap)")
-	}
-	if fr.Batches[0].BaseOffset != 5 {
-		t.Errorf("Fetch(3) first batch base: got %d, want 5", fr.Batches[0].BaseOffset)
+	if len(fr.Batches) != 0 {
+		t.Fatalf("Fetch(3) returned %d batches; expected empty (gap suppression)", len(fr.Batches))
 	}
 }
 
