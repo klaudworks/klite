@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -212,6 +213,141 @@ func TestPrimaryzBeforeReady(t *testing.T) {
 	}
 	if string(body) != "not ready" {
 		t.Fatalf("/primaryz before ready: got body %q, want %q", body, "not ready")
+	}
+}
+
+func TestReplzPrimaryNoStandby(t *testing.T) {
+	t.Parallel()
+
+	// Single-node primary (no replication configured, so not standby), ready.
+	b := &Broker{
+		ready: make(chan struct{}),
+	}
+	close(b.ready)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/replz", b.handleReplz)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/replz")
+	if err != nil {
+		t.Fatal("GET /replz:", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("/replz: got status %d, want 200", resp.StatusCode)
+	}
+
+	var status struct {
+		Role             string `json:"role"`
+		StandbyConnected *bool  `json:"standby_connected"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal("decode:", err)
+	}
+	if status.Role != "primary" {
+		t.Fatalf("role: got %q, want %q", status.Role, "primary")
+	}
+	if status.StandbyConnected == nil {
+		t.Fatal("standby_connected: want non-nil for primary")
+	}
+	if *status.StandbyConnected {
+		t.Fatal("standby_connected: got true, want false (no sender)")
+	}
+}
+
+func TestReplzStandby(t *testing.T) {
+	t.Parallel()
+
+	b := &Broker{
+		ready: make(chan struct{}),
+		cfg:   Config{ReplicationAddr: ":9093"},
+	}
+	close(b.ready)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/replz", b.handleReplz)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/replz")
+	if err != nil {
+		t.Fatal("GET /replz:", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("/replz: got status %d, want 200", resp.StatusCode)
+	}
+
+	var status struct {
+		Role             string `json:"role"`
+		StandbyConnected *bool  `json:"standby_connected"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal("decode:", err)
+	}
+	if status.Role != "standby" {
+		t.Fatalf("role: got %q, want %q", status.Role, "standby")
+	}
+	if status.StandbyConnected != nil {
+		t.Fatal("standby_connected: want nil for standby, got non-nil")
+	}
+}
+
+func TestReplzBeforeReady(t *testing.T) {
+	t.Parallel()
+
+	b := &Broker{
+		ready: make(chan struct{}),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/replz", b.handleReplz)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/replz")
+	if err != nil {
+		t.Fatal("GET /replz:", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/replz before ready: got status %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	var status struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal("decode:", err)
+	}
+	if status.Role != "not_ready" {
+		t.Fatalf("role: got %q, want %q", status.Role, "not_ready")
 	}
 }
 

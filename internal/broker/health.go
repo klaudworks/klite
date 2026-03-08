@@ -82,3 +82,37 @@ func (b *Broker) handlePrimaryz(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("not ready"))
 	}
 }
+
+// handleReplz returns JSON replication status. Returns 200 when the broker
+// is ready, 503 otherwise. The response includes the broker's role and,
+// for primaries, whether a standby is currently connected.
+func (b *Broker) handleReplz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	type replStatus struct {
+		Role             string `json:"role"`
+		StandbyConnected *bool  `json:"standby_connected,omitempty"`
+	}
+
+	select {
+	case <-b.ready:
+	default:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(replStatus{Role: "not_ready"})
+		return
+	}
+
+	status := replStatus{}
+	if b.isStandby() {
+		status.Role = "standby"
+	} else {
+		status.Role = "primary"
+		b.mu.Lock()
+		connected := b.replSender != nil && b.replSender.Connected()
+		b.mu.Unlock()
+		status.StandbyConnected = &connected
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(status)
+}
