@@ -187,6 +187,15 @@ func TestS3ReadAfterWALTrim(t *testing.T) {
 		WithS3FlushInterval(24*time.Hour),
 	)
 
+	// Verify HW was correctly restored from S3 by probeS3Watermarks
+	admin2 := NewAdminClient(t, tb2.Addr)
+	offsets, err := admin2.ListEndOffsets(context.Background(), topic)
+	require.NoError(t, err)
+	lo, ok := offsets.Lookup(topic, 0)
+	require.True(t, ok)
+	require.NoError(t, lo.Err)
+	require.Equal(t, int64(numRecords), lo.Offset, "HW should match S3 data after WAL trim")
+
 	consumer := NewClient(t, tb2.Addr,
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
@@ -665,5 +674,73 @@ func TestS3DisasterRecoveryWithoutBackup(t *testing.T) {
 	require.Len(t, consumed, numRecords)
 	for i, r := range consumed {
 		require.Equal(t, fmt.Sprintf("dr-no-backup-%d", i), string(r.Value), "record %d", i)
+	}
+}
+
+// TestS3LiveFlushAndConsume verifies that after the S3 flusher fires while the
+// broker is live (no restart), a consumer can read all data — old records from
+// S3 cold path + new records from chunks/WAL — in a single session.
+func TestS3LiveFlushAndConsume(t *testing.T) {
+	t.Parallel()
+
+	mem := s3store.NewInMemoryS3()
+	topic := "s3-live-flush"
+
+	tb := StartBroker(t,
+		WithS3(mem, "test-bucket", "klite/test"),
+		WithS3FlushInterval(1*time.Second),
+		WithS3FlushCheckInterval(200*time.Millisecond),
+		WithChunkPoolMemory(16*16*1024), // tiny — forces chunk eviction
+	)
+
+	admin := NewAdminClient(t, tb.Addr)
+	_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
+	require.NoError(t, err)
+
+	producer := NewClient(t, tb.Addr,
+		kgo.DefaultProduceTopic(topic),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+	)
+
+	for i := 0; i < 20; i++ {
+		ProduceSync(t, producer, &kgo.Record{
+			Topic:     topic,
+			Partition: 0,
+			Value:     []byte(fmt.Sprintf("live-%d", i)),
+		})
+	}
+
+	// Wait for the live S3 flush (no restart)
+	require.Eventually(t, func() bool {
+		for _, k := range mem.Keys() {
+			if s3KeyMatchesPartition(k, topic, 0) && strings.HasSuffix(k, ".obj") {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 200*time.Millisecond, "S3 live flush did not occur")
+
+	// Produce more records after flush — these stay in chunks/WAL
+	for i := 0; i < 10; i++ {
+		ProduceSync(t, producer, &kgo.Record{
+			Topic:     topic,
+			Partition: 0,
+			Value:     []byte(fmt.Sprintf("live-new-%d", i)),
+		})
+	}
+
+	// Consume all 30 from offset 0 — first 20 from S3, last 10 from chunks/WAL
+	consumer := NewClient(t, tb.Addr,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	consumed := ConsumeN(t, consumer, 30, 15*time.Second)
+	require.Len(t, consumed, 30)
+
+	for i := 0; i < 20; i++ {
+		require.Equal(t, fmt.Sprintf("live-%d", i), string(consumed[i].Value), "record %d", i)
+	}
+	for i := 0; i < 10; i++ {
+		require.Equal(t, fmt.Sprintf("live-new-%d", i), string(consumed[20+i].Value), "record %d", 20+i)
 	}
 }

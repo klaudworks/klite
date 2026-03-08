@@ -71,6 +71,11 @@ func WithS3FlushInterval(d time.Duration) BrokerOpt {
 	return func(c *broker.Config) { c.S3FlushInterval = d }
 }
 
+// WithS3FlushCheckInterval sets how often the flusher scans partitions.
+func WithS3FlushCheckInterval(d time.Duration) BrokerOpt {
+	return func(c *broker.Config) { c.S3FlushCheckInterval = d }
+}
+
 // WithRetentionCheckInterval sets the retention check interval.
 func WithRetentionCheckInterval(d time.Duration) BrokerOpt {
 	return func(c *broker.Config) { c.RetentionCheckInterval = d }
