@@ -327,7 +327,7 @@ func produceCommitWAL(p pendingWAL) error {
 }
 
 func getMaxMessageBytes(td *cluster.TopicData) int {
-	if v, ok := td.Configs["max.message.bytes"]; ok {
+	if v, ok := td.GetConfig("max.message.bytes"); ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
@@ -336,7 +336,7 @@ func getMaxMessageBytes(td *cluster.TopicData) int {
 }
 
 func getTimestampType(td *cluster.TopicData) string {
-	if v, ok := td.Configs["message.timestamp.type"]; ok {
+	if v, ok := td.GetConfig("message.timestamp.type"); ok {
 		return v
 	}
 	return "CreateTime"

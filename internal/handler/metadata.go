@@ -94,17 +94,14 @@ func HandleMetadata(cfg MetadataConfig) server.Handler {
 						resp.Topics = append(resp.Topics, st)
 						continue
 					}
-					var created bool
-					td, created, _ = cfg.State.GetOrCreateTopic(topicName)
+					td, _, _ = cfg.State.GetOrCreateTopic(topicName)
 					if td == nil {
-						// Shouldn't happen since we checked allowAuto
 						st := kmsg.NewMetadataResponseTopic()
 						st.Topic = kmsg.StringPtr(topicName)
 						st.ErrorCode = kerr.UnknownTopicOrPartition.Code
 						resp.Topics = append(resp.Topics, st)
 						continue
 					}
-					_ = created // auto-created
 				}
 
 				resp.Topics = append(resp.Topics, buildTopicMetadata(td, cfg.NodeID, r.Version))

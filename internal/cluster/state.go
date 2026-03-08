@@ -195,6 +195,7 @@ func (s *State) DefaultPartitions() int {
 // GetOrCreateTopic returns the existing topic, or creates it if auto-create
 // is enabled. Returns (topic, created, error). Error is non-nil if the topic
 // doesn't exist and auto-create is disabled.
+// When a topic is auto-created, it is persisted to the metadata log.
 func (s *State) GetOrCreateTopic(name string) (*TopicData, bool, error) {
 	// Fast path: read lock
 	s.mu.RLock()
@@ -210,6 +211,9 @@ func (s *State) GetOrCreateTopic(name string) (*TopicData, bool, error) {
 
 	// Slow path: write lock with double-check
 	td, created := s.CreateTopic(name, s.cfg.DefaultPartitions)
+	if created {
+		s.PersistTopicCreation(td)
+	}
 	return td, created, nil
 }
 
@@ -250,7 +254,27 @@ type TopicData struct {
 	Name       string
 	ID         [16]byte // UUID
 	Partitions []*PartData
-	Configs    map[string]string
+	Configs    map[string]string // protected by configMu
+	configMu   sync.RWMutex
+}
+
+// GetConfig returns the value of a topic config key. Safe for concurrent use.
+func (td *TopicData) GetConfig(key string) (string, bool) {
+	td.configMu.RLock()
+	v, ok := td.Configs[key]
+	td.configMu.RUnlock()
+	return v, ok
+}
+
+// CopyConfigs returns a snapshot of the topic configs. Safe for concurrent use.
+func (td *TopicData) CopyConfigs() map[string]string {
+	td.configMu.RLock()
+	cp := make(map[string]string, len(td.Configs))
+	for k, v := range td.Configs {
+		cp[k] = v
+	}
+	td.configMu.RUnlock()
+	return cp
 }
 
 func newTopicData(name string, numPartitions int, nodeID int32) *TopicData {
@@ -352,7 +376,9 @@ func (s *State) SetTopicConfig(topicName, key, value string) {
 	if !ok {
 		return
 	}
+	td.configMu.Lock()
 	td.Configs[key] = value
+	td.configMu.Unlock()
 }
 
 func (s *State) DeleteTopicConfig(topicName, key string) {
@@ -362,7 +388,9 @@ func (s *State) DeleteTopicConfig(topicName, key string) {
 	if !ok {
 		return
 	}
+	td.configMu.Lock()
 	delete(td.Configs, key)
+	td.configMu.Unlock()
 }
 
 func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfigsRequestResourceConfig) {
@@ -372,6 +400,7 @@ func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfig
 	if !ok {
 		return
 	}
+	td.configMu.Lock()
 	for k := range td.Configs {
 		delete(td.Configs, k)
 	}
@@ -380,6 +409,7 @@ func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfig
 			td.Configs[c.Name] = *c.Value
 		}
 	}
+	td.configMu.Unlock()
 }
 
 func (s *State) SetMetadataLog(ml *metadata.Log) {
@@ -388,6 +418,25 @@ func (s *State) SetMetadataLog(ml *metadata.Log) {
 
 func (s *State) MetadataLog() *metadata.Log {
 	return s.metaLog
+}
+
+// PersistTopicCreation writes a CreateTopic entry to the metadata log.
+// Must be called outside s.mu. No-op if the metadata log is nil.
+func (s *State) PersistTopicCreation(td *TopicData) {
+	ml := s.metaLog
+	if ml == nil {
+		return
+	}
+	entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
+		TopicName:      td.Name,
+		PartitionCount: int32(len(td.Partitions)),
+		TopicID:        td.ID,
+		Configs:        td.CopyConfigs(),
+	})
+	if err := ml.AppendSync(entry); err != nil {
+		slog.Warn("metadata.log: failed to persist topic creation",
+			"topic", td.Name, "err", err)
+	}
 }
 
 // SnapshotEntries generates serialized metadata entries for all live state.
@@ -404,7 +453,7 @@ func (s *State) SnapshotEntries() [][]byte {
 			TopicName:      td.Name,
 			PartitionCount: int32(len(td.Partitions)),
 			TopicID:        td.ID,
-			Configs:        td.Configs,
+			Configs:        td.CopyConfigs(),
 		})
 		entries = append(entries, e)
 	}
@@ -497,6 +546,8 @@ func (s *State) CreateTopicFromReplay(name string, numPartitions int, topicID [1
 
 	s.topics[name] = td
 	s.tnorms[NormalizeTopicName(name)] = name
+
+	s.initPartitionsWAL(td)
 
 	return td
 }

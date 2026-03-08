@@ -63,10 +63,11 @@ func HandleDescribeConfigs(cfg DescribeConfigsConfig) server.Handler {
 					continue
 				}
 
+				overrides := td.CopyConfigs()
 				for name, defaultVal := range topicConfigDefaults {
 					rc := kmsg.NewDescribeConfigsResponseResourceConfig()
 					rc.Name = name
-					if override, ok := td.Configs[name]; ok {
+					if override, ok := overrides[name]; ok {
 						v := override
 						rc.Value = &v
 						rc.Source = kmsg.ConfigSourceDynamicTopicConfig

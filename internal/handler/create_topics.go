@@ -1,10 +1,7 @@
 package handler
 
 import (
-	"log/slog"
-
 	"github.com/klaudworks/klite/internal/cluster"
-	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -172,18 +169,7 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				continue
 			}
 
-			if ml := state.MetadataLog(); ml != nil {
-				entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
-					TopicName:      td.Name,
-					PartitionCount: int32(len(td.Partitions)),
-					TopicID:        td.ID,
-					Configs:        td.Configs,
-				})
-				if err := ml.AppendSync(entry); err != nil {
-					slog.Warn("metadata.log: failed to persist CreateTopic (topic will be lost on restart)",
-						"topic", td.Name, "err", err)
-				}
-			}
+			state.PersistTopicCreation(td)
 
 			st.TopicID = td.ID
 			st.NumPartitions = int32(numPartitions)

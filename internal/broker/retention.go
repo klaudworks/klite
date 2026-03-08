@@ -44,12 +44,12 @@ func (b *Broker) enforceRetention(ctx context.Context) {
 		retentionMs := int64(604800000) // 7 days default
 		retentionBytes := int64(-1)     // infinite default
 
-		if v, ok := td.Configs["retention.ms"]; ok {
+		if v, ok := td.GetConfig("retention.ms"); ok {
 			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
 				retentionMs = parsed
 			}
 		}
-		if v, ok := td.Configs["retention.bytes"]; ok {
+		if v, ok := td.GetConfig("retention.bytes"); ok {
 			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
 				retentionBytes = parsed
 			}

@@ -194,7 +194,7 @@ func TestRetentionBySize(t *testing.T) {
 	// Set retention.bytes to fit ~1 object's worth of logical data
 	retBytes := oneObjDataSize + 1
 	td := b.state.GetTopic(topic)
-	td.Configs["retention.bytes"] = intToStr(retBytes)
+	b.state.SetTopicConfig(topic, "retention.bytes", intToStr(retBytes))
 
 	b.enforceRetention(context.Background())
 
