@@ -47,6 +47,11 @@ type WindowSnapshot struct {
 // Stats tracks latency and throughput metrics.
 // Per-window latencies are used for percentile calculation —
 // no global latency array, so memory usage stays bounded over long runs.
+//
+// Three modes of use:
+//   - Produce: call Record() with produce latency.
+//   - Consume: call RecordConsume() with bytes consumed. No latency tracking.
+//   - ProduceConsume: call Record() from producer, RecordE2E() from consumer.
 type Stats struct {
 	mu sync.Mutex
 
@@ -137,6 +142,116 @@ func (s *Stats) RecordE2E(latencyMs int) {
 	}
 	if latencyMs > s.cumE2EMax {
 		s.cumE2EMax = latencyMs
+	}
+}
+
+// RecordConsume records a batch of consumed records (consume-only mode).
+// Unlike Record(), there is no latency — only throughput is tracked.
+func (s *Stats) RecordConsume(records, bytes int64, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.measurementStarted {
+		s.start = now
+		s.windowStart = now
+		s.measurementStarted = true
+	}
+
+	s.count += records
+	s.bytes += bytes
+	s.windowCount += records
+	s.windowBytes += bytes
+
+	if now.Sub(s.windowStart) >= s.reportingInterval {
+		s.emitConsumeWindow(now)
+		s.newWindow(now)
+	}
+}
+
+func (s *Stats) emitConsumeWindow(now time.Time) {
+	elapsed := now.Sub(s.windowStart)
+	elapsedMs := elapsed.Milliseconds()
+	if elapsedMs == 0 {
+		elapsedMs = 1
+	}
+	wRecsPerSec := 1000.0 * float64(s.windowCount) / float64(elapsedMs)
+	wMBPerSec := 1000.0 * float64(s.windowBytes) / float64(elapsedMs) / (1024.0 * 1024.0)
+
+	totalElapsedMs := now.Sub(s.start).Milliseconds()
+	if totalElapsedMs == 0 {
+		totalElapsedMs = 1
+	}
+	cRecsPerSec := 1000.0 * float64(s.count) / float64(totalElapsedMs)
+	cMBPerSec := 1000.0 * float64(s.bytes) / float64(totalElapsedMs) / (1024.0 * 1024.0)
+
+	_, _ = fmt.Fprintf(s.out, "%d records consumed, %.1f records/sec (%.2f MB/sec).\n",
+		s.windowCount, wRecsPerSec, wMBPerSec)
+
+	if s.jsonOut != nil {
+		snap := WindowSnapshot{
+			TimestampUTC:  now.UTC().Format(time.RFC3339),
+			ElapsedSec:    float64(totalElapsedMs) / 1000.0,
+			Type:          "window",
+			WindowRecords: s.windowCount,
+			WindowRecsSec: wRecsPerSec,
+			WindowMBSec:   wMBPerSec,
+			CumRecords:    s.count,
+			CumRecsSec:    cRecsPerSec,
+			CumMBSec:      cMBPerSec,
+		}
+		data, _ := json.Marshal(snap)
+		_, _ = fmt.Fprintf(s.jsonOut, "%s\n", data)
+	}
+}
+
+// ConsumerResult returns a ConsumerResult from the current stats.
+func (s *Stats) ConsumerResult() *ConsumerResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	elapsed := time.Since(s.start).Milliseconds()
+	if elapsed == 0 {
+		elapsed = 1
+	}
+	recsPerSec := 1000.0 * float64(s.count) / float64(elapsed)
+	mbPerSec := 1000.0 * float64(s.bytes) / float64(elapsed) / (1024.0 * 1024.0)
+
+	return &ConsumerResult{
+		Records:    s.count,
+		Bytes:      s.bytes,
+		ElapsedMs:  elapsed,
+		RecsPerSec: recsPerSec,
+		MBPerSec:   mbPerSec,
+	}
+}
+
+// PrintConsumeTotal prints the final summary for consume-only mode.
+func (s *Stats) PrintConsumeTotal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	elapsed := time.Since(s.start).Milliseconds()
+	if elapsed == 0 {
+		elapsed = 1
+	}
+	recsPerSec := 1000.0 * float64(s.count) / float64(elapsed)
+	mbPerSec := 1000.0 * float64(s.bytes) / float64(elapsed) / (1024.0 * 1024.0)
+
+	_, _ = fmt.Fprintf(s.out, "%d records consumed, %f records/sec (%.2f MB/sec).\n",
+		s.count, recsPerSec, mbPerSec)
+
+	if s.jsonOut != nil {
+		now := time.Now()
+		snap := WindowSnapshot{
+			TimestampUTC: now.UTC().Format(time.RFC3339),
+			ElapsedSec:   float64(elapsed) / 1000.0,
+			Type:         "final",
+			CumRecords:   s.count,
+			CumRecsSec:   recsPerSec,
+			CumMBSec:     mbPerSec,
+		}
+		data, _ := json.Marshal(snap)
+		_, _ = fmt.Fprintf(s.jsonOut, "%s\n", data)
 	}
 }
 
@@ -295,18 +410,13 @@ func (s *Stats) PrintTotal() {
 	mbPerSec := 1000.0 * float64(s.bytes) / float64(elapsed) / (1024.0 * 1024.0)
 	avgLatency := float64(s.totalLatency) / float64(max64(s.count, 1))
 
-	// Use median of window percentiles for the final summary.
-	p50 := medianInt(s.allWindowP50)
-	p95 := medianInt(s.allWindowP95)
-	p99 := medianInt(s.allWindowP99)
-	p999 := medianInt(s.allWindowP999)
+	percs := s.finalPercentiles()
+	p50, p95, p99, p999 := percs[0], percs[1], percs[2], percs[3]
 
 	if s.e2eEnabled {
 		s.e2eMu.Lock()
-		e2eP50 := medianInt(s.allWindowE2EP50)
-		e2eP95 := medianInt(s.allWindowE2EP95)
-		e2eP99 := medianInt(s.allWindowE2EP99)
-		e2eP999 := medianInt(s.allWindowE2EP999)
+		e2ePercs := s.finalE2EPercentiles()
+		e2eP50, e2eP95, e2eP99, e2eP999 := e2ePercs[0], e2ePercs[1], e2ePercs[2], e2ePercs[3]
 		consumed := s.cumConsumed
 		s.e2eMu.Unlock()
 
@@ -345,10 +455,11 @@ func (s *Stats) PrintTotal() {
 		}
 		if s.e2eEnabled {
 			s.e2eMu.Lock()
-			snap.WindowE2EP50Ms = medianInt(s.allWindowE2EP50)
-			snap.WindowE2EP95Ms = medianInt(s.allWindowE2EP95)
-			snap.WindowE2EP99Ms = medianInt(s.allWindowE2EP99)
-			snap.WindowE2EP999Ms = medianInt(s.allWindowE2EP999)
+			e2ePercs := s.finalE2EPercentiles()
+			snap.WindowE2EP50Ms = e2ePercs[0]
+			snap.WindowE2EP95Ms = e2ePercs[1]
+			snap.WindowE2EP99Ms = e2ePercs[2]
+			snap.WindowE2EP999Ms = e2ePercs[3]
 			snap.WindowE2EMaxMs = s.cumE2EMax
 			snap.CumConsumed = s.cumConsumed
 			s.e2eMu.Unlock()
@@ -370,6 +481,8 @@ func (s *Stats) Result() *ProducerResult {
 	mbPerSec := 1000.0 * float64(s.bytes) / float64(elapsed) / (1024.0 * 1024.0)
 	avgLatency := float64(s.totalLatency) / float64(max64(s.count, 1))
 
+	percs := s.finalPercentiles()
+
 	return &ProducerResult{
 		Records:     s.count,
 		Bytes:       s.bytes,
@@ -378,11 +491,43 @@ func (s *Stats) Result() *ProducerResult {
 		MBPerSec:    mbPerSec,
 		AvgLatency:  avgLatency,
 		MaxLatency:  float64(s.maxLatency),
-		P50Latency:  medianInt(s.allWindowP50),
-		P95Latency:  medianInt(s.allWindowP95),
-		P99Latency:  medianInt(s.allWindowP99),
-		P999Latency: medianInt(s.allWindowP999),
+		P50Latency:  percs[0],
+		P95Latency:  percs[1],
+		P99Latency:  percs[2],
+		P999Latency: percs[3],
 	}
+}
+
+// finalPercentiles computes p50/p95/p99/p999 for the final summary.
+// If multiple windows emitted, uses the median of each window's percentile.
+// If no windows emitted (short run), computes directly from the current
+// un-emitted window samples — this avoids returning all-zeros for runs
+// shorter than the reporting interval.
+// Must be called with s.mu held.
+func (s *Stats) finalPercentiles() []int {
+	if len(s.allWindowP50) > 0 {
+		return []int{
+			medianInt(s.allWindowP50),
+			medianInt(s.allWindowP95),
+			medianInt(s.allWindowP99),
+			medianInt(s.allWindowP999),
+		}
+	}
+	return percentiles(s.windowLatencies, 0.5, 0.95, 0.99, 0.999)
+}
+
+// finalE2EPercentiles is the e2e equivalent of finalPercentiles.
+// Must be called with s.e2eMu held.
+func (s *Stats) finalE2EPercentiles() []int {
+	if len(s.allWindowE2EP50) > 0 {
+		return []int{
+			medianInt(s.allWindowE2EP50),
+			medianInt(s.allWindowE2EP95),
+			medianInt(s.allWindowE2EP99),
+			medianInt(s.allWindowE2EP999),
+		}
+	}
+	return percentiles(s.windowE2ELatencies, 0.5, 0.95, 0.99, 0.999)
 }
 
 func (s *Stats) TotalCount() int64 {

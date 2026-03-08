@@ -2,6 +2,7 @@ package bench
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -20,8 +21,14 @@ type ConsumerConfig struct {
 	NumConsumers      int // number of concurrent consumers in the same group
 	Timeout           time.Duration
 	ReportingInterval time.Duration
-	ShowDetailedStats bool
 	Out               io.Writer
+	JSONOut           io.Writer     // JSON Lines time-series output (nil = disabled)
+	KgoOpts           []kgo.Opt     // extra kgo client options (e.g. custom dialer)
+	Stats             *Stats        // shared Stats instance; if nil, RunConsumer creates its own
+	WarmupRecords     int64         // warmup count passed to Stats (only used when Stats is nil)
+	E2EEpoch          time.Time     // when non-zero, decode 9-byte keys for e2e latency tracking
+	ProduceDone       *atomic.Bool  // when non-nil, use drain-based termination instead of timeout
+	DrainTimeout      time.Duration // how long to wait after ProduceDone becomes true
 }
 
 func DefaultConsumerConfig() ConsumerConfig {
@@ -49,24 +56,40 @@ type ConsumerResult struct {
 // it creates multiple consumer clients with static group membership to avoid
 // rebalance storms. Each consumer gets a stable member ID so all consumers
 // join the group once without triggering cascading rebalances.
+//
+// Two modes are supported:
+//   - Standalone (E2EEpoch is zero): tracks throughput via RecordConsume.
+//     Terminates when NumRecords are consumed or Timeout elapses with no progress.
+//   - E2E (E2EEpoch is non-zero): decodes 9-byte keys [warmup(1)|nanos(8)]
+//     and tracks end-to-end latency via RecordE2E. Terminates when ProduceDone
+//     is true and either all expected records are consumed or DrainTimeout elapses.
 func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, error) {
 	if cfg.NumConsumers < 1 {
 		cfg.NumConsumers = 1
 	}
 
+	e2eMode := !cfg.E2EEpoch.IsZero()
+
+	ownStats := cfg.Stats == nil
+	stats := cfg.Stats
+	if ownStats {
+		stats = NewStats(cfg.NumRecords, cfg.WarmupRecords, cfg.ReportingInterval, cfg.Out)
+		if cfg.JSONOut != nil {
+			stats.SetJSONOutput(cfg.JSONOut)
+		}
+		if e2eMode {
+			stats.EnableE2E()
+		}
+	}
+
 	groupID := fmt.Sprintf("perf-consumer-%d", rand.IntN(100_000))
 
 	var (
-		recordsRead    atomic.Int64
-		bytesRead      atomic.Int64
-		lastConsumedAt atomic.Int64 // unix nanos
+		fetchErrors    atomic.Int64
+		firstFetchErr  syncErr
+		lastConsumedAt atomic.Int64 // unix nanos — used for timeout-based termination
 	)
 	lastConsumedAt.Store(time.Now().UnixNano())
-	startTime := time.Now()
-
-	if !cfg.ShowDetailedStats {
-		_, _ = fmt.Fprintf(cfg.Out, "start.time, end.time, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec\n")
-	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -81,6 +104,7 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 			kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 			kgo.InstanceID(fmt.Sprintf("perf-%s-%d", groupID, i)),
 		}
+		opts = append(opts, cfg.KgoOpts...)
 		client, err := kgo.NewClient(opts...)
 		if err != nil {
 			for j := 0; j < i; j++ {
@@ -96,14 +120,20 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 		}
 	}()
 
-	doneCh := make(chan struct{})
+	consumedCount := func() int64 {
+		if e2eMode {
+			return stats.CumConsumed()
+		}
+		return stats.TotalCount()
+	}
+
 	for i := 0; i < cfg.NumConsumers; i++ {
 		go func(client *kgo.Client) {
 			for {
 				if ctx.Err() != nil {
 					return
 				}
-				if recordsRead.Load() >= cfg.NumRecords {
+				if consumedCount() >= cfg.NumRecords {
 					return
 				}
 
@@ -111,119 +141,131 @@ func RunConsumer(ctx context.Context, cfg ConsumerConfig) (*ConsumerResult, erro
 				fetches := client.PollFetches(pollCtx)
 				pollCancel()
 
-				var fetchRecords int64
-				var fetchBytes int64
-				fetches.EachRecord(func(r *kgo.Record) {
-					fetchRecords++
-					if r.Key != nil {
-						fetchBytes += int64(len(r.Key))
-					}
-					if r.Value != nil {
-						fetchBytes += int64(len(r.Value))
-					}
+				fetches.EachError(func(_ string, _ int32, err error) {
+					fetchErrors.Add(1)
+					firstFetchErr.Set(err)
 				})
 
-				if fetchRecords > 0 {
-					recordsRead.Add(fetchRecords)
-					bytesRead.Add(fetchBytes)
+				if e2eMode {
+					epoch := cfg.E2EEpoch
+					fetches.EachRecord(func(r *kgo.Record) {
+						now := time.Since(epoch).Nanoseconds()
+						if len(r.Key) != 9 {
+							return
+						}
+						if r.Key[0] == 0x00 {
+							return // warmup
+						}
+						sendNanos := int64(binary.BigEndian.Uint64(r.Key[1:9]))
+						e2eMs := int((now - sendNanos) / 1_000_000)
+						if e2eMs < 0 {
+							e2eMs = 0
+						}
+						stats.RecordE2E(e2eMs)
+					})
 					lastConsumedAt.Store(time.Now().UnixNano())
+				} else {
+					var fetchRecords int64
+					var fetchBytes int64
+					fetches.EachRecord(func(r *kgo.Record) {
+						fetchRecords++
+						if r.Key != nil {
+							fetchBytes += int64(len(r.Key))
+						}
+						if r.Value != nil {
+							fetchBytes += int64(len(r.Value))
+						}
+					})
+					if fetchRecords > 0 {
+						now := time.Now()
+						stats.RecordConsume(fetchRecords, fetchBytes, now)
+						lastConsumedAt.Store(now.UnixNano())
+					}
 				}
 			}
 		}(clients[i])
 	}
 
+	// Termination logic: two modes.
+	if cfg.ProduceDone != nil {
+		// Drain-based: wait for producer to finish, then drain up to DrainTimeout.
+		waitForDrain(ctx, cancel, cfg, consumedCount)
+	} else {
+		// Timeout-based: exit when NumRecords consumed or idle timeout.
+		waitForTimeout(ctx, cancel, cfg, consumedCount, &lastConsumedAt)
+	}
+
+	if ownStats {
+		if e2eMode {
+			stats.PrintTotal()
+		} else {
+			stats.PrintConsumeTotal()
+		}
+	}
+
+	result := stats.ConsumerResult()
+
+	if result.Records < cfg.NumRecords && !e2eMode {
+		if fe := firstFetchErr.Get(); fe != nil {
+			return result, fmt.Errorf("consumed %d/%d records (%d fetch errors, first: %w)",
+				result.Records, cfg.NumRecords, fetchErrors.Load(), fe)
+		}
+		return result, fmt.Errorf("consumed %d/%d records (timeout)", result.Records, cfg.NumRecords)
+	}
+	return result, nil
+}
+
+func waitForDrain(ctx context.Context, cancel context.CancelFunc, cfg ConsumerConfig, consumedCount func() int64) {
+	var drainDeadline time.Time
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-
-	var (
-		lastReportTime  = startTime
-		lastRecordsRead int64
-		lastBytesRead   int64
-	)
 
 	for {
 		select {
 		case <-ctx.Done():
-			goto done
+			return
 		case <-ticker.C:
 		}
 
-		now := time.Now()
+		if cfg.ProduceDone.Load() {
+			if drainDeadline.IsZero() {
+				drainDeadline = time.Now().Add(cfg.DrainTimeout)
+			}
+			if consumedCount() >= cfg.NumRecords {
+				cancel()
+				return
+			}
+			if time.Now().After(drainDeadline) {
+				cancel()
+				return
+			}
+		}
+	}
+}
 
-		if recordsRead.Load() >= cfg.NumRecords {
-			cancel()
-			goto done
+func waitForTimeout(ctx context.Context, cancel context.CancelFunc, cfg ConsumerConfig, consumedCount func() int64, lastConsumedAt *atomic.Int64) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 
+		if consumedCount() >= cfg.NumRecords {
+			cancel()
+			return
+		}
+
+		now := time.Now()
 		lastTs := time.Unix(0, lastConsumedAt.Load())
 		if now.Sub(lastTs) > cfg.Timeout {
 			_, _ = fmt.Fprintf(cfg.Out, "WARNING: Exiting before consuming the expected number of records: "+
 				"timeout (%v) exceeded. You can use the --timeout option to increase the timeout.\n", cfg.Timeout)
 			cancel()
-			goto done
-		}
-
-		if cfg.ShowDetailedStats && now.Sub(lastReportTime) >= cfg.ReportingInterval {
-			curRecords := recordsRead.Load()
-			curBytes := bytesRead.Load()
-			printConsumerWindow(cfg.Out, curBytes, lastBytesRead, curRecords, lastRecordsRead,
-				lastReportTime, now)
-			lastReportTime = now
-			lastRecordsRead = curRecords
-			lastBytesRead = curBytes
+			return
 		}
 	}
-
-done:
-	close(doneCh)
-
-	endTime := time.Now()
-	elapsedMs := endTime.Sub(startTime).Milliseconds()
-	if elapsedMs == 0 {
-		elapsedMs = 1
-	}
-	elapsedSec := float64(elapsedMs) / 1000.0
-	totalRecs := recordsRead.Load()
-	totalBytes := bytesRead.Load()
-	totalMB := float64(totalBytes) / (1024.0 * 1024.0)
-
-	if !cfg.ShowDetailedStats {
-		_, _ = fmt.Fprintf(cfg.Out, "%s, %s, %.4f, %.4f, %d, %.4f, %d, %d, %.4f, %.4f\n",
-			startTime.Format("2006-01-02 15:04:05.000"),
-			endTime.Format("2006-01-02 15:04:05.000"),
-			totalMB,
-			totalMB/elapsedSec,
-			totalRecs,
-			float64(totalRecs)/elapsedSec,
-			0,
-			elapsedMs,
-			totalMB/elapsedSec,
-			float64(totalRecs)/elapsedSec,
-		)
-	}
-
-	return &ConsumerResult{
-		Records:    totalRecs,
-		Bytes:      totalBytes,
-		ElapsedMs:  elapsedMs,
-		RecsPerSec: float64(totalRecs) / elapsedSec,
-		MBPerSec:   totalMB / elapsedSec,
-	}, nil
-}
-
-func printConsumerWindow(out io.Writer, bytesRead, lastBytesRead, recordsRead, lastRecordsRead int64,
-	startTime, endTime time.Time,
-) {
-	elapsedMs := endTime.Sub(startTime).Milliseconds()
-	if elapsedMs == 0 {
-		elapsedMs = 1
-	}
-	intervalMB := float64(bytesRead-lastBytesRead) / (1024.0 * 1024.0)
-	mbPerSec := 1000.0 * intervalMB / float64(elapsedMs)
-	recsPerSec := 1000.0 * float64(recordsRead-lastRecordsRead) / float64(elapsedMs)
-	totalMB := float64(bytesRead) / (1024.0 * 1024.0)
-
-	_, _ = fmt.Fprintf(out, "%s, %.4f, %.4f, %d, %.4f\n",
-		endTime.Format("2006-01-02 15:04:05.000"),
-		totalMB, mbPerSec, recordsRead, recsPerSec)
 }

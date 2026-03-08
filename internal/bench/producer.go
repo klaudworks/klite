@@ -12,6 +12,20 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
+// syncErr captures the first error from concurrent callbacks.
+type syncErr struct {
+	once sync.Once
+	err  error
+}
+
+func (s *syncErr) Set(err error) {
+	s.once.Do(func() { s.err = err })
+}
+
+func (s *syncErr) Get() error {
+	return s.err
+}
+
 type ProducerConfig struct {
 	Brokers            []string
 	Topic              string
@@ -26,7 +40,10 @@ type ProducerConfig struct {
 	WarmupRecords      int64
 	ReportingInterval  time.Duration
 	Out                io.Writer
-	JSONOut            io.Writer // JSON Lines time-series output (nil = disabled)
+	JSONOut            io.Writer  // JSON Lines time-series output (nil = disabled)
+	KgoOpts            []kgo.Opt  // extra kgo client options (e.g. custom dialer)
+	KeyEncoder         KeyEncoder // optional key encoder (e.g. for e2e latency timestamps)
+	Stats              *Stats     // shared Stats instance; if nil, RunProducer creates its own
 }
 
 func DefaultProducerConfig() ProducerConfig {
@@ -70,22 +87,38 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 		cfg.NumProducers = 1
 	}
 
-	stats := NewStats(cfg.NumRecords, cfg.WarmupRecords, cfg.ReportingInterval, cfg.Out)
-	if cfg.JSONOut != nil {
-		stats.SetJSONOutput(cfg.JSONOut)
+	ownStats := cfg.Stats == nil
+	stats := cfg.Stats
+	if ownStats {
+		stats = NewStats(cfg.NumRecords, cfg.WarmupRecords, cfg.ReportingInterval, cfg.Out)
+		if cfg.JSONOut != nil {
+			stats.SetJSONOutput(cfg.JSONOut)
+		}
 	}
-	var totalErrors atomic.Int64
 
-	// Divide measured records, warmup, and throughput across producers.
-	// Each producer sends warmup + measured records (warmup first).
-	baseMeasured := cfg.NumRecords / int64(cfg.NumProducers)
-	measuredRemainder := cfg.NumRecords % int64(cfg.NumProducers)
-	baseWarmup := cfg.WarmupRecords / int64(cfg.NumProducers)
-	warmupRemainder := cfg.WarmupRecords % int64(cfg.NumProducers)
+	var totalErrors atomic.Int64
+	var firstErr syncErr
+
+	params := producerCoreParams{
+		brokers:            cfg.Brokers,
+		topic:              cfg.Topic,
+		recordSize:         cfg.RecordSize,
+		acks:               cfg.Acks,
+		batchMaxBytes:      cfg.BatchMaxBytes,
+		lingerMs:           cfg.LingerMs,
+		maxBufferedRecords: cfg.MaxBufferedRecords,
+		kgoOpts:            cfg.KgoOpts,
+	}
+
 	perProducerThroughput := cfg.Throughput
 	if cfg.Throughput > 0 {
 		perProducerThroughput = cfg.Throughput / float64(cfg.NumProducers)
 	}
+
+	baseMeasured := cfg.NumRecords / int64(cfg.NumProducers)
+	measuredRemainder := cfg.NumRecords % int64(cfg.NumProducers)
+	baseWarmup := cfg.WarmupRecords / int64(cfg.NumProducers)
+	warmupRemainder := cfg.WarmupRecords % int64(cfg.NumProducers)
 
 	var wg sync.WaitGroup
 	errs := make([]error, cfg.NumProducers)
@@ -104,18 +137,25 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 		wg.Add(1)
 		go func(producerIdx int, total, warmupCount int64) {
 			defer wg.Done()
-			errs[producerIdx] = runSingleProducer(ctx, cfg, total, warmupCount,
-				perProducerThroughput, stats, &totalErrors)
+			errs[producerIdx] = runProducerCore(ctx, params, total, warmupCount,
+				perProducerThroughput, cfg.KeyEncoder, stats, &totalErrors, &firstErr)
 		}(p, totalForProducer, warmup)
 	}
 
 	wg.Wait()
-	stats.PrintTotal()
+
+	if ownStats {
+		stats.PrintTotal()
+	}
 
 	result := stats.Result()
 	result.Errors = totalErrors.Load()
 
 	if result.Errors > 0 {
+		if fe := firstErr.Get(); fe != nil {
+			_, _ = fmt.Fprintf(cfg.Out, "%d records failed to produce, first error: %v\n", result.Errors, fe)
+			return result, fmt.Errorf("%d records failed, first error: %w", result.Errors, fe)
+		}
 		_, _ = fmt.Fprintf(cfg.Out, "%d records failed to produce.\n", result.Errors)
 		return result, fmt.Errorf("%d records failed", result.Errors)
 	}
@@ -128,23 +168,46 @@ func RunProducer(ctx context.Context, cfg ProducerConfig) (*ProducerResult, erro
 	return result, nil
 }
 
-func runSingleProducer(ctx context.Context, cfg ProducerConfig,
-	numRecords, warmupRecords int64, throughput float64, stats *Stats, errorCount *atomic.Int64,
+// producerCoreParams holds the kgo-client-level settings for the core
+// produce loop, separate from higher-level orchestration concerns.
+type producerCoreParams struct {
+	brokers            []string
+	topic              string
+	recordSize         int
+	acks               int
+	batchMaxBytes      int32
+	lingerMs           int
+	maxBufferedRecords int
+	kgoOpts            []kgo.Opt
+}
+
+// KeyEncoder is called for every record to produce a key. If nil, records
+// have no key (plain produce mode). The buffer is reusable; implementations
+// must copy if they need the key to survive past the call.
+type KeyEncoder func(seq int64, isWarmup bool, buf []byte) []byte
+
+// runProducerCore is the core produce loop. When KeyEncoder is nil, records
+// have no key (plain produce). When set, each record gets a key via the encoder
+// (e.g. timestamp-stamping for e2e latency tracking).
+func runProducerCore(ctx context.Context, p producerCoreParams,
+	numRecords, warmupRecords int64, throughput float64,
+	keyEnc KeyEncoder, stats *Stats, errorCount *atomic.Int64, firstErr *syncErr,
 ) error {
-	gen := NewPayloadGenerator(cfg.RecordSize)
+	gen := NewPayloadGenerator(p.recordSize)
 
 	opts := []kgo.Opt{
-		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.DefaultProduceTopic(cfg.Topic),
-		kgo.ProducerBatchMaxBytes(cfg.BatchMaxBytes),
-		kgo.ProducerLinger(time.Duration(cfg.LingerMs) * time.Millisecond),
+		kgo.SeedBrokers(p.brokers...),
+		kgo.DefaultProduceTopic(p.topic),
+		kgo.ProducerBatchMaxBytes(p.batchMaxBytes),
+		kgo.ProducerLinger(time.Duration(p.lingerMs) * time.Millisecond),
 		kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
-		kgo.MaxBufferedRecords(cfg.MaxBufferedRecords),
+		kgo.MaxBufferedRecords(p.maxBufferedRecords),
 		kgo.RetryBackoffFn(func(int) time.Duration { return 100 * time.Millisecond }),
 		kgo.RequestRetries(10),
 	}
+	opts = append(opts, p.kgoOpts...)
 
-	switch cfg.Acks {
+	switch p.acks {
 	case 0:
 		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()), kgo.DisableIdempotentWrite())
 	case 1:
@@ -162,6 +225,11 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig,
 	startTime := time.Now()
 	throttler := NewThroughputThrottler(throughput, startTime)
 
+	var keyBuf []byte
+	if keyEnc != nil {
+		keyBuf = make([]byte, 0, 16)
+	}
+
 	for i := int64(0); i < numRecords; i++ {
 		if ctx.Err() != nil {
 			break
@@ -170,8 +238,13 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig,
 		val := gen.GenerateCopy()
 		isWarmup := i < warmupRecords
 
-		record := &kgo.Record{
-			Value: val,
+		record := &kgo.Record{Value: val}
+
+		if keyEnc != nil {
+			keyBuf = keyEnc(i, isWarmup, keyBuf[:0])
+			key := make([]byte, len(keyBuf))
+			copy(key, keyBuf)
+			record.Key = key
 		}
 
 		sendStart := time.Now()
@@ -180,6 +253,7 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig,
 			latencyMs := int(now.Sub(sendStart).Milliseconds())
 			if err != nil {
 				errorCount.Add(1)
+				firstErr.Set(err)
 				return
 			}
 			if !isWarmup {
@@ -192,6 +266,5 @@ func runSingleProducer(ctx context.Context, cfg ProducerConfig,
 		}
 	}
 
-	_ = client.Flush(ctx)
-	return nil
+	return client.Flush(ctx)
 }

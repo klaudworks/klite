@@ -8,8 +8,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-func CreateTopic(ctx context.Context, brokers []string, topic string, partitions int32) error {
-	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+func CreateTopic(ctx context.Context, brokers []string, topic string, partitions int32, opts ...kgo.Opt) error {
+	allOpts := []kgo.Opt{kgo.SeedBrokers(brokers...)}
+	allOpts = append(allOpts, opts...)
+
+	client, err := kgo.NewClient(allOpts...)
 	if err != nil {
 		return fmt.Errorf("connecting to broker: %w", err)
 	}
@@ -34,8 +37,11 @@ func CreateTopic(ctx context.Context, brokers []string, topic string, partitions
 	return nil
 }
 
-func DeleteTopic(ctx context.Context, brokers []string, topic string) error {
-	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+func DeleteTopic(ctx context.Context, brokers []string, topic string, opts ...kgo.Opt) error {
+	allOpts := []kgo.Opt{kgo.SeedBrokers(brokers...)}
+	allOpts = append(allOpts, opts...)
+
+	client, err := kgo.NewClient(allOpts...)
 	if err != nil {
 		return fmt.Errorf("connecting to broker: %w", err)
 	}

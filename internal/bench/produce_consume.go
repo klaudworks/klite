@@ -30,6 +30,7 @@ type ProduceConsumeConfig struct {
 	DrainTimeout       time.Duration // how long to wait for consumers to catch up after produce finishes
 	Out                io.Writer
 	JSONOut            io.Writer
+	KgoOpts            []kgo.Opt // extra kgo client options (e.g. custom dialer)
 }
 
 func DefaultProduceConsumeConfig() ProduceConsumeConfig {
@@ -60,14 +61,10 @@ type ProduceConsumeResult struct {
 // Records carry a 9-byte key: [warmup_flag(1) | send_timestamp_nanos(8)].
 // The consumer uses this to compute e2e latency and skip warmup records.
 // After producers finish, consumers drain for up to DrainTimeout.
+//
+// Internally this composes RunProducer and RunConsumer with a shared Stats
+// instance and e2e latency tracking enabled.
 func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceConsumeResult, error) {
-	if cfg.NumProducers < 1 {
-		cfg.NumProducers = 1
-	}
-	if cfg.NumConsumers < 1 {
-		cfg.NumConsumers = 1
-	}
-
 	// Monotonic epoch — all timestamps are offsets from this point.
 	epoch := time.Now()
 
@@ -77,94 +74,78 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 		stats.SetJSONOutput(cfg.JSONOut)
 	}
 
-	var totalErrors atomic.Int64
 	var produceDone atomic.Bool
-	expectedRecords := cfg.NumRecords // warmup is extra, NumRecords = measured
 
-	consumerCtx, consumerCancel := context.WithCancel(ctx)
-	defer consumerCancel()
+	// Key encoder stamps [warmup(1) | monotonic_nanos(8)] for e2e latency.
+	keyEnc := func(_ int64, isWarmup bool, buf []byte) []byte {
+		buf = buf[:0]
+		if isWarmup {
+			buf = append(buf, 0x00)
+		} else {
+			buf = append(buf, 0x01)
+		}
+		var nanos [8]byte
+		binary.BigEndian.PutUint64(nanos[:], uint64(time.Since(epoch).Nanoseconds()))
+		buf = append(buf, nanos[:]...)
+		return buf
+	}
 
+	pCfg := ProducerConfig{
+		Brokers:            cfg.Brokers,
+		Topic:              cfg.Topic,
+		NumRecords:         cfg.NumRecords,
+		RecordSize:         cfg.RecordSize,
+		Throughput:         cfg.Throughput,
+		Acks:               cfg.Acks,
+		BatchMaxBytes:      cfg.BatchMaxBytes,
+		LingerMs:           cfg.LingerMs,
+		MaxBufferedRecords: cfg.MaxBufferedRecords,
+		NumProducers:       cfg.NumProducers,
+		WarmupRecords:      cfg.WarmupRecords,
+		Out:                cfg.Out,
+		KgoOpts:            cfg.KgoOpts,
+		KeyEncoder:         keyEnc,
+		Stats:              stats,
+	}
+
+	cCfg := ConsumerConfig{
+		Brokers:       cfg.Brokers,
+		Topic:         cfg.Topic,
+		NumRecords:    cfg.NumRecords,
+		FetchMaxBytes: cfg.BatchMaxBytes,
+		NumConsumers:  cfg.NumConsumers,
+		Out:           cfg.Out,
+		KgoOpts:       cfg.KgoOpts,
+		Stats:         stats,
+		E2EEpoch:      epoch,
+		ProduceDone:   &produceDone,
+		DrainTimeout:  cfg.DrainTimeout,
+	}
+
+	// Run consumer in background.
 	var consumerWg sync.WaitGroup
-	consumerClients := make([]*kgo.Client, cfg.NumConsumers)
-	groupID := fmt.Sprintf("bench-pc-%d", time.Now().UnixNano()%100000)
+	var consumerErr error
+	consumerWg.Add(1)
+	go func() {
+		defer consumerWg.Done()
+		_, consumerErr = RunConsumer(ctx, cCfg)
+	}()
 
-	for i := range cfg.NumConsumers {
-		opts := []kgo.Opt{
-			kgo.SeedBrokers(cfg.Brokers...),
-			kgo.ConsumeTopics(cfg.Topic),
-			kgo.ConsumerGroup(groupID),
-			kgo.FetchMaxPartitionBytes(cfg.BatchMaxBytes),
-			kgo.FetchMaxWait(500 * time.Millisecond),
-			kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-			kgo.InstanceID(fmt.Sprintf("bench-pc-%s-%d", groupID, i)),
-		}
-		client, err := kgo.NewClient(opts...)
-		if err != nil {
-			for j := range i {
-				consumerClients[j].Close()
-			}
-			return nil, fmt.Errorf("creating consumer %d: %w", i, err)
-		}
-		consumerClients[i] = client
-
-		consumerWg.Add(1)
-		go func(client *kgo.Client) {
-			defer consumerWg.Done()
-			consumeLoop(consumerCtx, client, epoch, stats, &produceDone, expectedRecords, cfg.DrainTimeout)
-		}(client)
-	}
-
-	baseMeasured := cfg.NumRecords / int64(cfg.NumProducers)
-	measuredRemainder := cfg.NumRecords % int64(cfg.NumProducers)
-	baseWarmup := cfg.WarmupRecords / int64(cfg.NumProducers)
-	warmupRemainder := cfg.WarmupRecords % int64(cfg.NumProducers)
-	perProducerThroughput := cfg.Throughput
-	if cfg.Throughput > 0 {
-		perProducerThroughput = cfg.Throughput / float64(cfg.NumProducers)
-	}
-
-	var producerWg sync.WaitGroup
-	producerErrs := make([]error, cfg.NumProducers)
-
-	for p := range cfg.NumProducers {
-		measured := baseMeasured
-		if int64(p) < measuredRemainder {
-			measured++
-		}
-		warmup := baseWarmup
-		if int64(p) < warmupRemainder {
-			warmup++
-		}
-		totalForProducer := warmup + measured
-		producerWg.Add(1)
-		go func(idx int, total, warmupCount int64) {
-			defer producerWg.Done()
-			producerErrs[idx] = runPCProducer(ctx, cfg, epoch, stats,
-				total, warmupCount, perProducerThroughput, &totalErrors)
-		}(p, totalForProducer, warmup)
-	}
-
-	producerWg.Wait()
+	// Run producer (blocks until all records are produced + flushed).
+	producerResult, producerErr := RunProducer(ctx, pCfg)
 	produceDone.Store(true)
 
 	consumerWg.Wait()
 
-	for _, c := range consumerClients {
-		c.Close()
-	}
-
 	stats.PrintTotal()
 
-	result := stats.Result()
-	result.Errors = totalErrors.Load()
-
+	consumed := stats.CumConsumed()
 	pcResult := &ProduceConsumeResult{
-		ProducerResult: *result,
-		Consumed:       stats.CumConsumed(),
+		ProducerResult: *producerResult,
+		Consumed:       consumed,
 	}
 
-	produced := result.Records
-	consumed := pcResult.Consumed
+	produced := producerResult.Records
 	if consumed == produced {
 		_, _ = fmt.Fprintf(cfg.Out, "OK: produced == consumed (%d records)\n", produced)
 	} else {
@@ -173,143 +154,11 @@ func RunProduceConsume(ctx context.Context, cfg ProduceConsumeConfig) (*ProduceC
 			produced, consumed, diff, 100.0*float64(diff)/float64(produced))
 	}
 
-	if result.Errors > 0 {
-		return pcResult, fmt.Errorf("%d records failed to produce", result.Errors)
+	if producerErr != nil {
+		return pcResult, producerErr
 	}
-	for _, err := range producerErrs {
-		if err != nil {
-			return pcResult, err
-		}
+	if consumerErr != nil {
+		return pcResult, consumerErr
 	}
 	return pcResult, nil
-}
-
-func runPCProducer(ctx context.Context, cfg ProduceConsumeConfig, epoch time.Time,
-	stats *Stats, numRecords, warmupRecords int64, throughput float64, errorCount *atomic.Int64,
-) error {
-	gen := NewPayloadGenerator(cfg.RecordSize)
-
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.DefaultProduceTopic(cfg.Topic),
-		kgo.ProducerBatchMaxBytes(cfg.BatchMaxBytes),
-		kgo.ProducerLinger(time.Duration(cfg.LingerMs) * time.Millisecond),
-		kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
-		kgo.MaxBufferedRecords(cfg.MaxBufferedRecords),
-		kgo.RetryBackoffFn(func(int) time.Duration { return 100 * time.Millisecond }),
-		kgo.RequestRetries(10),
-	}
-
-	switch cfg.Acks {
-	case 0:
-		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()), kgo.DisableIdempotentWrite())
-	case 1:
-		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()), kgo.DisableIdempotentWrite())
-	default:
-		opts = append(opts, kgo.RequiredAcks(kgo.AllISRAcks()))
-	}
-
-	client, err := kgo.NewClient(opts...)
-	if err != nil {
-		return fmt.Errorf("creating producer: %w", err)
-	}
-	defer client.Close()
-
-	startTime := time.Now()
-	throttler := NewThroughputThrottler(throughput, startTime)
-
-	// Reusable key buffer: [warmup(1) | nanos(8)]
-	keyBuf := make([]byte, 9)
-
-	for i := int64(0); i < numRecords; i++ {
-		if ctx.Err() != nil {
-			break
-		}
-
-		val := gen.GenerateCopy()
-
-		isWarmup := i < warmupRecords
-		if isWarmup {
-			keyBuf[0] = 0x00
-		} else {
-			keyBuf[0] = 0x01
-		}
-		binary.BigEndian.PutUint64(keyBuf[1:], uint64(time.Since(epoch).Nanoseconds()))
-
-		key := make([]byte, 9)
-		copy(key, keyBuf)
-
-		record := &kgo.Record{
-			Key:   key,
-			Value: val,
-		}
-
-		sendStart := time.Now()
-		client.Produce(ctx, record, func(_ *kgo.Record, err error) {
-			now := time.Now()
-			latencyMs := int(now.Sub(sendStart).Milliseconds())
-			if err != nil {
-				errorCount.Add(1)
-				return
-			}
-			if !isWarmup {
-				stats.Record(latencyMs, len(val), now)
-			}
-		})
-
-		if throttler.ShouldThrottle(i+1, sendStart) {
-			throttler.Throttle()
-		}
-	}
-
-	_ = client.Flush(ctx)
-	return nil
-}
-
-func consumeLoop(ctx context.Context, client *kgo.Client, epoch time.Time,
-	stats *Stats, produceDone *atomic.Bool, expectedRecords int64, drainTimeout time.Duration,
-) {
-	var drainDeadline time.Time
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		// Once producers are done, start the drain timer.
-		if produceDone.Load() {
-			if drainDeadline.IsZero() {
-				drainDeadline = time.Now().Add(drainTimeout)
-			}
-			if stats.CumConsumed() >= expectedRecords {
-				return
-			}
-			if time.Now().After(drainDeadline) {
-				return
-			}
-		}
-
-		pollCtx, pollCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		fetches := client.PollFetches(pollCtx)
-		pollCancel()
-
-		fetches.EachRecord(func(r *kgo.Record) {
-			// Timestamp each record individually rather than sharing a
-			// single timestamp across the entire fetch batch.
-			now := time.Since(epoch).Nanoseconds()
-
-			if len(r.Key) != 9 {
-				return
-			}
-			if r.Key[0] == 0x00 {
-				return // warmup
-			}
-			sendNanos := int64(binary.BigEndian.Uint64(r.Key[1:9]))
-			e2eMs := int((now - sendNanos) / 1_000_000)
-			if e2eMs < 0 {
-				e2eMs = 0
-			}
-			stats.RecordE2E(e2eMs)
-		})
-	}
 }
