@@ -208,11 +208,57 @@ func (b *Broker) onElected(outerCtx, primaryCtx context.Context) {
 			hw := pd.HW()
 			s3wm := pd.S3FlushWatermark()
 			pd.RUnlock()
+			entries := b.walIndex.PartitionEntries(tp)
 			walMax := b.walIndex.MaxOffset(tp)
 			b.logger.Info("promotion: partition state",
 				"topic", td.Name, "partition", tp.Partition,
 				"hw", hw, "s3_watermark", s3wm, "wal_max_offset", walMax,
-				"wal_entries", len(b.walIndex.PartitionEntries(tp)))
+				"wal_entries", len(entries))
+
+			// Check for overlapping/duplicate entries (different segments
+			// covering the same offset range).
+			var overlaps int
+			var lastSeg uint64
+			var segTransitions int
+			for i := 1; i < len(entries); i++ {
+				if entries[i].SegmentSeq != entries[i-1].SegmentSeq {
+					segTransitions++
+					// Log if we go backwards in segment seq (old tenure interleaved).
+					if entries[i].SegmentSeq < entries[i-1].SegmentSeq {
+						if overlaps == 0 {
+							b.logger.Warn("promotion: WAL index segment regression",
+								"topic", td.Name, "partition", tp.Partition,
+								"idx", i,
+								"prev_offset", entries[i-1].BaseOffset,
+								"prev_seg", entries[i-1].SegmentSeq,
+								"curr_offset", entries[i].BaseOffset,
+								"curr_seg", entries[i].SegmentSeq)
+						}
+						overlaps++
+					}
+				}
+				if entries[i].BaseOffset <= entries[i-1].BaseOffset+int64(entries[i-1].LastOffset-entries[i-1].BaseOffset) {
+					if overlaps == 0 {
+						b.logger.Warn("promotion: WAL index offset overlap",
+							"topic", td.Name, "partition", tp.Partition,
+							"idx", i,
+							"prev_base", entries[i-1].BaseOffset,
+							"prev_last", entries[i-1].LastOffset,
+							"prev_seg", entries[i-1].SegmentSeq,
+							"curr_base", entries[i].BaseOffset,
+							"curr_seg", entries[i].SegmentSeq)
+					}
+					overlaps++
+				}
+				lastSeg = entries[i].SegmentSeq
+			}
+			if overlaps > 0 || segTransitions > 0 {
+				b.logger.Warn("promotion: WAL index analysis",
+					"topic", td.Name, "partition", tp.Partition,
+					"overlaps", overlaps, "seg_transitions", segTransitions,
+					"first_seg", entries[0].SegmentSeq, "last_seg", lastSeg,
+					"entries", len(entries))
+			}
 		}
 	}
 
