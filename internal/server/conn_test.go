@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"log/slog"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -168,5 +171,60 @@ func TestHandlerRegistryBasic(t *testing.T) {
 	// Other keys still nil
 	if h := reg.Get(0); h != nil {
 		t.Fatal("expected nil handler for key 0")
+	}
+}
+
+func TestCloseConnsUnblocksWait(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	handlers := NewHandlerRegistry()
+	srv := NewServer(handlers, shutdownCh, slog.Default())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	serveDone := make(chan struct{})
+	go func() {
+		_ = srv.Serve(ln)
+		close(serveDone)
+	}()
+
+	// Connect a client that stays idle (simulates a consumer blocked on
+	// long-poll Fetch). The server's readLoop blocks on readFrame().
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Wait for the server to register the connection.
+	deadline := time.After(2 * time.Second)
+	for srv.ConnCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("server did not register connection")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Close the listener (no new connections), then close active
+	// connections — same sequence as shutdownPrimary.
+	_ = ln.Close()
+	srv.CloseConns()
+
+	// Wait must return promptly.
+	waitDone := make(chan struct{})
+	go func() {
+		srv.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server.Wait() did not return within 2s after CloseConns()")
 	}
 }
