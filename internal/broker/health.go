@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"time"
@@ -12,6 +13,7 @@ func (b *Broker) startHealthServer() (shutdown func(), err error) {
 	mux.HandleFunc("/livez", b.handleLivez)
 	mux.HandleFunc("/readyz", b.handleReadyz)
 	mux.HandleFunc("/primaryz", b.handlePrimaryz)
+	mux.HandleFunc("/replz", b.handleReplz)
 
 	srv := &http.Server{
 		Handler:      mux,
