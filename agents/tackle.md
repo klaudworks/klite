@@ -19,6 +19,12 @@ fulfills the plan's intent.
    - `go build ./...`
    - `go vet ./...`
    - `go test ./... -count=1`
+   - **If the change touches replication, leader election, WAL, S3 flushing,
+     failover paths, or anything that could affect behavior of a streaming
+     replica setup**, also run the e2e tests:
+     `go test -tags e2e -run TestK3sHelmReplicationFailover -timeout 10m -v ./test/e2e/`
+     These deploy klite into k3s with a standby replica and exercise failover
+     cycles. They require Docker and take several minutes.
    - Any additional verification from the plan
 6. If all green:
    - Commit: `improve(<scope>): <description>`
