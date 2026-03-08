@@ -1521,15 +1521,12 @@ func (b *Broker) abortOrphanedTransactions() {
 			}
 
 			for pid, firstOffset := range openPIDs {
-				controlBatch := cluster.BuildControlBatch(pid, 0, false, b.cfg.Clock.Now().UnixMilli())
-				meta, err := cluster.ParseBatchHeader(controlBatch)
+				raw := cluster.BuildControlBatch(pid, 0, false, b.cfg.Clock.Now().UnixMilli())
+				meta, err := cluster.ParseBatchHeader(raw)
 				if err != nil {
 					b.logger.Warn("abortOrphanedTransactions: failed to parse control batch", "err", err)
 					continue
 				}
-
-				raw := make([]byte, len(controlBatch))
-				copy(raw, controlBatch)
 
 				spare := pd.AcquireSpareChunk(len(raw))
 				pd.Lock()
