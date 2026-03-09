@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
 	s3store "github.com/klaudworks/klite/internal/s3"
@@ -46,9 +47,9 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 	}
 }
 
-func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32) {
-	topics := b.state.GetAllTopics()
-
+// selectDirtyPartition picks the best partition eligible for compaction from
+// the given topics. Returns nil, nil if no partition qualifies.
+func selectDirtyPartition(topics []*cluster.TopicData, minDirty int32, clk clock.Clock) (*cluster.TopicData, *cluster.PartData) {
 	var bestPD *cluster.PartData
 	var bestTD *cluster.TopicData
 	var bestDirty int32
@@ -82,7 +83,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 							maxLagMs = parsed
 						}
 					}
-					if maxLagMs < 9223372036854775807 && b.cfg.Clock.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
+					if maxLagMs < 9223372036854775807 && clk.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
 						// Stale — eligible
 					} else {
 						continue
@@ -98,6 +99,13 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		}
 	}
 
+	return bestTD, bestPD
+}
+
+func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32) {
+	topics := b.state.GetAllTopics()
+
+	bestTD, bestPD := selectDirtyPartition(topics, minDirty, b.cfg.Clock)
 	if bestPD == nil {
 		return
 	}
