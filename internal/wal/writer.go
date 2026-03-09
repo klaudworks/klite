@@ -121,8 +121,9 @@ type Writer struct {
 	mu      sync.Mutex
 	stopped bool
 
-	// noStandbyWarned tracks whether we've logged the no-standby warning
-	noStandbyWarned atomic.Bool
+	// standbyDisconnected tracks whether we've already logged a disconnect
+	// warning for the current disconnected period.
+	standbyDisconnected atomic.Bool
 
 	// localOnlyBatches counts WAL batches written without replication because
 	// the standby was not connected. Reset on standby reconnect.
@@ -393,7 +394,9 @@ func (w *Writer) SetNextSequence(seq uint64) {
 // Safe to call from any goroutine.
 func (w *Writer) SetReplicator(r Replicator) {
 	w.replicator.Store(wrappedReplicator{inner: r})
-	w.noStandbyWarned.Store(false)
+	if r == nil {
+		w.standbyDisconnected.Store(false)
+	}
 }
 
 // getReplicator returns the current Replicator, or nil if none is set.
@@ -508,14 +511,15 @@ func (w *Writer) run() {
 		// Phase 2: fsync local + replicate in parallel
 		var replCh <-chan error
 		repl := w.getReplicator()
-		if written > 0 && repl != nil && repl.Connected() {
+		connected := repl != nil && repl.Connected()
+		if written > 0 && connected {
+			w.logStandbyReconnectedIfNeeded()
 			batch := w.collectBatchBytes(pending[:written])
 			firstSeq, lastSeq := w.batchSeqRange(pending[:written])
 			replCh = repl.Replicate(batch, firstSeq, lastSeq)
-		} else if written > 0 && repl != nil && !repl.Connected() {
+		} else if written > 0 && repl != nil {
 			newTotal := w.localOnlyBatches.Add(int64(written))
-			w.logger.Warn("WAL local-only ack: standby not connected, acking without replication",
-				"batches", written, "local_only_total", newTotal)
+			w.logStandbyDisconnectedOnce(written, newTotal)
 		}
 
 		if written > 0 && w.cfg.FsyncEnabled && w.current != nil && w.current.file != nil {
@@ -562,9 +566,6 @@ func (w *Writer) run() {
 				go func(ch <-chan error) { <-ch }(replCh)
 			}
 
-			if repl != nil && !repl.Connected() {
-				w.logNoStandbyOnce()
-			}
 		}
 		pending = pending[:0]
 		w.maybePreCreateSegment()
@@ -704,10 +705,16 @@ func parseSequence(entry []byte) uint64 {
 	return binary.BigEndian.Uint64(entry[8:16])
 }
 
-func (w *Writer) logNoStandbyOnce() {
-	if !w.noStandbyWarned.Load() {
-		w.logger.Warn("replicator configured but no standby connected, proceeding with local fsync only")
-		w.noStandbyWarned.Store(true)
+func (w *Writer) logStandbyDisconnectedOnce(batches int, localOnlyTotal int64) {
+	if w.standbyDisconnected.CompareAndSwap(false, true) {
+		w.logger.Warn("WAL local-only ack: standby not connected, acking without replication",
+			"batches", batches, "local_only_total", localOnlyTotal)
+	}
+}
+
+func (w *Writer) logStandbyReconnectedIfNeeded() {
+	if w.standbyDisconnected.CompareAndSwap(true, false) {
+		w.logger.Info("WAL sync replication connectivity restored")
 	}
 }
 
@@ -720,7 +727,6 @@ func (w *Writer) LocalOnlyBatches() int64 {
 // ResetLocalOnlyBatches resets the local-only batch counter (e.g. on standby reconnect).
 func (w *Writer) ResetLocalOnlyBatches() {
 	w.localOnlyBatches.Store(0)
-	w.noStandbyWarned.Store(false)
 }
 
 // rotateSegment closes the current segment and switches to the next one.

@@ -2,8 +2,11 @@ package wal
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,6 +54,12 @@ func (m *mockReplicator) Connected() bool {
 	return m.connected
 }
 
+func (m *mockReplicator) setConnected(connected bool) {
+	m.mu.Lock()
+	m.connected = connected
+	m.mu.Unlock()
+}
+
 func (m *mockReplicator) resolvePending(idx int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -69,6 +78,11 @@ func (m *mockReplicator) getCalls() []mockReplCall {
 
 func newTestWriter(t *testing.T, repl Replicator) *Writer {
 	t.Helper()
+	return newTestWriterWithLogger(t, repl, nil)
+}
+
+func newTestWriterWithLogger(t *testing.T, repl Replicator, logger *slog.Logger) *Writer {
+	t.Helper()
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
 
@@ -80,6 +94,7 @@ func newTestWriter(t *testing.T, repl Replicator) *Writer {
 		FsyncEnabled:    false,
 		Clock:           clock.RealClock{},
 		Replicator:      repl,
+		Logger:          logger,
 	}
 
 	w, err := NewWriter(cfg, idx)
@@ -91,6 +106,41 @@ func newTestWriter(t *testing.T, repl Replicator) *Writer {
 	}
 	t.Cleanup(w.Stop)
 	return w
+}
+
+type logCaptureHandler struct {
+	mu      sync.Mutex
+	entries []capturedLog
+}
+
+type capturedLog struct {
+	level slog.Level
+	msg   string
+}
+
+func (h *logCaptureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logCaptureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.entries = append(h.entries, capturedLog{level: r.Level, msg: r.Message})
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *logCaptureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *logCaptureHandler) WithGroup(string) slog.Handler { return h }
+
+func (h *logCaptureHandler) count(level slog.Level, msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	count := 0
+	for _, entry := range h.entries {
+		if entry.level == level && strings.Contains(entry.msg, msg) {
+			count++
+		}
+	}
+	return count
 }
 
 func TestWriterReplicatorNil(t *testing.T) {
@@ -421,6 +471,64 @@ func TestWriterAcksAll_ReplErrorPropagates(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("second write timeout")
+	}
+}
+
+func TestWriterReplicationConnectivityTransitionLogging(t *testing.T) {
+	t.Parallel()
+
+	repl := &mockReplicator{connected: false}
+	logs := &logCaptureHandler{}
+	w := newTestWriterWithLogger(t, repl, slog.New(logs))
+
+	entry := func(offset int64) *Entry {
+		return &Entry{
+			TopicID:   [16]byte{1, 2, 3},
+			Partition: 0,
+			Offset:    offset,
+			Data:      makeTestBatch(1, 1000),
+		}
+	}
+
+	if err := w.Append(entry(0)); err != nil {
+		t.Fatalf("first disconnected append: %v", err)
+	}
+	if got := logs.count(slog.LevelWarn, "WAL local-only ack: standby not connected"); got != 1 {
+		t.Fatalf("expected 1 disconnect warning after first append, got %d", got)
+	}
+
+	if err := w.Append(entry(1)); err != nil {
+		t.Fatalf("second disconnected append: %v", err)
+	}
+	if got := logs.count(slog.LevelWarn, "WAL local-only ack: standby not connected"); got != 1 {
+		t.Fatalf("expected disconnect warning to stay at 1 while disconnected, got %d", got)
+	}
+
+	repl.setConnected(true)
+	errCh, err := w.AppendAsync(entry(2), AppendOpts{RequireReplACK: true})
+	if err != nil {
+		t.Fatalf("append on reconnect: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	repl.resolvePending(0, nil)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil replication error after reconnect, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for acks=-1 append after reconnect")
+	}
+	if got := logs.count(slog.LevelInfo, "WAL sync replication connectivity restored"); got != 1 {
+		t.Fatalf("expected 1 reconnect info log, got %d", got)
+	}
+
+	repl.setConnected(false)
+	if err := w.Append(entry(3)); err != nil {
+		t.Fatalf("append after second disconnect: %v", err)
+	}
+	if got := logs.count(slog.LevelWarn, "WAL local-only ack: standby not connected"); got != 2 {
+		t.Fatalf("expected second disconnect warning after reconnect cycle, got %d", got)
 	}
 }
 
