@@ -8,7 +8,8 @@ Estimate your monthly object storage costs based on your workload parameters.
 <div id="calc">
   <div class="tablist-wrapper not-content">
     <ul role="tablist" class="provider-tablist">
-      <li role="presentation" class="tab"><a role="tab" class="provider-tab active" data-provider="aws">AWS S3</a></li>
+      <li role="presentation" class="tab"><a role="tab" class="provider-tab active" data-provider="hetzner">Hetzner</a></li>
+      <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="aws">AWS S3</a></li>
       <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="gcs">GCS</a></li>
       <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="azure">Azure Blob (on roadmap)</a></li>
     </ul>
@@ -56,6 +57,7 @@ Estimate your monthly object storage costs based on your workload parameters.
         <tr><th></th><th>Count/month</th><th>Cost/month</th></tr>
       </thead>
       <tbody>
+        <tr id="baseFeeRow" style="display:none"><td>Base fee</td><td id="baseFeeNote"></td><td id="baseFeeCost">—</td></tr>
         <tr><td id="putLabel">PUT</td><td id="putCount">—</td><td id="putCost">—</td></tr>
         <tr><td id="getLabel">GET</td><td id="getCount">—</td><td id="getCost">—</td></tr>
         <tr><td id="listLabel">LIST</td><td id="listCount">—</td><td id="listCost">—</td></tr>
@@ -235,8 +237,20 @@ The main API cost driver is **object store reads**: consumers fetching data that
   var M = 2592000;
 
   var PROVIDERS = {
+    hetzner: {
+      put: 0, get: 0, list: 0, storage: 0.006, baseFee: 5.99, includedStorageGB: 1024,
+      note: 'Fsn1 / Hel1, S3-compatible. Base fee includes 1 TB storage + 1 TB egress.',
+      egress: '~$0.0012/GB (1 TB included)',
+      putLabel: 'PUT', getLabel: 'GET', listLabel: 'LIST',
+      pricingRows: [
+        ['Base fee', '$5.99/month (includes 1 TB storage + 1 TB egress)'],
+        ['All S3 API calls', 'Free'],
+        ['Storage (over 1 TB)', '$0.006 per GB-month'],
+        ['Egress (over 1 TB)', '$0.0012 per GB']
+      ]
+    },
     aws: {
-      put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.023,
+      put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.023, baseFee: 0, includedStorageGB: 0,
       note: 'US East (N. Virginia), S3 Standard.',
       egress: '~$0.09/GB',
       putLabel: 'PUT', getLabel: 'GET', listLabel: 'LIST',
@@ -248,7 +262,7 @@ The main API cost driver is **object store reads**: consumers fetching data that
       ]
     },
     gcs: {
-      put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.020,
+      put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.020, baseFee: 0, includedStorageGB: 0,
       note: 'US multi-region / us-central1, Standard class. Same pricing via S3-compatible XML API.',
       egress: '~$0.12/GB',
       putLabel: 'Class A (write)', getLabel: 'Class B (read)', listLabel: 'Class A (list)',
@@ -260,7 +274,7 @@ The main API cost driver is **object store reads**: consumers fetching data that
       ]
     },
     azure: {
-      put: 0.0081 / 1000, get: 0.0005 / 1000, list: 0.0081 / 1000, storage: 0.0184,
+      put: 0.0081 / 1000, get: 0.0005 / 1000, list: 0.0081 / 1000, storage: 0.0184, baseFee: 0, includedStorageGB: 0,
       note: 'East US, Hot tier, LRS redundancy.',
       egress: '~$0.087/GB',
       putLabel: 'Write (Put)', getLabel: 'Read (Get)', listLabel: 'Write (List)',
@@ -273,7 +287,7 @@ The main API cost driver is **object store reads**: consumers fetching data that
     }
   };
 
-  var currentProvider = 'aws';
+  var currentProvider = 'hetzner';
 
   function fmt(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
@@ -300,6 +314,14 @@ The main API cost driver is **object store reads**: consumers fetching data that
     document.getElementById('putLabel').textContent = p.putLabel;
     document.getElementById('getLabel').textContent = p.getLabel;
     document.getElementById('listLabel').textContent = p.listLabel;
+    var baseFeeRow = document.getElementById('baseFeeRow');
+    if (p.baseFee > 0) {
+      baseFeeRow.style.display = '';
+      document.getElementById('baseFeeNote').textContent = 'incl. ' + (p.includedStorageGB / 1024).toFixed(0) + ' TB storage';
+      document.getElementById('baseFeeCost').textContent = usd(p.baseFee);
+    } else {
+      baseFeeRow.style.display = 'none';
+    }
     renderPricingTable();
   }
 
@@ -339,8 +361,9 @@ The main API cost driver is **object store reads**: consumers fetching data that
     var putCost = totalPUTs * p.put;
     var getCost = totalGETs * p.get;
     var listCost = totalLISTs * p.list;
-    var storageCostVal = storageGB * p.storage;
-    var total = putCost + getCost + listCost + storageCostVal;
+    var billableGB = Math.max(0, storageGB - p.includedStorageGB);
+    var storageCostVal = billableGB * p.storage;
+    var total = p.baseFee + putCost + getCost + listCost + storageCostVal;
 
     document.getElementById('putCount').textContent = fmt(totalPUTs);
     document.getElementById('putCost').textContent = usd(putCost);
