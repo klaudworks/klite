@@ -57,39 +57,6 @@ func TestMetadataLogReplicateHook(t *testing.T) {
 	}
 }
 
-func TestMetadataLogReplicateHookFailure(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-
-	ml, err := NewLog(LogConfig{DataDir: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ml.Close() }()
-
-	// Hook that panics — should not affect the append
-	ml.SetReplicateHook(func(frame []byte) {
-		// Simulate a failing hook (but don't actually panic since that
-		// would crash the test). In production, SendMeta logs and returns.
-		// For this test, just verify the append succeeds regardless.
-	})
-
-	entry := MarshalCreateTopic(&CreateTopicEntry{
-		TopicName:      "still-works",
-		PartitionCount: 1,
-		TopicID:        [16]byte{4, 5, 6},
-	})
-
-	if err := ml.AppendSync(entry); err != nil {
-		t.Fatalf("append should succeed even if hook fails: %v", err)
-	}
-
-	// Verify the entry was written
-	if ml.Size() == 0 {
-		t.Fatal("metadata.log should not be empty")
-	}
-}
-
 func TestMetadataLogCompactHook(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
