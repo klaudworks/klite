@@ -24,8 +24,16 @@ fulfills the plan's intent.
      If a pre-existing test fails, investigate and fix it. Do not skip,
      disable, or mark tests as expected-fail to work around breakage.
      A "passing" build with suppressed failures is worse than a red build.
-   - **Do NOT run e2e tests** (`test/e2e/`). They are not stable yet.
-   - Any additional verification from the plan
+    - **E2E tests**: If the change touches core functionality that is
+      indirectly tested by `test/e2e/k3s_test.go` — failover, replication,
+      WAL replay, S3 flush, promotion/demotion, PID dedup, offset
+      continuity, or CLI flag defaults — run the e2e tests to verify:
+      `go test -tags e2e -timeout 15m -v ./test/e2e/`
+      These tests deploy klite into k3s with replication and exercise
+      two failover cycles with a continuous producer, verifying zero
+      data loss. If you're unsure whether your change could affect
+      failover behavior, run them.
+    - Any additional verification from the plan
 7. If all green:
    - Commit: `improve(<scope>): <description>`
      Use a scope that fits: `lint`, `errors`, `refactor`, `tests`, `docs`,
