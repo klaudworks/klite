@@ -406,11 +406,14 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	if len(coldBatches) > 0 {
 		coldBatches = filterBatchesByHW(coldBatches, hw)
 		if len(coldBatches) > 0 {
-			if coldBatches[0].BaseOffset > fetchOffset && fetchOffset >= s3WM {
+			if s3Fetch != nil && coldBatches[0].BaseOffset > fetchOffset && fetchOffset >= s3WM {
 				// Cold path returned data starting after the requested
 				// offset, and the gap is above the S3 watermark (data
 				// that should be in chunks/WAL but hasn't been flushed).
 				// Suppress to avoid the consumer skipping the gap.
+				// Only suppress when S3 is configured — without S3 the
+				// data is gone and suppressing would cause an infinite
+				// retry loop.
 				if now := time.Now().UnixNano(); now-lastColdGapLog.Load() > int64(time.Second) {
 					lastColdGapLog.Store(now)
 					slog.Warn("fetch: suppressing cold path gap",
@@ -443,7 +446,9 @@ func (pd *PartData) Fetch(fetchOffset int64, maxBytes int32) FetchResponse {
 	// this would cause the consumer to skip records in the gap. Return an
 	// empty response so the consumer retries (and triggers the long-poll
 	// wait path). The data should eventually appear via S3 listing refresh.
-	if len(chunkBatches) > 0 && chunkBatches[0].BaseOffset > fetchOffset {
+	// Only suppress when S3 is configured — without S3 the data is gone
+	// and suppressing would cause an infinite retry loop.
+	if s3Fetch != nil && len(chunkBatches) > 0 && chunkBatches[0].BaseOffset > fetchOffset {
 		if now := time.Now().UnixNano(); now-lastChunkFallbackLog.Load() > int64(time.Second) {
 			lastChunkFallbackLog.Store(now)
 			slog.Warn("fetch: suppressing chunk fallback gap",

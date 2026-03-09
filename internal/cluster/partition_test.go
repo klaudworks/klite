@@ -1132,13 +1132,18 @@ func TestSkipOffsetsOutOfOrder(t *testing.T) {
 }
 
 // TestFetchGapSuppressesChunkFallback verifies that Fetch returns empty when
-// the requested offset falls in a gap before chunk data. This prevents the
-// consumer from skipping ahead past offsets that may exist in S3 but haven't
-// been fetched yet. The consumer will retry, giving S3 time to serve the gap.
+// the requested offset falls in a gap before chunk data and S3 is configured.
+// This prevents the consumer from skipping ahead past offsets that may exist
+// in S3 but haven't been fetched yet. The consumer will retry, giving S3 time
+// to serve the gap.
 func TestFetchGapSuppressesChunkFallback(t *testing.T) {
 	t.Parallel()
 
 	pd := newTestPartitionWithChunks()
+	// Gap suppression only activates when S3 is configured — without S3
+	// there is no fallback source, so returning available data is better
+	// than an infinite retry loop.
+	pd.SetS3Fetcher(&mockS3Fetcher{batches: nil})
 
 	raw0 := makeSimpleBatch(3, 1000)
 	raw1 := makeSimpleBatch(3, 2000)
