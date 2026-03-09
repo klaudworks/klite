@@ -251,11 +251,11 @@ func TestDefaultConfig(t *testing.T) {
 	}
 
 	// Compaction defaults
-	if cfg.CompactionCheckInterval != 30*time.Second {
-		t.Errorf("CompactionCheckInterval = %v, want 30s", cfg.CompactionCheckInterval)
+	if cfg.CompactionCheckInterval != 2*time.Minute {
+		t.Errorf("CompactionCheckInterval = %v, want 2m", cfg.CompactionCheckInterval)
 	}
-	if cfg.CompactionMinDirtyObjects != 4 {
-		t.Errorf("CompactionMinDirtyObjects = %d, want 4", cfg.CompactionMinDirtyObjects)
+	if cfg.CompactionMinDirtyObjects != 16 {
+		t.Errorf("CompactionMinDirtyObjects = %d, want 16", cfg.CompactionMinDirtyObjects)
 	}
 	if cfg.CompactionReadRate != 50*1024*1024 {
 		t.Errorf("CompactionReadRate = %d, want %d", cfg.CompactionReadRate, 50*1024*1024)

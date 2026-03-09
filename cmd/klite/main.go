@@ -166,13 +166,13 @@ func main() {
 			// Compaction
 			&cli.DurationFlag{
 				Name:        "compaction-check-interval",
-				Usage:       "How often to scan dirty counters (default: 30s)",
+				Usage:       "How often to scan dirty counters (default: 2m)",
 				Value:       cfg.CompactionCheckInterval,
 				Destination: &cfg.CompactionCheckInterval,
 			},
 			&cli.IntFlag{
 				Name:        "compaction-min-dirty-objects",
-				Usage:       "Min dirty S3 objects before compaction triggers (default: 4)",
+				Usage:       "Min dirty S3 objects before compaction triggers (default: 16)",
 				Value:       cfg.CompactionMinDirtyObjects,
 				Destination: &cfg.CompactionMinDirtyObjects,
 			},

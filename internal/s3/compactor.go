@@ -198,6 +198,12 @@ func (c *Compactor) compactWindow(
 	currentCleanedUpTo int64,
 	deleteRetentionMs int64,
 ) (int64, error) {
+	sourceObjects := len(window)
+	var sourceBytes int64
+	for _, wo := range window {
+		sourceBytes += wo.size
+	}
+
 	type cachedObj struct {
 		key      string
 		rawBytes []byte
@@ -309,6 +315,13 @@ func (c *Compactor) compactWindow(
 		c.client.DeleteObjectsBatch(ctx, keys)
 
 		c.reader.InvalidateFooters(topic, topicID, partition)
+		c.logger.Info("compaction window complete",
+			"topic", topic,
+			"partition", partition,
+			"source_objects", sourceObjects,
+			"source_bytes", sourceBytes,
+			"output_bytes", 0,
+			"watermark", lastOffset)
 
 		return lastOffset, nil
 	}
@@ -343,6 +356,14 @@ func (c *Compactor) compactWindow(
 	if len(deleteKeys) > 0 {
 		c.client.DeleteObjectsBatch(ctx, deleteKeys)
 	}
+
+	c.logger.Info("compaction window complete",
+		"topic", topic,
+		"partition", partition,
+		"source_objects", sourceObjects,
+		"source_bytes", sourceBytes,
+		"output_bytes", len(outputData),
+		"watermark", newWatermark)
 
 	return newWatermark, nil
 }

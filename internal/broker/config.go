@@ -56,8 +56,8 @@ type Config struct {
 	RetentionCheckInterval time.Duration // How often the retention goroutine runs (default 1h)
 
 	// Compaction configuration (Phase 6)
-	CompactionCheckInterval   time.Duration // How often to scan dirty counters (default 30s)
-	CompactionMinDirtyObjects int           // Min dirty objects before compaction triggers (default 4)
+	CompactionCheckInterval   time.Duration // How often to scan dirty counters (default 2m)
+	CompactionMinDirtyObjects int           // Min dirty objects before compaction triggers (default 16)
 	CompactionWindowBytes     int64         // Max source object size per window (default 256 MiB)
 	CompactionS3Concurrency   int           // Max concurrent S3 GETs for compaction (default 4)
 	CompactionReadRate        int           // Max S3 read bytes/sec for compaction (default 50 MiB/s, 0 = unlimited)
@@ -126,8 +126,8 @@ func DefaultConfig() Config {
 		RetentionCheckInterval: 1 * time.Hour,
 
 		// Compaction defaults
-		CompactionCheckInterval:         30 * time.Second,
-		CompactionMinDirtyObjects:       4,
+		CompactionCheckInterval:         2 * time.Minute,
+		CompactionMinDirtyObjects:       16,
 		CompactionReadRate:              50 * 1024 * 1024, // 50 MiB/s
 		MetadataCompactionCheckInterval: 30 * time.Second,
 		MetadataCompactionMinSizeBytes:  64 * 1024 * 1024,

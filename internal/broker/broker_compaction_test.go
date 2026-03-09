@@ -128,7 +128,7 @@ func TestSelectDirtyPartition_StaleButNotExceeded(t *testing.T) {
 	assert.Nil(t, gotPD)
 }
 
-func TestSelectDirtyPartition_NeverCompactedAlwaysEligible(t *testing.T) {
+func TestSelectDirtyPartition_NeverCompactedBelowThresholdSkipped(t *testing.T) {
 	t.Parallel()
 	td := makeTopic("never-compacted", map[string]string{
 		"cleanup.policy": "compact",
@@ -136,6 +136,18 @@ func TestSelectDirtyPartition_NeverCompactedAlwaysEligible(t *testing.T) {
 
 	clk := clock.NewFakeClock(time.Now())
 	gotTD, gotPD := selectDirtyPartition([]*cluster.TopicData{td}, 100, clk)
+	assert.Nil(t, gotTD)
+	assert.Nil(t, gotPD)
+}
+
+func TestSelectDirtyPartition_NeverCompactedAtThresholdEligible(t *testing.T) {
+	t.Parallel()
+	td := makeTopic("never-compacted", map[string]string{
+		"cleanup.policy": "compact",
+	}, []int32{5})
+
+	clk := clock.NewFakeClock(time.Now())
+	gotTD, gotPD := selectDirtyPartition([]*cluster.TopicData{td}, 5, clk)
 	require.NotNil(t, gotTD)
 	require.NotNil(t, gotPD)
 	assert.Equal(t, "never-compacted", gotTD.Name)

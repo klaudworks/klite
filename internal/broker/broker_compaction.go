@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"strings"
 
@@ -42,6 +43,7 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			b.logger.Debug("compaction scan tick", "interval", interval, "min_dirty_objects", minDirty)
 			b.compactOneDirtyPartition(ctx, compactor, int32(minDirty))
 		}
 	}
@@ -68,22 +70,22 @@ func selectDirtyPartition(topics []*cluster.TopicData, minDirty int32, clk clock
 
 			// Eligibility check
 			if dirty < minDirty {
-				// Check staleness guarantee
+				// Check staleness guarantee.
 				lc := pd.LastCompacted()
 				switch {
-				case lc.IsZero() && dirty > 0:
-					// Never compacted and has dirty objects — eligible
+				case lc.IsZero():
+					continue
 				case dirty <= 0:
 					continue
 				default:
 					// Check max.compaction.lag.ms
-					maxLagMs := int64(9223372036854775807) // math.MaxInt64
+					maxLagMs := int64(math.MaxInt64)
 					if v, ok := td.GetConfig("max.compaction.lag.ms"); ok {
 						if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
 							maxLagMs = parsed
 						}
 					}
-					if maxLagMs < 9223372036854775807 && clk.Since(lc).Milliseconds() > maxLagMs && dirty > 0 {
+					if maxLagMs < int64(math.MaxInt64) && clk.Since(lc).Milliseconds() > maxLagMs {
 						// Stale — eligible
 					} else {
 						continue
@@ -107,8 +109,10 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 
 	bestTD, bestPD := selectDirtyPartition(topics, minDirty, b.cfg.Clock)
 	if bestPD == nil {
+		b.logger.Debug("compaction scan found no eligible partitions", "min_dirty_objects", minDirty)
 		return
 	}
+	dirtyObjects := bestPD.DirtyObjects()
 
 	minCompactionLagMs := int64(0)
 	if v, ok := bestTD.GetConfig("min.compaction.lag.ms"); ok {
@@ -152,6 +156,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		bestPD.Unlock()
 		b.logger.Info("compaction complete",
 			"topic", bestTD.Name, "partition", bestPD.Index,
-			"cleaned_up_to", newWatermark)
+			"cleaned_up_to", newWatermark,
+			"dirty_objects", dirtyObjects)
 	}
 }

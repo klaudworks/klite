@@ -61,6 +61,22 @@ When `--s3-endpoint` is set, path-style addressing is enabled automatically (req
 
 The flush interval and size threshold together determine your recovery point objective (RPO). With the defaults (60s / 64 MB per partition), at most 60 seconds of data per partition is at risk if the disk is lost before the next flush. Lower the interval for tighter RPO at the cost of more S3 PUT requests.
 
+### S3 compaction
+
+Compaction rewrites overlapping S3 objects for topics using `cleanup.policy=compact`, removing superseded keys and expired tombstones.
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--compaction-check-interval` | *(flag only)* | `2m` | How often klite scans partition dirty counters for compaction eligibility. |
+| `--compaction-min-dirty-objects` | *(flag only)* | `16` | Minimum dirty objects before a partition is considered for compaction. |
+| `--compaction-read-rate` | *(flag only)* | `52428800` | Max S3 read throughput for compaction in bytes/sec (50 MiB/s). Set `0` for unlimited. |
+
+Tuning guidance:
+
+- **Low-traffic clusters**: use lower thresholds (for example, `--compaction-check-interval=30s` and `--compaction-min-dirty-objects=4`) to reclaim space sooner.
+- **High-throughput clusters**: keep or raise defaults (for example, `2m`/`16` or `5m`/`32`) to reduce constant background compaction pressure.
+- **Fetch latency sensitive workloads**: keep `--compaction-read-rate` capped so compaction reads do not contend with client fetches.
+
 ## Topics
 
 | Flag | Env | Default | Description |
