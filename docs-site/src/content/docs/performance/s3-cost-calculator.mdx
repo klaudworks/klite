@@ -14,7 +14,7 @@ Estimate your monthly object storage costs based on your workload parameters.
       <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="azure">Azure Blob (on roadmap)</a></li>
     </ul>
   </div>
-  <p class="provider-note" id="providerNote">Fsn1 / Hel1, S3-compatible. Base fee includes 1 TB storage + 1 TB egress.</p>
+  <p class="provider-note" id="providerNote">Fsn1 / Nbg1 / Hel1, S3-compatible.</p>
 
   <div class="calc-grid">
     <div class="calc-field">
@@ -239,11 +239,11 @@ The main API cost driver is **object store reads**: consumers fetching data that
   var PROVIDERS = {
     hetzner: {
       put: 0, get: 0, list: 0, storage: 0.006, baseFee: 5.99, includedStorageGB: 1024,
-      note: 'Fsn1 / Hel1, S3-compatible. Base fee includes 1 TB storage + 1 TB egress.',
+      note: 'Fsn1 / Nbg1 / Hel1, S3-compatible.',
       egress: '~$0.0012/GB (1 TB included)',
       putLabel: 'PUT', getLabel: 'GET', listLabel: 'LIST',
       pricingRows: [
-        ['Base fee', '$5.99/month (includes 1 TB storage + 1 TB egress)'],
+        ['Base fee (incl. 1 TB storage + 1 TB egress)', '$5.99/month'],
         ['All S3 API calls', 'Free'],
         ['Storage (over 1 TB)', '$0.006 per GB-month'],
         ['Egress (over 1 TB)', '$0.0012 per GB']
@@ -263,7 +263,7 @@ The main API cost driver is **object store reads**: consumers fetching data that
     },
     gcs: {
       put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.020, baseFee: 0, includedStorageGB: 0,
-      note: 'US multi-region / us-central1, Standard class. Same pricing via S3-compatible XML API.',
+      note: 'US multi-region / us-central1, Standard class, via S3-compatible XML API.',
       egress: '~$0.12/GB',
       putLabel: 'Class A (write)', getLabel: 'Class B (read)', listLabel: 'Class A (list)',
       pricingRows: [
@@ -317,7 +317,7 @@ The main API cost driver is **object store reads**: consumers fetching data that
     var baseFeeRow = document.getElementById('baseFeeRow');
     if (p.baseFee > 0) {
       baseFeeRow.style.display = '';
-      document.getElementById('baseFeeLabel').textContent = 'Base fee (incl. 1 TB storage + 1 TB egress)';
+      document.getElementById('baseFeeLabel').textContent = 'Base fee';
       document.getElementById('baseFeeNote').textContent = '';
       document.getElementById('baseFeeCost').textContent = usd(p.baseFee);
     } else {
