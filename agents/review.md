@@ -8,12 +8,15 @@ You are reviewing a change made by a previous iteration.
 2. `br show <review-issue-id> --format toon -q` — the description contains
    the **commit hash**. The `discovered-from` dependency points to the
    **original issue**.
+   - Command hygiene: after opening the review issue, do **not** run broad
+     backlog commands (`br ready`, `br list`) unless you are explicitly
+     selecting new work.
 3. `git show <commit-hash>` — read the full diff
 4. If the diff isn't enough to understand the change (large refactors,
    structural moves), read the affected files in their final state. Start
    from the diff, then read whatever you need to fully understand the result.
 5. `br show <original-issue-id> --format toon -q` — understand what was being improved
-6. `br comments <original-issue-id> --format toon -q` — read the plan that was executed
+6. `br comments list <original-issue-id>` — read the plan that was executed
 7. Evaluate (klite is in active development with no external consumers —
    backwards compatibility is not a constraint, so renamed exports, changed
    package structure, and altered internal APIs are fine if they improve things):

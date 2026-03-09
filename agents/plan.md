@@ -19,6 +19,9 @@ the code better.
 
 1. `br update <issue-id> --status in_progress`
 2. `br show <issue-id> --format toon -q` — read the issue description
+   - Command hygiene: once you have `<issue-id>`, do **not** run broad backlog
+     commands (`br ready`, `br list`) in this iteration unless you are
+     explicitly selecting the next issue. Keep context focused on this issue.
 3. Read the relevant source files. Understand the current state thoroughly.
    For refactors, trace callers and callees. For error handling, trace the
    full error path. For structural changes, map out the current organization.
@@ -62,7 +65,7 @@ the code better.
    br comments add <issue-id> "Plan: <plan>"
    ```
 10. Promote to ready-for-implementation (status goes back to open so
-    `br ready` picks it up, priority P1 so it's next):
+     `br ready` picks it up, priority P1 so it's next):
     ```
     br update <issue-id> --status open -p 1
     br label remove <issue-id> needs-plan
