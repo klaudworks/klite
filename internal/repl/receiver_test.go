@@ -220,8 +220,20 @@ func TestReceiverSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Give the receiver time to process
-	time.Sleep(100 * time.Millisecond)
+	// Send a WAL batch after the snapshot; its ACK proves the snapshot was processed.
+	var entriesBuf bytes.Buffer
+	entriesBuf.Write(makeTestWALEntry(100))
+	probe := MarshalWALBatch(100, 100, 1, 0, entriesBuf.Bytes())
+	if err := WriteFrame(primary, MsgWALBatch, probe); err != nil {
+		t.Fatal(err)
+	}
+	msgType, _, err := ReadFrame(primary)
+	if err != nil {
+		t.Fatalf("ReadFrame ACK: %v", err)
+	}
+	if msgType != MsgACK {
+		t.Fatalf("expected ACK, got %#x", msgType)
+	}
 
 	if !ma.SnapshotApplied() {
 		t.Fatal("snapshot was not applied")
@@ -233,8 +245,8 @@ func TestReceiverSnapshot(t *testing.T) {
 	}
 	ma.mu.Unlock()
 
-	if wa.NextSequence() != 100 {
-		t.Errorf("nextSeq: got %d, want 100", wa.NextSequence())
+	if wa.NextSequence() != 101 {
+		t.Errorf("nextSeq: got %d, want 101", wa.NextSequence())
 	}
 }
 
@@ -364,7 +376,20 @@ func TestReceiverMetaEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	// Send a WAL batch after the meta entry; its ACK proves the meta entry was processed.
+	var entriesBuf bytes.Buffer
+	entriesBuf.Write(makeTestWALEntry(0))
+	probe := MarshalWALBatch(0, 0, 1, 0, entriesBuf.Bytes())
+	if err := WriteFrame(primary, MsgWALBatch, probe); err != nil {
+		t.Fatal(err)
+	}
+	msgType, _, err := ReadFrame(primary)
+	if err != nil {
+		t.Fatalf("ReadFrame ACK: %v", err)
+	}
+	if msgType != MsgACK {
+		t.Fatalf("expected ACK, got %#x", msgType)
+	}
 
 	if ma.RawCount() != 1 {
 		t.Errorf("raw entries: got %d, want 1", ma.RawCount())
@@ -799,8 +824,20 @@ func TestWatermarkPiggyback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Keepalives don't produce ACKs, so give a moment for processing.
-	time.Sleep(50 * time.Millisecond)
+	// Send a real WAL batch after the keepalive; its ACK proves the keepalive was processed.
+	entriesBuf.Reset()
+	entriesBuf.Write(makeTestWALEntry(2))
+	probe := MarshalWALBatch(2, 2, 1, 1500, entriesBuf.Bytes())
+	if err := WriteFrame(primary, MsgWALBatch, probe); err != nil {
+		t.Fatal(err)
+	}
+	msgType, _, err = ReadFrame(primary)
+	if err != nil {
+		t.Fatalf("ReadFrame ACK: %v", err)
+	}
+	if msgType != MsgACK {
+		t.Fatalf("expected ACK, got %#x", msgType)
+	}
 
 	if wm := wa.getS3FlushWatermark(); wm != 1500 {
 		t.Errorf("s3FlushWatermark after keepalive: got %d, want 1500", wm)
