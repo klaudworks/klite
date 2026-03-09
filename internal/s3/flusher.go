@@ -333,7 +333,10 @@ func (f *Flusher) scanAndFlush(ctx context.Context, flushAll bool) error {
 			}
 
 			if f.cfg.Reader != nil {
-				f.cfg.Reader.InvalidateListings(job.Topic, job.TopicID, job.Partition)
+				f.cfg.Reader.AppendToListing(job.Topic, job.TopicID, job.Partition, ObjectInfo{
+					Key:  key,
+					Size: int64(len(objectData)),
+				})
 			}
 
 			lastBatch := batches[len(batches)-1]

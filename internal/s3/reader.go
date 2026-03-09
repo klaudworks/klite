@@ -338,6 +338,23 @@ func (r *Reader) InvalidateListings(topic string, topicID [16]byte, partition in
 	r.listingMu.Unlock()
 }
 
+// AppendToListing appends a newly flushed object to the cached listing for a
+// partition. If the listing was invalidated (e.g. by compaction) or was never
+// populated, this is a no-op — the next consumer fetch will re-LIST from S3.
+//
+// Flush only ever adds objects with strictly increasing offsets, so appending
+// preserves the sort order that findObjectForOffset relies on.
+func (r *Reader) AppendToListing(topic string, topicID [16]byte, partition int32, obj ObjectInfo) {
+	prefix := ObjectKeyPrefix(r.client.prefix, topic, topicID, partition)
+	r.listingMu.Lock()
+	defer r.listingMu.Unlock()
+	existing, ok := r.listingCache[prefix]
+	if !ok {
+		return
+	}
+	r.listingCache[prefix] = append(existing, obj)
+}
+
 func (r *Reader) InvalidateAll() {
 	r.footerMu.Lock()
 	r.footerCache = make(map[string]*Footer)

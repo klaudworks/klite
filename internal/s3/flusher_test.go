@@ -822,6 +822,140 @@ func TestUpdateGlobalFlushWatermark_AllFlushed(t *testing.T) {
 	assert.Equal(t, walWriter.NextSequence(), walWriter.S3FlushWatermark())
 }
 
+// --- Listing cache interaction tests ---
+
+func TestScanAndFlush_AppendsToListingCache(t *testing.T) {
+	t.Parallel()
+
+	pool := chunk.NewPool(10*1024*1024, 1024*1024)
+	chunks := []*chunk.Chunk{
+		makeTestChunk(pool, []chunk.ChunkBatch{
+			{BaseOffset: 0, LastOffsetDelta: 4},
+		}),
+	}
+
+	provider := &stubPartitionProvider{
+		partitions: []FlushPartition{{
+			Topic:       "test-topic",
+			Partition:   0,
+			TopicID:     [16]byte{0xAA},
+			SealedBytes: 2 * 1024 * 1024,
+			DetachChunks: func(flushAll bool) ([]*chunk.Chunk, *chunk.Pool) {
+				return chunks, pool
+			},
+			AdvanceWatermark: func(wm int64) {},
+		}},
+	}
+
+	mem := NewInMemoryS3()
+	clk := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	mem.SetClock(clk)
+
+	client := NewClient(ClientConfig{
+		S3Client: mem,
+		Bucket:   "test-bucket",
+		Prefix:   "test-prefix",
+	})
+	reader := NewReader(client, nil)
+
+	// Pre-populate listing cache by fetching (will be empty but cached).
+	ctx := context.Background()
+	prefix := ObjectKeyPrefix("test-prefix", "test-topic", [16]byte{0xAA}, 0)
+	// Seed the listing cache with an empty listing (no objects yet).
+	_, _ = client.ListObjects(ctx, prefix)
+	reader.listingMu.Lock()
+	reader.listingCache[prefix] = []ObjectInfo{} // empty but present
+	reader.listingMu.Unlock()
+
+	flusher := NewFlusher(FlusherConfig{
+		Client:            client,
+		FlushInterval:     60 * time.Second,
+		TargetObjectSize:  1024 * 1024,
+		UploadConcurrency: 1,
+		Clock:             clk,
+		Reader:            reader,
+	}, provider)
+
+	err := flusher.scanAndFlush(ctx, true)
+	require.NoError(t, err)
+
+	// Verify the listing cache was appended to, not invalidated.
+	reader.listingMu.RLock()
+	listing, ok := reader.listingCache[prefix]
+	reader.listingMu.RUnlock()
+
+	require.True(t, ok, "listing cache entry should still exist (append, not invalidate)")
+	require.Len(t, listing, 1, "listing should have 1 entry from the flush")
+	assert.Contains(t, listing[0].Key, "00000000000000000000.obj",
+		"appended entry should be the flushed object")
+	assert.Greater(t, listing[0].Size, int64(0), "appended entry should have a non-zero size")
+}
+
+func TestScanAndFlush_UploadFailure_NoListingAppend(t *testing.T) {
+	t.Parallel()
+
+	pool := chunk.NewPool(10*1024*1024, 1024*1024)
+	chunks := []*chunk.Chunk{
+		makeTestChunk(pool, []chunk.ChunkBatch{
+			{BaseOffset: 0, LastOffsetDelta: 4},
+		}),
+	}
+
+	provider := &stubPartitionProvider{
+		partitions: []FlushPartition{{
+			Topic:       "test-topic",
+			Partition:   0,
+			TopicID:     [16]byte{0xBB},
+			SealedBytes: 2 * 1024 * 1024,
+			DetachChunks: func(flushAll bool) ([]*chunk.Chunk, *chunk.Pool) {
+				return chunks, pool
+			},
+			AdvanceWatermark: func(wm int64) {},
+		}},
+	}
+
+	clk := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	failS3 := &alwaysFailingS3{err: errors.New("S3 down")}
+
+	client := NewClient(ClientConfig{
+		S3Client: failS3,
+		Bucket:   "test-bucket",
+		Prefix:   "test-prefix",
+	})
+	reader := NewReader(client, nil)
+
+	// Pre-populate listing cache with an existing entry.
+	prefix := ObjectKeyPrefix("test-prefix", "test-topic", [16]byte{0xBB}, 0)
+	reader.listingMu.Lock()
+	reader.listingCache[prefix] = []ObjectInfo{
+		{Key: "test-prefix/existing.obj", Size: 1000},
+	}
+	reader.listingMu.Unlock()
+
+	flusher := NewFlusher(FlusherConfig{
+		Client:            client,
+		FlushInterval:     60 * time.Second,
+		TargetObjectSize:  1024 * 1024,
+		UploadConcurrency: 1,
+		Clock:             clk,
+		Reader:            reader,
+	}, provider)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := flusher.scanAndFlush(ctx, true)
+	require.Error(t, err)
+
+	// Listing cache should be unchanged — no append on failure.
+	reader.listingMu.RLock()
+	listing := reader.listingCache[prefix]
+	reader.listingMu.RUnlock()
+
+	require.Len(t, listing, 1, "listing should be unchanged after upload failure")
+	assert.Equal(t, "test-prefix/existing.obj", listing[0].Key)
+}
+
 // --- S3 test doubles ---
 
 // alwaysFailingS3 wraps InMemoryS3 but PutObject always fails.
