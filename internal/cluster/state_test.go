@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -471,6 +472,84 @@ func TestSetCommittedOffsetFromReplay_CreatesGroup(t *testing.T) {
 		t.Fatal("expected group to be created by replay")
 	}
 	defer g.Stop()
+}
+
+func TestSetMetadataLog_BackfillsReplayGroups(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+	s.SetShutdownCh(shutdownCh)
+	s.SetLogger(slog.Default())
+
+	// Simulate metadata replay creating a group before State has a metadata log.
+	s.SetCommittedOffsetFromReplay("restored-group", "topic-a", 0, 42, "from-replay")
+
+	g := s.GetGroup("restored-group")
+	if g == nil {
+		t.Fatal("expected replay to create group")
+	}
+	defer g.Stop()
+
+	ml, err := metadata.NewLog(metadata.LogConfig{DataDir: t.TempDir(), Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("create metadata log: %v", err)
+	}
+	defer func() {
+		if err := ml.Close(); err != nil {
+			t.Fatalf("close metadata log: %v", err)
+		}
+	}()
+
+	s.SetMetadataLog(ml)
+
+	beforeOffsetCommit := ml.Size()
+
+	req := kmsg.NewPtrOffsetCommitRequest()
+	req.Group = "restored-group"
+	topic := kmsg.NewOffsetCommitRequestTopic()
+	topic.Topic = "topic-a"
+	partition := kmsg.NewOffsetCommitRequestTopicPartition()
+	partition.Partition = 0
+	partition.Offset = 43
+	topic.Partitions = append(topic.Partitions, partition)
+	req.Topics = append(req.Topics, topic)
+
+	respRaw, err := g.Send(req)
+	if err != nil {
+		t.Fatalf("send OffsetCommit request: %v", err)
+	}
+	resp, ok := respRaw.(*kmsg.OffsetCommitResponse)
+	if !ok {
+		t.Fatalf("expected *kmsg.OffsetCommitResponse, got %T", respRaw)
+	}
+	if len(resp.Topics) != 1 || len(resp.Topics[0].Partitions) != 1 {
+		t.Fatalf("unexpected offset commit response shape: %+v", resp.Topics)
+	}
+	if got := resp.Topics[0].Partitions[0].ErrorCode; got != 0 {
+		t.Fatalf("expected successful OffsetCommit, got error code %d", got)
+	}
+	if got := ml.Size(); got <= beforeOffsetCommit {
+		t.Fatalf("expected OffsetCommit to append to metadata log, size before=%d after=%d", beforeOffsetCommit, got)
+	}
+
+	beforeTxnApply := ml.Size()
+	g.Control(func() {
+		g.ApplyTxnOffset(TopicPartition{Topic: "topic-a", Partition: 0}, PendingTxnOffset{
+			Offset:      44,
+			LeaderEpoch: 0,
+			Metadata:    "txn-apply",
+		})
+	})
+	if got := ml.Size(); got <= beforeTxnApply {
+		t.Fatalf("expected transactional offset apply to append to metadata log, size before=%d after=%d", beforeTxnApply, got)
+	}
 }
 
 func TestSetCompactionWatermarkFromReplay(t *testing.T) {

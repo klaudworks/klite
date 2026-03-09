@@ -426,7 +426,13 @@ func (s *State) ReplaceTopicConfigs(topicName string, configs []kmsg.AlterConfig
 }
 
 func (s *State) SetMetadataLog(ml *metadata.Log) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.metaLog = ml
+	for _, g := range s.groups {
+		g.SetMetadataLog(ml)
+	}
 }
 
 func (s *State) MetadataLog() *metadata.Log {
