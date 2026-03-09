@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -411,5 +413,27 @@ func TestCreateTopics_SuccessfulCreate(t *testing.T) {
 	}
 	if v, ok := td.GetConfig("retention.ms"); !ok || v != "3600000" {
 		t.Errorf("expected retention.ms=3600000, got %q (exists=%v)", v, ok)
+	}
+}
+
+func TestCreateTopics_PersistFailure(t *testing.T) {
+	state := newTestState(1)
+
+	ml, err := metadata.NewLog(metadata.LogConfig{DataDir: t.TempDir(), Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new metadata log: %v", err)
+	}
+	state.SetMetadataLog(ml)
+	if err := ml.Close(); err != nil {
+		t.Fatalf("close metadata log: %v", err)
+	}
+
+	resp := callHandler(t, state, makeCreateReq(7, simpleTopic("persist-fail", 1)))
+
+	if resp.Topics[0].ErrorCode != kerr.KafkaStorageError.Code {
+		t.Fatalf("expected KafkaStorageError (%d), got %d", kerr.KafkaStorageError.Code, resp.Topics[0].ErrorCode)
+	}
+	if state.TopicExists("persist-fail") {
+		t.Fatal("topic should not exist after metadata persistence failure")
 	}
 }

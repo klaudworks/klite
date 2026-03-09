@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -161,15 +163,20 @@ func HandleCreateTopics(state *cluster.State) server.Handler {
 				continue
 			}
 
-			td, created := state.CreateTopicWithConfigs(rt.Topic, numPartitions, configs)
+			td, created, err := state.CreateTopicWithConfigsDurable(rt.Topic, numPartitions, configs)
+			if err != nil {
+				slog.Warn("metadata.log: failed to persist topic creation",
+					"topic", rt.Topic, "err", err)
+				st.ErrorCode = kerr.KafkaStorageError.Code
+				resp.Topics = append(resp.Topics, st)
+				continue
+			}
 			if !created {
 				// Race: topic was created between our check and create call
 				st.ErrorCode = kerr.TopicAlreadyExists.Code
 				resp.Topics = append(resp.Topics, st)
 				continue
 			}
-
-			state.PersistTopicCreation(td)
 
 			st.TopicID = td.ID
 			st.NumPartitions = int32(numPartitions)

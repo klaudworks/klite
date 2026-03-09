@@ -22,6 +22,7 @@ type DeletedTopic struct {
 // Protected by a RWMutex for concurrent access.
 type State struct {
 	mu            sync.RWMutex
+	createTopicMu sync.Mutex
 	topics        map[string]*TopicData // topic name -> topic
 	tnorms        map[string]string     // normalized name -> actual topic name (collision detection)
 	groups        map[string]*Group     // group ID -> group
@@ -222,12 +223,7 @@ func (s *State) GetOrCreateTopic(name string) (*TopicData, bool, error) {
 		return nil, false, ErrTopicNotFound
 	}
 
-	// Slow path: write lock with double-check
-	td, created := s.CreateTopic(name, s.cfg.DefaultPartitions)
-	if created {
-		s.PersistTopicCreation(td)
-	}
-	return td, created, nil
+	return s.CreateTopicWithConfigsDurable(name, s.cfg.DefaultPartitions, nil)
 }
 
 func (s *State) AutoCreateEnabled() bool {
@@ -429,10 +425,10 @@ func (s *State) MetadataLog() *metadata.Log {
 
 // PersistTopicCreation writes a CreateTopic entry to the metadata log.
 // Must be called outside s.mu. No-op if the metadata log is nil.
-func (s *State) PersistTopicCreation(td *TopicData) {
+func (s *State) PersistTopicCreation(td *TopicData) error {
 	ml := s.metaLog
 	if ml == nil {
-		return
+		return nil
 	}
 	entry := metadata.MarshalCreateTopic(&metadata.CreateTopicEntry{
 		TopicName:      td.Name,
@@ -441,9 +437,43 @@ func (s *State) PersistTopicCreation(td *TopicData) {
 		Configs:        td.CopyConfigs(),
 	})
 	if err := ml.AppendSync(entry); err != nil {
-		slog.Warn("metadata.log: failed to persist topic creation",
-			"topic", td.Name, "err", err)
+		return err
 	}
+	return nil
+}
+
+// CreateTopicWithConfigsDurable creates a topic and persists its metadata entry
+// before making it visible in-memory.
+func (s *State) CreateTopicWithConfigsDurable(name string, numPartitions int, configs map[string]string) (*TopicData, bool, error) {
+	s.createTopicMu.Lock()
+	defer s.createTopicMu.Unlock()
+
+	s.mu.RLock()
+	if td, ok := s.topics[name]; ok {
+		s.mu.RUnlock()
+		return td, false, nil
+	}
+	s.mu.RUnlock()
+
+	td := newTopicData(name, numPartitions, s.cfg.NodeID)
+	for k, v := range configs {
+		td.Configs[k] = v
+	}
+
+	if err := s.PersistTopicCreation(td); err != nil {
+		return nil, false, ErrTopicPersistenceFailed
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.topics[name]; ok {
+		return existing, false, nil
+	}
+	s.topics[name] = td
+	s.tnorms[NormalizeTopicName(name)] = name
+	s.initPartitionsWAL(td)
+
+	return td, true, nil
 }
 
 // PersistPartitionCount writes a partition expansion entry to the metadata log.

@@ -3,11 +3,13 @@ package handler
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
+	"github.com/klaudworks/klite/internal/metadata"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -169,6 +171,33 @@ func TestProduce_ParseBatchHeaderError(t *testing.T) {
 	if code != kerr.CorruptMessage.Code {
 		t.Errorf("expected CorruptMessage (%d), got %d",
 			kerr.CorruptMessage.Code, code)
+	}
+}
+
+func TestProduce_AutoCreatePersistFailure(t *testing.T) {
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+	ml, err := metadata.NewLog(metadata.LogConfig{DataDir: t.TempDir(), Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new metadata log: %v", err)
+	}
+	state.SetMetadataLog(ml)
+	if err := ml.Close(); err != nil {
+		t.Fatalf("close metadata log: %v", err)
+	}
+
+	clk := clock.NewFakeClock(time.Unix(1000, 0))
+	req := makeProduceReq(9, 1, "auto-topic", 0, make([]byte, 10))
+	resp := callProduce(t, state, clk, req)
+
+	if code := partitionErrorCode(resp, "auto-topic", 0); code != kerr.KafkaStorageError.Code {
+		t.Fatalf("expected KafkaStorageError (%d), got %d", kerr.KafkaStorageError.Code, code)
+	}
+	if state.TopicExists("auto-topic") {
+		t.Fatal("topic should not exist after metadata persistence failure")
 	}
 }
 

@@ -176,6 +176,39 @@ func TestGetOrCreateTopic_AutoCreateEnabled(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateTopic_AutoCreatePersistFailure(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 3,
+		AutoCreateTopics:  true,
+	})
+
+	ml, err := metadata.NewLog(metadata.LogConfig{DataDir: t.TempDir(), Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new metadata log: %v", err)
+	}
+	s.SetMetadataLog(ml)
+	if err := ml.Close(); err != nil {
+		t.Fatalf("close metadata log: %v", err)
+	}
+
+	td, created, err := s.GetOrCreateTopic("auto-topic")
+	if td != nil {
+		t.Fatalf("expected nil topic, got %v", td)
+	}
+	if created {
+		t.Fatal("expected created=false")
+	}
+	if !errors.Is(err, ErrTopicPersistenceFailed) {
+		t.Fatalf("expected ErrTopicPersistenceFailed, got %v", err)
+	}
+	if s.TopicExists("auto-topic") {
+		t.Fatal("topic should not exist after metadata persistence failure")
+	}
+}
+
 func TestGetOrCreateTopic_ConcurrentAutoCreate(t *testing.T) {
 	t.Parallel()
 

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"strconv"
 
@@ -55,10 +56,14 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, clk clock.Clock)
 
 			td, _, err := state.GetOrCreateTopic(rt.Topic)
 			if err != nil {
+				errCode := kerr.UnknownTopicOrPartition.Code
+				if errors.Is(err, cluster.ErrTopicPersistenceFailed) {
+					errCode = kerr.KafkaStorageError.Code
+				}
 				for _, rp := range rt.Partitions {
 					sp := kmsg.NewProduceResponseTopicPartition()
 					sp.Partition = rp.Partition
-					sp.ErrorCode = kerr.UnknownTopicOrPartition.Code
+					sp.ErrorCode = errCode
 					sp.BaseOffset = -1
 					sp.LogStartOffset = -1
 					st.Partitions = append(st.Partitions, sp)
