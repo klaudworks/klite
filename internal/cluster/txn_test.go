@@ -231,7 +231,9 @@ func TestValidateAndDedupRejectsHigherEpochNonZeroSeq(t *testing.T) {
 	tp := TopicPartition{Topic: "t", Partition: 0}
 
 	m.InitProducerID("", 0)
-	m.ValidateAndDedup(1, 0, tp, 0, 5, 0)
+	if errCode, _, _ := m.ValidateAndDedup(1, 0, tp, 0, 5, 0); errCode != 0 {
+		t.Fatalf("setup ValidateAndDedup: errCode=%d", errCode)
+	}
 
 	// Epoch bump with non-zero seq must be rejected.
 	errCode, _, _ := m.ValidateAndDedup(1, 1, tp, 5, 3, 100)
@@ -247,8 +249,12 @@ func TestValidateAndDedupEpochBumpClearsAllPartitions(t *testing.T) {
 	tp1 := TopicPartition{Topic: "t", Partition: 1}
 
 	m.InitProducerID("", 0)
-	m.ValidateAndDedup(1, 0, tp0, 0, 5, 0)
-	m.ValidateAndDedup(1, 0, tp1, 0, 3, 100)
+	if errCode, _, _ := m.ValidateAndDedup(1, 0, tp0, 0, 5, 0); errCode != 0 {
+		t.Fatalf("setup ValidateAndDedup tp0: errCode=%d", errCode)
+	}
+	if errCode, _, _ := m.ValidateAndDedup(1, 0, tp1, 0, 3, 100); errCode != 0 {
+		t.Fatalf("setup ValidateAndDedup tp1: errCode=%d", errCode)
+	}
 
 	// Epoch bump on tp0 should clear all partition windows.
 	errCode, _, _ := m.ValidateAndDedup(1, 1, tp0, 0, 2, 200)
@@ -460,7 +466,9 @@ func TestExpiredTransactionsReturnsExpired(t *testing.T) {
 	// Create a transactional producer with 5s timeout.
 	pid, epoch, _ := m.InitProducerID("txn-1", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// Not expired yet.
 	expired := m.ExpiredTransactions()
@@ -489,10 +497,14 @@ func TestExpiredTransactionsIgnoresCompletedTxns(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-2", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// Complete the transaction.
-	m.PrepareEndTxn(pid, epoch, true)
+	if _, ec := m.PrepareEndTxn(pid, epoch, true); ec != 0 {
+		t.Fatalf("setup PrepareEndTxn: errCode=%d", ec)
+	}
 
 	// Advance past timeout.
 	fc.Advance(6 * time.Second)
@@ -513,7 +525,9 @@ func TestExpiredTransactionsIgnoresZeroTimeout(t *testing.T) {
 	// Timeout of 0 should not be treated as expired.
 	pid, epoch, _ := m.InitProducerID("txn-3", 0)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	fc.Advance(time.Hour)
 
@@ -531,7 +545,9 @@ func TestStoreTxnOffsetValid(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-store", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	errCode := m.StoreTxnOffset(pid, epoch, "group-1", "t", 0, 42, 0, "meta")
 	if errCode != 0 {
@@ -567,7 +583,9 @@ func TestStoreTxnOffsetFencedEpoch(t *testing.T) {
 	// Re-init to bump epoch to 1.
 	_, epoch, _ := m.InitProducerID("txn-fence", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// Old epoch (0) should be fenced.
 	errCode := m.StoreTxnOffset(pid, 0, "group-1", "t", 0, 42, 0, "")
@@ -582,7 +600,9 @@ func TestStoreTxnOffsetInvalidEpoch(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-inv-epoch", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// Higher epoch than current should return INVALID_PRODUCER_EPOCH.
 	errCode := m.StoreTxnOffset(pid, epoch+1, "group-1", "t", 0, 42, 0, "")
@@ -610,10 +630,16 @@ func TestStoreTxnOffsetMultipleGroups(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-multi-grp", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
-	m.StoreTxnOffset(pid, epoch, "group-a", "t", 0, 10, 0, "")
-	m.StoreTxnOffset(pid, epoch, "group-b", "t", 0, 20, 0, "")
+	if errCode := m.StoreTxnOffset(pid, epoch, "group-a", "t", 0, 10, 0, ""); errCode != 0 {
+		t.Fatalf("StoreTxnOffset group-a: errCode=%d", errCode)
+	}
+	if errCode := m.StoreTxnOffset(pid, epoch, "group-b", "t", 0, 20, 0, ""); errCode != 0 {
+		t.Fatalf("StoreTxnOffset group-b: errCode=%d", errCode)
+	}
 
 	ps := m.GetProducer(pid)
 	if len(ps.TxnOffsets) != 2 {
@@ -638,7 +664,9 @@ func TestAddOffsetsToTxnValid(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-offsets", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	errCode := m.AddOffsetsToTxn(pid, epoch, "consumer-group")
 	if errCode != 0 {
@@ -728,9 +756,15 @@ func TestPrepareEndTxnCommit(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-end", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
-	m.AddOffsetsToTxn(pid, epoch, "group-1")
-	m.StoreTxnOffset(pid, epoch, "group-1", "t", 0, 50, 0, "")
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
+	if ec := m.AddOffsetsToTxn(pid, epoch, "group-1"); ec != 0 {
+		t.Fatalf("setup AddOffsetsToTxn: errCode=%d", ec)
+	}
+	if ec := m.StoreTxnOffset(pid, epoch, "group-1", "t", 0, 50, 0, ""); ec != 0 {
+		t.Fatalf("setup StoreTxnOffset: errCode=%d", ec)
+	}
 	m.RecordTxnBatch(pid, "t", 0, 100)
 
 	state, errCode := m.PrepareEndTxn(pid, epoch, true)
@@ -769,7 +803,9 @@ func TestPrepareEndTxnRetryIdempotent(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-retry", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// First EndTxn commit.
 	_, errCode := m.PrepareEndTxn(pid, epoch, true)
@@ -800,7 +836,9 @@ func TestPrepareEndTxnRetryDifferentFlag(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-diff", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// Commit the transaction.
 	_, errCode := m.PrepareEndTxn(pid, epoch, true)
@@ -824,7 +862,9 @@ func TestPrepareEndTxnAbortRetryIdempotent(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-abort-retry", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	// First EndTxn abort.
 	_, errCode := m.PrepareEndTxn(pid, epoch, false)
@@ -862,7 +902,9 @@ func TestPrepareEndTxnFencedEpoch(t *testing.T) {
 	pid, _, _ := m.InitProducerID("txn-end-fence", 5000)
 	_, epoch, _ := m.InitProducerID("txn-end-fence", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	_, errCode := m.PrepareEndTxn(pid, 0, true)
 	if errCode != 35 {
@@ -876,7 +918,9 @@ func TestPrepareEndTxnInvalidEpoch(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-end-inv", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	_, errCode := m.PrepareEndTxn(pid, epoch+1, true)
 	if errCode != 47 {
@@ -892,7 +936,9 @@ func TestRecordTxnBatchTracksFirstOffset(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-batch", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	m.RecordTxnBatch(pid, "t", 0, 100)
 	m.RecordTxnBatch(pid, "t", 0, 200)
@@ -918,7 +964,9 @@ func TestRecordTxnBatchMultiplePartitions(t *testing.T) {
 	pid, epoch, _ := m.InitProducerID("txn-batch-mp", 5000)
 	tp0 := TopicPartition{Topic: "t", Partition: 0}
 	tp1 := TopicPartition{Topic: "t", Partition: 1}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0, tp1})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0, tp1}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	m.RecordTxnBatch(pid, "t", 0, 10)
 	m.RecordTxnBatch(pid, "t", 1, 20)
@@ -1004,7 +1052,9 @@ func TestInitProducerIDReuseTxnIDResetsOngoingTxn(t *testing.T) {
 
 	pid, epoch, _ := m.InitProducerID("txn-reuse", 5000)
 	tp := TopicPartition{Topic: "t", Partition: 0}
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
 
 	ps := m.GetProducer(pid)
 	if ps.TxnState != TxnOngoing {
@@ -1115,8 +1165,12 @@ func TestAddPartitionsToTxnAddsToExisting(t *testing.T) {
 	tp0 := TopicPartition{Topic: "t", Partition: 0}
 	tp1 := TopicPartition{Topic: "t", Partition: 1}
 
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0})
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp1})
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0}); ec != 0 {
+		t.Fatalf("AddPartitionsToTxn tp0: errCode=%d", ec)
+	}
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp1}); ec != 0 {
+		t.Fatalf("AddPartitionsToTxn tp1: errCode=%d", ec)
+	}
 
 	ps := m.GetProducer(pid)
 	if len(ps.TxnPartitions) != 2 {
@@ -1185,14 +1239,20 @@ func TestGetProducersForPartition(t *testing.T) {
 
 	// Create two producers that have written to the same partition.
 	pid1, _, _ := m.InitProducerID("", 0)
-	m.ValidateAndDedup(pid1, 0, tp, 0, 5, 0)
+	if errCode, _, _ := m.ValidateAndDedup(pid1, 0, tp, 0, 5, 0); errCode != 0 {
+		t.Fatalf("setup pid1 ValidateAndDedup: errCode=%d", errCode)
+	}
 
 	pid2, _, _ := m.InitProducerID("", 0)
-	m.ValidateAndDedup(pid2, 0, tp, 0, 3, 100)
+	if errCode, _, _ := m.ValidateAndDedup(pid2, 0, tp, 0, 3, 100); errCode != 0 {
+		t.Fatalf("setup pid2 ValidateAndDedup: errCode=%d", errCode)
+	}
 
 	// A third producer writing to a different partition.
 	pid3, _, _ := m.InitProducerID("", 0)
-	m.ValidateAndDedup(pid3, 0, TopicPartition{Topic: "t", Partition: 1}, 0, 1, 200)
+	if errCode, _, _ := m.ValidateAndDedup(pid3, 0, TopicPartition{Topic: "t", Partition: 1}, 0, 1, 200); errCode != 0 {
+		t.Fatalf("setup pid3 ValidateAndDedup: errCode=%d", errCode)
+	}
 
 	snaps := m.GetProducersForPartition("t", 0)
 	if len(snaps) != 2 {
@@ -1231,8 +1291,12 @@ func TestGetProducersForPartitionWithTxn(t *testing.T) {
 	tp := TopicPartition{Topic: "t", Partition: 0}
 
 	pid, epoch, _ := m.InitProducerID("txn-gpp", 5000)
-	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
-	m.ValidateAndDedup(pid, epoch, tp, 0, 5, 0)
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
+	if errCode, _, _ := m.ValidateAndDedup(pid, epoch, tp, 0, 5, 0); errCode != 0 {
+		t.Fatalf("setup ValidateAndDedup: errCode=%d", errCode)
+	}
 	m.RecordTxnBatch(pid, "t", 0, 50)
 
 	snaps := m.GetProducersForPartition("t", 0)
