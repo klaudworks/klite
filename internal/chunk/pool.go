@@ -34,10 +34,6 @@ func (c *Chunk) Reset() {
 	c.CreatedAt = time.Time{}
 }
 
-func (c *Chunk) Remaining() int {
-	return len(c.Data) - c.Used
-}
-
 type Pool struct {
 	chunkSize int // bytes per chunk (= max.message.bytes)
 	maxChunks int // total chunks = budget / chunkSize

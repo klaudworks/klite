@@ -35,14 +35,6 @@ type Record struct {
 	Headers        []RecordHeader
 }
 
-func (r *Record) AbsoluteOffset(baseOffset int64) int64 {
-	return baseOffset + int64(r.OffsetDelta)
-}
-
-func (r *Record) AbsoluteTimestamp(baseTimestamp int64) int64 {
-	return baseTimestamp + r.TimestampDelta
-}
-
 type RecordHeader struct {
 	Key   string
 	Value []byte
@@ -66,10 +58,6 @@ type BatchHeader struct {
 
 func (h *BatchHeader) CompressionCodec() int {
 	return int(h.Attributes & 0x07)
-}
-
-func (h *BatchHeader) IsTransactional() bool {
-	return h.Attributes&0x10 != 0
 }
 
 func (h *BatchHeader) IsControlBatch() bool {

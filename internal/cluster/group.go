@@ -1285,8 +1285,7 @@ func derefStr(s *string) string {
 	return *s
 }
 
-func (g *Group) ID() string           { return g.id }
-func (g *Group) GetState() GroupState { return g.state }
+func (g *Group) ID() string { return g.id }
 
 type GroupInfo struct {
 	State        string

@@ -100,19 +100,6 @@ func (idx *Index) PartitionEntries(tp TopicPartition) []IndexEntry {
 	return result
 }
 
-func (idx *Index) SegmentReferenced(segmentSeq uint64) bool {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	for _, entries := range idx.partitions {
-		for _, e := range entries {
-			if e.SegmentSeq == segmentSeq {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (idx *Index) UnflushedBytes(tp TopicPartition, s3Watermark int64) int64 {
 	idx.mu.RLock()
 	entries := idx.partitions[tp]

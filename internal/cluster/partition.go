@@ -212,10 +212,6 @@ func (pd *PartData) SetS3Fetcher(f S3Fetcher) {
 	pd.s3Fetch = f
 }
 
-func (pd *PartData) HasS3() bool {
-	return pd.s3Fetch != nil
-}
-
 // PushBatch assigns an offset and appends a batch. Returns base offset and
 // any unused spare chunk. Caller must hold pd.mu.Lock().
 // Used by WAL replay and EndTxn; normal produce uses ReserveOffset + CommitBatch.
@@ -925,8 +921,4 @@ func (pd *PartData) HasChunkData() bool {
 
 func (pd *PartData) ChunkPool() *chunk.Pool {
 	return pd.chunkPool
-}
-
-func (pd *PartData) WalIndex() *wal.Index {
-	return pd.walIndex
 }

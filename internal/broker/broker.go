@@ -364,29 +364,13 @@ func (b *Broker) Wait() {
 	<-b.done
 }
 
-func (b *Broker) ShutdownCh() <-chan struct{} {
-	return b.shutdownCh
-}
-
 func (b *Broker) ClusterID() string {
 	<-b.ready
 	return b.clusterID
 }
 
-func (b *Broker) Addr() string {
-	<-b.ready
-	if b.listener != nil {
-		return b.listener.Addr().String()
-	}
-	return ""
-}
-
 func (b *Broker) Ready() <-chan struct{} {
 	return b.ready
-}
-
-func (b *Broker) Handlers() *server.HandlerRegistry {
-	return b.handlers
 }
 
 func (b *Broker) resolveAdvertisedAddr() (addr string, warn bool) {
