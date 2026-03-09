@@ -545,15 +545,7 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 	b.replSender = sender
 
 	sameEpochReconnect := epoch != 0 && epoch == currentEpoch
-	sendSnapshot := epoch == 0 || epoch != currentEpoch
-	if sameEpochReconnect {
-		needsSnapshot, snapCheckErr := b.sameEpochReconnectNeedsSnapshot(lastWALSeq)
-		if snapCheckErr != nil {
-			b.logger.Warn("replication: failed to evaluate reconnect snapshot need", "err", snapCheckErr)
-			needsSnapshot = true
-		}
-		sendSnapshot = sendSnapshot || needsSnapshot
-	}
+	sendSnapshot := epoch == 0 || epoch != currentEpoch || sameEpochReconnect
 
 	if sendSnapshot {
 		metaData, readErr := os.ReadFile(b.metaLog.Path())
@@ -590,25 +582,6 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 
 	// Start keepalive goroutine
 	go b.keepaliveLoop(ctx, sender)
-}
-
-func (b *Broker) sameEpochReconnectNeedsSnapshot(standbyLastSeq uint64) (bool, error) {
-	if b.walWriter == nil {
-		return false, nil
-	}
-
-	nextSeq := b.walWriter.NextSequence()
-	startSeq := standbyLastSeq + 1
-	if startSeq >= nextSeq {
-		return false, nil
-	}
-
-	const probeBatchBytes = 4 * 1024 * 1024
-	_, _, _, count, err := b.walWriter.ReadSequenceBatch(startSeq, nextSeq-1, probeBatchBytes)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
 }
 
 func (b *Broker) backfillStandbyFromWAL(sender *repl.Sender, standbyLastSeq uint64) error {

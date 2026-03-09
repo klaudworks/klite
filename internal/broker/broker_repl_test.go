@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net"
@@ -467,20 +468,40 @@ func TestHandleStandbyConn_MalformedHello(t *testing.T) {
 	}
 }
 
-func TestHandleStandbyConn_EpochMatch_NoSnapshot(t *testing.T) {
+func TestHandleStandbyConn_SameEpochReconnect_SendsSnapshotForMetadataOnlyChanges(t *testing.T) {
 	t.Parallel()
 	clk := clock.NewFakeClock(time.Now())
 	brokerEpoch := uint64(7)
 	b := newHandshakeBroker(t, clk, brokerEpoch)
 
+	if err := b.metaLog.Append([]byte("metadata-only-update")); err != nil {
+		t.Fatalf("append metadata update: %v", err)
+	}
+
+	b.walWriter.SetNextSequence(42)
+
 	brokerConn, standbyConn := net.Pipe()
 	defer standbyConn.Close() //nolint:errcheck
 
-	// Send HELLO with matching epoch.
-	hello := repl.MarshalHello(10, brokerEpoch)
-	errCh := make(chan error, 1)
+	// Reconnect in the same epoch and report the current WAL sequence so no WAL
+	// backfill is needed.
+	hello := repl.MarshalHello(41, brokerEpoch)
+	type result struct {
+		msgType  byte
+		payload  []byte
+		writeErr error
+		readErr  error
+	}
+	resCh := make(chan result, 1)
 	go func() {
-		errCh <- repl.WriteFrame(standbyConn, repl.MsgHello, hello)
+		var r result
+		r.writeErr = repl.WriteFrame(standbyConn, repl.MsgHello, hello)
+		if r.writeErr != nil {
+			resCh <- r
+			return
+		}
+		r.msgType, r.payload, r.readErr = repl.ReadFrame(standbyConn)
+		resCh <- r
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -488,21 +509,30 @@ func TestHandleStandbyConn_EpochMatch_NoSnapshot(t *testing.T) {
 
 	b.handleStandbyConn(ctx, brokerConn)
 
-	if err := <-errCh; err != nil {
-		t.Fatalf("writing HELLO: %v", err)
+	r := <-resCh
+	if r.writeErr != nil {
+		t.Fatalf("writing HELLO: %v", r.writeErr)
+	}
+	if r.readErr != nil {
+		t.Fatalf("reading response: %v", r.readErr)
+	}
+	if r.msgType != repl.MsgSnapshot {
+		t.Fatalf("expected MsgSnapshot on same-epoch reconnect, got 0x%02x", r.msgType)
 	}
 
-	// With matching epoch, no SNAPSHOT should be sent. Close the standby
-	// write side and try to read — should get nothing before EOF.
-	// Set a short deadline so we don't block forever.
-	_ = standbyConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	_, _, err := repl.ReadFrame(standbyConn)
-	if err == nil {
-		t.Fatal("expected no frame (timeout or EOF), but got one")
+	walSeq, metaData, err := repl.UnmarshalSnapshot(r.payload)
+	if err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if walSeq != 42 {
+		t.Fatalf("snapshot walSeq: got %d, want 42", walSeq)
+	}
+	if !bytes.Contains(metaData, []byte("metadata-only-update")) {
+		t.Fatal("snapshot metadata missing metadata-only update")
 	}
 
 	if b.replSender == nil {
-		t.Error("replSender should be set even without snapshot")
+		t.Error("replSender should be set after same-epoch snapshot")
 	}
 
 	cancel()
