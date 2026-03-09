@@ -19,8 +19,11 @@ func startElector(t *testing.T, e *MemElector, cb lease.Callbacks) context.Cance
 		defer wg.Done()
 		_ = e.Run(ctx, cb)
 	}()
-	// Give Run a moment to register callbacks
-	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-e.Ready():
+	case <-time.After(time.Second):
+		t.Fatal("MemElector.Run did not become ready")
+	}
 	t.Cleanup(func() {
 		cancel()
 		wg.Wait()
