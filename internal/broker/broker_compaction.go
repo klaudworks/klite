@@ -73,8 +73,8 @@ func selectDirtyPartition(topics []*cluster.TopicData, minDirty int32, clk clock
 				// Check staleness guarantee.
 				lc := pd.LastCompacted()
 				switch {
-				case lc.IsZero():
-					continue
+				case lc.IsZero() && dirty > 0:
+					// Never compacted and has dirty objects — eligible.
 				case dirty <= 0:
 					continue
 				default:
