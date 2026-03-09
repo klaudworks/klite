@@ -45,6 +45,7 @@ func setLastCompacted(pd *cluster.PartData, t time.Time, dirty int32) {
 }
 
 func TestSelectDirtyPartition_SkipsDeletePolicy(t *testing.T) {
+	t.Parallel()
 	td := makeTopic("delete-only", map[string]string{
 		"cleanup.policy": "delete",
 	}, []int32{100})
@@ -56,6 +57,7 @@ func TestSelectDirtyPartition_SkipsDeletePolicy(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_SkipsDefaultPolicy(t *testing.T) {
+	t.Parallel()
 	// No cleanup.policy set at all — defaults to "delete"
 	td := makeTopic("no-policy", nil, []int32{100})
 
@@ -66,6 +68,7 @@ func TestSelectDirtyPartition_SkipsDefaultPolicy(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_CompactDeletePolicyEligible(t *testing.T) {
+	t.Parallel()
 	td := makeTopic("compact-delete", map[string]string{
 		"cleanup.policy": "compact,delete",
 	}, []int32{10})
@@ -78,6 +81,7 @@ func TestSelectDirtyPartition_CompactDeletePolicyEligible(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_BelowMinDirtySkipped(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	td := makeTopic("compacted", map[string]string{
 		"cleanup.policy": "compact",
@@ -92,6 +96,7 @@ func TestSelectDirtyPartition_BelowMinDirtySkipped(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_StalePartitionEligible(t *testing.T) {
+	t.Parallel()
 	compactedAt := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	td := makeTopic("stale", map[string]string{
 		"cleanup.policy":        "compact",
@@ -108,6 +113,7 @@ func TestSelectDirtyPartition_StalePartitionEligible(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_StaleButNotExceeded(t *testing.T) {
+	t.Parallel()
 	compactedAt := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	td := makeTopic("not-stale", map[string]string{
 		"cleanup.policy":        "compact",
@@ -123,6 +129,7 @@ func TestSelectDirtyPartition_StaleButNotExceeded(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_NeverCompactedAlwaysEligible(t *testing.T) {
+	t.Parallel()
 	td := makeTopic("never-compacted", map[string]string{
 		"cleanup.policy": "compact",
 	}, []int32{1}) // dirty=1, lastCompacted is zero
@@ -135,6 +142,7 @@ func TestSelectDirtyPartition_NeverCompactedAlwaysEligible(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_NeverCompactedZeroDirtySkipped(t *testing.T) {
+	t.Parallel()
 	td := makeTopic("never-compacted-clean", map[string]string{
 		"cleanup.policy": "compact",
 	}, []int32{0}) // dirty=0, lastCompacted is zero
@@ -146,6 +154,7 @@ func TestSelectDirtyPartition_NeverCompactedZeroDirtySkipped(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_HighestDirtySelected(t *testing.T) {
+	t.Parallel()
 	td := makeTopic("multi", map[string]string{
 		"cleanup.policy": "compact",
 	}, []int32{5, 20, 10})
@@ -158,6 +167,7 @@ func TestSelectDirtyPartition_HighestDirtySelected(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_HighestDirtyAcrossTopics(t *testing.T) {
+	t.Parallel()
 	td1 := makeTopic("topic-a", map[string]string{
 		"cleanup.policy": "compact",
 	}, []int32{5})
@@ -174,6 +184,7 @@ func TestSelectDirtyPartition_HighestDirtyAcrossTopics(t *testing.T) {
 }
 
 func TestSelectDirtyPartition_NoTopicsReturnsNil(t *testing.T) {
+	t.Parallel()
 	clk := clock.NewFakeClock(time.Now())
 	gotTD, gotPD := selectDirtyPartition(nil, 1, clk)
 	assert.Nil(t, gotTD)

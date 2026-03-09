@@ -92,6 +92,7 @@ func readInferredTopics(t *testing.T, metaPath string) []metadata.CreateTopicEnt
 }
 
 func TestInferTopicsFromS3_SingleTopic(t *testing.T) {
+	t.Parallel()
 	b, mem := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -126,6 +127,7 @@ func TestInferTopicsFromS3_SingleTopic(t *testing.T) {
 }
 
 func TestInferTopicsFromS3_MultipleTopicsSorted(t *testing.T) {
+	t.Parallel()
 	b, mem := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -157,6 +159,7 @@ func TestInferTopicsFromS3_MultipleTopicsSorted(t *testing.T) {
 }
 
 func TestInferTopicsFromS3_SkipsNonDataKeys(t *testing.T) {
+	t.Parallel()
 	b, mem := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -187,6 +190,7 @@ func TestInferTopicsFromS3_SkipsNonDataKeys(t *testing.T) {
 }
 
 func TestInferTopicsFromS3_EmptyBucket(t *testing.T) {
+	t.Parallel()
 	b, _ := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -202,6 +206,7 @@ func TestInferTopicsFromS3_EmptyBucket(t *testing.T) {
 }
 
 func TestInferTopicsFromS3_ZeroTopicIDGetsNewUUID(t *testing.T) {
+	t.Parallel()
 	b, mem := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -229,6 +234,7 @@ func TestInferTopicsFromS3_ZeroTopicIDGetsNewUUID(t *testing.T) {
 }
 
 func TestInferTopicsFromS3_PartitionCountFromMaxIndex(t *testing.T) {
+	t.Parallel()
 	b, mem := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -256,6 +262,7 @@ func TestInferTopicsFromS3_PartitionCountFromMaxIndex(t *testing.T) {
 }
 
 func TestInferTopicsFromS3_TopicIDPreserved(t *testing.T) {
+	t.Parallel()
 	b, mem := newInferTestBroker(t)
 	prefix := "klite/test"
 
@@ -335,6 +342,7 @@ func putS3Object(t *testing.T, mem *s3store.InMemoryS3, prefix string, topicID [
 }
 
 func TestProbeS3Watermarks_SetsHWFromS3(t *testing.T) {
+	t.Parallel()
 	b, mem := newS3WatermarkTestBroker(t)
 	prefix := "klite/test"
 
@@ -359,6 +367,7 @@ func TestProbeS3Watermarks_SetsHWFromS3(t *testing.T) {
 }
 
 func TestProbeS3Watermarks_NoS3Data(t *testing.T) {
+	t.Parallel()
 	b, _ := newS3WatermarkTestBroker(t)
 	b.state.CreateTopic("empty-topic", 2)
 
@@ -382,6 +391,7 @@ func TestProbeS3Watermarks_NoS3Data(t *testing.T) {
 }
 
 func TestProbeS3Watermarks_DoesNotRegressBelowWALHW(t *testing.T) {
+	t.Parallel()
 	b, mem := newS3WatermarkTestBroker(t)
 	prefix := "klite/test"
 
@@ -413,6 +423,7 @@ func TestProbeS3Watermarks_DoesNotRegressBelowWALHW(t *testing.T) {
 }
 
 func TestProbeS3Watermarks_MultiplePartitions(t *testing.T) {
+	t.Parallel()
 	b, mem := newS3WatermarkTestBroker(t)
 	prefix := "klite/test"
 
@@ -438,6 +449,7 @@ func TestProbeS3Watermarks_MultiplePartitions(t *testing.T) {
 }
 
 func TestRehydrateDirtyCounters_MatchesS3ObjectCount(t *testing.T) {
+	t.Parallel()
 	b, mem := newS3WatermarkTestBroker(t)
 	prefix := "klite/test"
 
@@ -461,6 +473,7 @@ func TestRehydrateDirtyCounters_MatchesS3ObjectCount(t *testing.T) {
 }
 
 func TestRehydrateDirtyCounters_ZeroForNonCompactTopic(t *testing.T) {
+	t.Parallel()
 	b, mem := newS3WatermarkTestBroker(t)
 	prefix := "klite/test"
 
@@ -476,6 +489,7 @@ func TestRehydrateDirtyCounters_ZeroForNonCompactTopic(t *testing.T) {
 }
 
 func TestRehydrateDirtyCounters_ZeroForEmptyPartition(t *testing.T) {
+	t.Parallel()
 	b, _ := newS3WatermarkTestBroker(t)
 	b.state.CreateTopicWithConfigs("compact-empty", 1, map[string]string{
 		"cleanup.policy": "compact",
@@ -495,6 +509,7 @@ func TestRehydrateDirtyCounters_ZeroForEmptyPartition(t *testing.T) {
 }
 
 func TestRehydrateDirtyCounters_ExcludesObjectsBelowCleanedUpTo(t *testing.T) {
+	t.Parallel()
 	b, mem := newS3WatermarkTestBroker(t)
 	prefix := "klite/test"
 

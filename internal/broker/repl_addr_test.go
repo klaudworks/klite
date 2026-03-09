@@ -7,6 +7,7 @@ import (
 )
 
 func TestResolveReplAddrExplicit(t *testing.T) {
+	t.Parallel()
 	addr, warn := resolveReplicationAddr(":9093", "10.0.1.5:9093")
 	if addr != "10.0.1.5:9093" {
 		t.Errorf("expected 10.0.1.5:9093, got %s", addr)
@@ -17,6 +18,7 @@ func TestResolveReplAddrExplicit(t *testing.T) {
 }
 
 func TestResolveReplAddrSpecificBind(t *testing.T) {
+	t.Parallel()
 	addr, warn := resolveReplicationAddr("10.0.1.5:9093", "")
 	if addr != "10.0.1.5:9093" {
 		t.Errorf("expected 10.0.1.5:9093, got %s", addr)
@@ -27,12 +29,14 @@ func TestResolveReplAddrSpecificBind(t *testing.T) {
 }
 
 func TestResolveReplAddrWildcard(t *testing.T) {
+	t.Parallel()
 	tests := []string{":9093", "0.0.0.0:9093"}
 	hostname, _ := os.Hostname()
 	expected := net.JoinHostPort(hostname, "9093")
 
 	for _, listen := range tests {
 		t.Run(listen, func(t *testing.T) {
+			t.Parallel()
 			addr, warn := resolveReplicationAddr(listen, "")
 			if addr != expected {
 				t.Errorf("expected %s, got %s", expected, addr)
