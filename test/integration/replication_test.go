@@ -1348,3 +1348,126 @@ func TestReplicationS3LeaseFailover(t *testing.T) {
 		require.Equal(t, fmt.Sprintf("value-%d", i), string(r.Value))
 	}
 }
+
+// TestReplicationAcks1NotBlocked verifies that acks=1 produce returns
+// immediately after leader write, without waiting for the standby ACK.
+func TestReplicationAcks1NotBlocked(t *testing.T) {
+	t.Parallel()
+
+	pair := StartReplicaPair(t)
+
+	pair.ElectorA.Elect()
+	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
+
+	topic := "test-acks-modes"
+	// Create topic first so both producers use the same partition layout
+	adminCl := NewClient(t, pair.Primary.Addr, kgo.AllowAutoTopicCreation())
+	ProduceSync(t, adminCl, &kgo.Record{Topic: topic, Value: []byte("warmup")})
+	adminCl.Close()
+
+	// acks=1 producer (leader ACK only)
+	cl1 := NewClient(t, pair.Primary.Addr,
+		kgo.RequiredAcks(kgo.LeaderAck()),
+		kgo.DisableIdempotentWrite(),
+		kgo.RequestRetries(3),
+		kgo.RetryTimeout(5*time.Second),
+	)
+
+	// acks=-1 producer (all ISR ACK)
+	clAll := NewClient(t, pair.Primary.Addr,
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.RequestRetries(3),
+		kgo.RetryTimeout(5*time.Second),
+	)
+
+	// Produce with acks=1: should succeed
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel1()
+	results1 := cl1.ProduceSync(ctx1, &kgo.Record{
+		Topic: topic,
+		Key:   []byte("acks1-key"),
+		Value: []byte("acks1-value"),
+	})
+	require.Len(t, results1, 1)
+	require.NoError(t, results1[0].Err, "acks=1 produce should succeed")
+
+	// Produce with acks=-1: should succeed
+	ctxAll, cancelAll := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelAll()
+	resultsAll := clAll.ProduceSync(ctxAll, &kgo.Record{
+		Topic: topic,
+		Key:   []byte("acksAll-key"),
+		Value: []byte("acksAll-value"),
+	})
+	require.Len(t, resultsAll, 1)
+	require.NoError(t, resultsAll[0].Err, "acks=-1 produce should succeed")
+}
+
+// TestReplicationAcks1DataReplicatedOnFailover verifies that data produced
+// with acks=1 is still replicated to the standby and available after failover.
+// Even though acks=1 doesn't block on the standby ACK, the replication still
+// happens asynchronously.
+func TestReplicationAcks1DataReplicatedOnFailover(t *testing.T) {
+	t.Parallel()
+
+	pair := StartReplicaPair(t)
+
+	pair.ElectorA.Elect()
+	waitPrimary(t, pair.HealthAddrA, 5*time.Second)
+	waitStandby(t, pair.HealthAddrB, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let replication receiver connect
+
+	topic := "test-acks1-failover"
+	cl := NewClient(t, pair.Primary.Addr,
+		kgo.AllowAutoTopicCreation(),
+		kgo.RequiredAcks(kgo.LeaderAck()),
+		kgo.DisableIdempotentWrite(),
+		kgo.RequestRetries(3),
+		kgo.RetryTimeout(5*time.Second),
+	)
+
+	// Produce 50 records with acks=1
+	records := make([]*kgo.Record, 50)
+	for i := range records {
+		records[i] = &kgo.Record{
+			Topic: topic,
+			Key:   []byte(fmt.Sprintf("key-%d", i)),
+			Value: []byte(fmt.Sprintf("value-%d", i)),
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	results := cl.ProduceSync(ctx, records...)
+	for _, r := range results {
+		require.NoError(t, r.Err)
+	}
+	cl.Close()
+
+	// Allow replication to catch up (acks=1 produces are replicated
+	// asynchronously — the WAL writer still calls Replicate, it just
+	// doesn't block the producer response on the ACK)
+	time.Sleep(300 * time.Millisecond)
+
+	// Failover: demote A, promote B
+	pair.ElectorA.Demote()
+	waitStandby(t, pair.HealthAddrA, 5*time.Second)
+	pair.ElectorB.Elect()
+	waitPrimary(t, pair.HealthAddrB, 5*time.Second)
+
+	// Consume from B — all 50 records should be available
+	consumer := NewClient(t, pair.Standby.Addr,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.RequestRetries(3),
+		kgo.RetryTimeout(5*time.Second),
+	)
+	consumed := ConsumeN(t, consumer, 50, 15*time.Second)
+	require.Len(t, consumed, 50)
+
+	for i, r := range consumed {
+		require.Equal(t, fmt.Sprintf("key-%d", i), string(r.Key))
+		require.Equal(t, fmt.Sprintf("value-%d", i), string(r.Value))
+	}
+}
