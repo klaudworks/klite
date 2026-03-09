@@ -196,6 +196,15 @@ func HandleFetch(state *cluster.State, shutdownCh <-chan struct{}, clk clock.Clo
 				case <-shutdownCh:
 				}
 				timer.Stop()
+
+				// Remove the waiter from all partitions to prevent stale
+				// waiters accumulating on idle partitions that never produce.
+				for i, info := range allParts {
+					if info.pd == nil || results[i].sp.ErrorCode != 0 || results[i].hasData {
+						continue
+					}
+					info.pd.UnregisterWaiter(w)
+				}
 			}
 
 			results, _ = doFetch()

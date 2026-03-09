@@ -343,6 +343,20 @@ func (pd *PartData) RegisterWaiter(w *FetchWaiter) {
 	pd.waiterMu.Unlock()
 }
 
+// UnregisterWaiter removes w from the waiter list. Call after a long-poll
+// timeout or shutdown to prevent stale waiters from accumulating on idle
+// partitions. Caller must NOT hold pd.mu.
+func (pd *PartData) UnregisterWaiter(w *FetchWaiter) {
+	pd.waiterMu.Lock()
+	for i, cur := range pd.waiters {
+		if cur == w {
+			pd.waiters = append(pd.waiters[:i], pd.waiters[i+1:]...)
+			break
+		}
+	}
+	pd.waiterMu.Unlock()
+}
+
 type FetchResponse struct {
 	HW       int64
 	LogStart int64

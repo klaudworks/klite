@@ -616,6 +616,82 @@ func TestNotifyWaiters(t *testing.T) {
 
 		pd2.NotifyWaiters() // double-close safe via sync.Once
 	})
+
+	t.Run("unregister removes waiter", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		w := NewFetchWaiter()
+		pd.RegisterWaiter(w)
+
+		pd.waiterMu.Lock()
+		if len(pd.waiters) != 1 {
+			t.Fatalf("expected 1 waiter, got %d", len(pd.waiters))
+		}
+		pd.waiterMu.Unlock()
+
+		pd.UnregisterWaiter(w)
+
+		pd.waiterMu.Lock()
+		if len(pd.waiters) != 0 {
+			t.Fatalf("expected 0 waiters after unregister, got %d", len(pd.waiters))
+		}
+		pd.waiterMu.Unlock()
+	})
+
+	t.Run("unregister absent waiter is safe", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		w1 := NewFetchWaiter()
+		w2 := NewFetchWaiter()
+		pd.RegisterWaiter(w1)
+
+		pd.UnregisterWaiter(w2) // w2 was never registered
+
+		pd.waiterMu.Lock()
+		if len(pd.waiters) != 1 {
+			t.Fatalf("expected 1 waiter (w1 still present), got %d", len(pd.waiters))
+		}
+		pd.waiterMu.Unlock()
+	})
+
+	t.Run("unregister shared waiter across partitions", func(t *testing.T) {
+		t.Parallel()
+		pd1 := newTestPartition()
+		pd2 := newTestPartition()
+
+		w := NewFetchWaiter()
+		pd1.RegisterWaiter(w)
+		pd2.RegisterWaiter(w)
+
+		// Simulate timeout: unregister from both
+		pd1.UnregisterWaiter(w)
+		pd2.UnregisterWaiter(w)
+
+		pd1.waiterMu.Lock()
+		if len(pd1.waiters) != 0 {
+			t.Fatalf("pd1: expected 0 waiters, got %d", len(pd1.waiters))
+		}
+		pd1.waiterMu.Unlock()
+
+		pd2.waiterMu.Lock()
+		if len(pd2.waiters) != 0 {
+			t.Fatalf("pd2: expected 0 waiters, got %d", len(pd2.waiters))
+		}
+		pd2.waiterMu.Unlock()
+	})
+
+	t.Run("unregister after notify is safe", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		w := NewFetchWaiter()
+		pd.RegisterWaiter(w)
+		pd.NotifyWaiters() // clears waiters slice
+
+		pd.UnregisterWaiter(w) // should be no-op, not panic
+	})
 }
 
 func TestMaxTimestampTracking(t *testing.T) {
