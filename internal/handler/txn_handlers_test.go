@@ -163,7 +163,7 @@ func TestEndTxn_UnknownProducerID(t *testing.T) {
 	r.Commit = true
 
 	resp := callEndTxn(t, state, clk, r)
-	// Error code 3 = UNKNOWN_MEMBER_ID (used for unknown PID)
+	// PIDManager returns error code 3 for unknown producer IDs
 	if resp.ErrorCode != 3 {
 		t.Errorf("expected error code 3, got %d", resp.ErrorCode)
 	}
