@@ -1327,3 +1327,575 @@ func TestRebuildChunksFromWAL_DetachOldChunks(t *testing.T) {
 		t.Fatalf("first batch NumRecords = %d, want 5 (WAL data, not stale)", fr.Batches[0].NumRecords)
 	}
 }
+
+// TestReplayWAL_TransactionState tests replayWAL's transaction state
+// reconstruction: open transactions, aborted transactions, committed
+// transactions, interleaved producers, and various skip/error paths.
+func TestReplayWAL_TransactionState(t *testing.T) {
+	t.Parallel()
+
+	// replayTestSetup creates a WAL writer, state, and topic with the given
+	// partition count, writes entries via appendFn, then stops the writer and
+	// replays into a fresh broker. Returns the fresh state and cleanup func.
+	type replayResult struct {
+		state *cluster.State
+		td    *cluster.TopicData
+	}
+	setup := func(t *testing.T, partCount int, appendFn func(t *testing.T, w *wal.Writer, topicID [16]byte)) replayResult {
+		t.Helper()
+		walDir := t.TempDir()
+		topicID := [16]byte{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+		// Phase 1: Write WAL entries.
+		idx1 := wal.NewIndex()
+		walCfg := wal.DefaultWriterConfig()
+		walCfg.Dir = walDir
+		walCfg.S3Configured = true
+		walCfg.Logger = logger
+		w1, err := wal.NewWriter(walCfg, idx1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create state with topic so entries can be written.
+		state1 := cluster.NewState(cluster.Config{
+			NodeID:            0,
+			DefaultPartitions: partCount,
+			AutoCreateTopics:  true,
+		})
+		td1, _, err := state1.GetOrCreateTopic("test-topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		td1.ID = topicID
+
+		appendFn(t, w1, topicID)
+		w1.Stop()
+
+		// Phase 2: Replay into fresh broker.
+		idx2 := wal.NewIndex()
+		walCfg2 := wal.DefaultWriterConfig()
+		walCfg2.Dir = walDir
+		walCfg2.S3Configured = true
+		walCfg2.Logger = logger
+		w2, err := wal.NewWriter(walCfg2, idx2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { w2.Stop() })
+
+		pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+		state2 := cluster.NewState(cluster.Config{
+			NodeID:            0,
+			DefaultPartitions: partCount,
+			AutoCreateTopics:  true,
+		})
+		td2, _, err := state2.GetOrCreateTopic("test-topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		td2.ID = topicID
+		for _, pd := range td2.Partitions {
+			pd.Lock()
+			pd.TopicID = topicID
+			pd.InitWAL(pool, w2, idx2)
+			pd.Unlock()
+		}
+
+		b := &Broker{
+			walWriter: w2,
+			walIndex:  idx2,
+			chunkPool: pool,
+			state:     state2,
+			logger:    logger,
+			cfg:       Config{Clock: clock.RealClock{}},
+		}
+		if err := b.replayWAL(w2); err != nil {
+			t.Fatalf("replayWAL: %v", err)
+		}
+		return replayResult{state: state2, td: td2}
+	}
+
+	appendEntry := func(t *testing.T, w *wal.Writer, topicID [16]byte, partition int32, batch []byte, baseOffset int64, seq uint64) {
+		t.Helper()
+		entry := &wal.Entry{
+			Sequence:  seq,
+			TopicID:   topicID,
+			Partition: partition,
+			Offset:    baseOffset,
+			Data:      batch,
+		}
+		serialized := wal.MarshalEntry(entry)
+		_, written, err := w.AppendReplicated(serialized)
+		if err != nil {
+			t.Fatalf("AppendReplicated seq=%d: %v", seq, err)
+		}
+		if !written {
+			t.Fatalf("entry seq=%d was not written", seq)
+		}
+	}
+
+	t.Run("PartialTransaction", func(t *testing.T) {
+		t.Parallel()
+		const pid int64 = 100
+		const epoch int16 = 0
+
+		res := setup(t, 1, func(t *testing.T, w *wal.Writer, topicID [16]byte) {
+			// Write two txn data batches — no control record.
+			batch1 := makeTestBatchTxn(0, 5, pid, epoch, 0)
+			appendEntry(t, w, topicID, 0, batch1, 0, 1)
+			batch2 := makeTestBatchTxn(5, 5, pid, epoch, 5)
+			appendEntry(t, w, topicID, 0, batch2, 5, 2)
+		})
+
+		pd := res.td.Partitions[0]
+		pd.RLock()
+		openPIDs := pd.OpenTxnPIDs()
+		pd.RUnlock()
+		if _, ok := openPIDs[pid]; !ok {
+			t.Fatalf("expected PID %d in OpenTxnPIDs, got %v", pid, openPIDs)
+		}
+	})
+
+	t.Run("CompletedAbort", func(t *testing.T) {
+		t.Parallel()
+		const pid int64 = 200
+		const epoch int16 = 0
+
+		res := setup(t, 1, func(t *testing.T, w *wal.Writer, topicID [16]byte) {
+			batch := makeTestBatchTxn(0, 5, pid, epoch, 0)
+			appendEntry(t, w, topicID, 0, batch, 0, 1)
+			abortCtrl := cluster.BuildControlBatch(pid, epoch, false, 1000)
+			appendEntry(t, w, topicID, 0, abortCtrl, 5, 2)
+		})
+
+		pd := res.td.Partitions[0]
+		pd.RLock()
+		openPIDs := pd.OpenTxnPIDs()
+		aborted := pd.AbortedTxnsInRange(0, 10)
+		pd.RUnlock()
+
+		if _, ok := openPIDs[pid]; ok {
+			t.Fatalf("PID %d should NOT be in OpenTxnPIDs after abort", pid)
+		}
+		if len(aborted) != 1 {
+			t.Fatalf("expected 1 aborted txn, got %d", len(aborted))
+		}
+		if aborted[0].ProducerID != pid {
+			t.Fatalf("aborted txn PID = %d, want %d", aborted[0].ProducerID, pid)
+		}
+		if aborted[0].FirstOffset != 0 {
+			t.Fatalf("aborted txn FirstOffset = %d, want 0", aborted[0].FirstOffset)
+		}
+	})
+
+	t.Run("CompletedCommit", func(t *testing.T) {
+		t.Parallel()
+		const pid int64 = 300
+		const epoch int16 = 0
+
+		res := setup(t, 1, func(t *testing.T, w *wal.Writer, topicID [16]byte) {
+			batch := makeTestBatchTxn(0, 5, pid, epoch, 0)
+			appendEntry(t, w, topicID, 0, batch, 0, 1)
+			commitCtrl := cluster.BuildControlBatch(pid, epoch, true, 1000)
+			appendEntry(t, w, topicID, 0, commitCtrl, 5, 2)
+		})
+
+		pd := res.td.Partitions[0]
+		pd.RLock()
+		openPIDs := pd.OpenTxnPIDs()
+		aborted := pd.AbortedTxnsInRange(0, 10)
+		pd.RUnlock()
+
+		if _, ok := openPIDs[pid]; ok {
+			t.Fatalf("PID %d should NOT be in OpenTxnPIDs after commit", pid)
+		}
+		if len(aborted) != 0 {
+			t.Fatalf("expected 0 aborted txns after commit, got %d", len(aborted))
+		}
+	})
+
+	t.Run("InterleavedProducers", func(t *testing.T) {
+		t.Parallel()
+		const pid1 int64 = 400
+		const pid2 int64 = 500
+		const epoch int16 = 0
+
+		res := setup(t, 1, func(t *testing.T, w *wal.Writer, topicID [16]byte) {
+			// PID1 data
+			appendEntry(t, w, topicID, 0, makeTestBatchTxn(0, 3, pid1, epoch, 0), 0, 1)
+			// PID2 data
+			appendEntry(t, w, topicID, 0, makeTestBatchTxn(3, 3, pid2, epoch, 0), 3, 2)
+			// PID1 more data
+			appendEntry(t, w, topicID, 0, makeTestBatchTxn(6, 2, pid1, epoch, 3), 6, 3)
+			// PID1 abort
+			appendEntry(t, w, topicID, 0, cluster.BuildControlBatch(pid1, epoch, false, 1000), 8, 4)
+			// PID2 commit
+			appendEntry(t, w, topicID, 0, cluster.BuildControlBatch(pid2, epoch, true, 1000), 9, 5)
+		})
+
+		pd := res.td.Partitions[0]
+		pd.RLock()
+		openPIDs := pd.OpenTxnPIDs()
+		aborted := pd.AbortedTxnsInRange(0, 20)
+		pd.RUnlock()
+
+		if len(openPIDs) != 0 {
+			t.Fatalf("expected no open txns, got %v", openPIDs)
+		}
+		// PID1 was aborted → should appear in aborted txns.
+		if len(aborted) != 1 {
+			t.Fatalf("expected 1 aborted txn (pid1), got %d", len(aborted))
+		}
+		if aborted[0].ProducerID != pid1 {
+			t.Fatalf("aborted txn PID = %d, want %d", aborted[0].ProducerID, pid1)
+		}
+		if aborted[0].FirstOffset != 0 {
+			t.Fatalf("aborted txn FirstOffset = %d, want 0", aborted[0].FirstOffset)
+		}
+	})
+
+	t.Run("BelowLogStartOffset", func(t *testing.T) {
+		t.Parallel()
+		const pid int64 = 600
+		const epoch int16 = 0
+
+		walDir := t.TempDir()
+		topicID := [16]byte{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+		// Phase 1: Write entries.
+		idx1 := wal.NewIndex()
+		walCfg := wal.DefaultWriterConfig()
+		walCfg.Dir = walDir
+		walCfg.S3Configured = true
+		walCfg.Logger = logger
+		w1, err := wal.NewWriter(walCfg, idx1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write a PID batch at offset 0 (below logStart=10) and one at offset 15.
+		batch1 := makeTestBatchPID(0, 5, pid, epoch, 0)
+		appendEntry(t, w1, topicID, 0, batch1, 0, 1)
+		batch2 := makeTestBatchPID(15, 5, pid, epoch, 5)
+		appendEntry(t, w1, topicID, 0, batch2, 15, 2)
+		w1.Stop()
+
+		// Phase 2: Replay with logStart=10.
+		idx2 := wal.NewIndex()
+		walCfg2 := wal.DefaultWriterConfig()
+		walCfg2.Dir = walDir
+		walCfg2.S3Configured = true
+		walCfg2.Logger = logger
+		w2, err := wal.NewWriter(walCfg2, idx2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { w2.Stop() })
+
+		pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+		state2 := cluster.NewState(cluster.Config{
+			NodeID:            0,
+			DefaultPartitions: 1,
+			AutoCreateTopics:  true,
+		})
+		td2, _, err := state2.GetOrCreateTopic("test-topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		td2.ID = topicID
+		pd := td2.Partitions[0]
+		pd.Lock()
+		pd.TopicID = topicID
+		pd.InitWAL(pool, w2, idx2)
+		pd.Unlock()
+
+		// Set logStart to 10 so the first batch (offsets 0-4) is below it.
+		state2.SetLogStartOffsetFromReplay("test-topic", 0, 10)
+
+		b := &Broker{
+			walWriter: w2,
+			walIndex:  idx2,
+			chunkPool: pool,
+			state:     state2,
+			logger:    logger,
+			cfg:       Config{Clock: clock.RealClock{}},
+		}
+		if err := b.replayWAL(w2); err != nil {
+			t.Fatalf("replayWAL: %v", err)
+		}
+
+		// PID dedup state should be rebuilt for BOTH batches (even the one
+		// below logStart — dedup needs to know all producer sequences).
+		ps := state2.PIDManager().GetProducer(pid)
+		if ps == nil {
+			t.Fatal("expected producer state for PID after replay")
+		}
+
+		// HW should only reflect the batch above logStart.
+		pd.RLock()
+		hw := pd.HW()
+		pd.RUnlock()
+		if hw != 20 { // batch2: baseOffset=15, numRecords=5, endOffset=20
+			t.Fatalf("HW = %d, want 20 (only batch above logStart advances HW)", hw)
+		}
+	})
+
+	t.Run("UnknownTopicID", func(t *testing.T) {
+		t.Parallel()
+		walDir := t.TempDir()
+		topicID := [16]byte{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160}
+		unknownID := [16]byte{99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+		// Write one entry with known topic and one with unknown.
+		idx1 := wal.NewIndex()
+		walCfg := wal.DefaultWriterConfig()
+		walCfg.Dir = walDir
+		walCfg.S3Configured = true
+		walCfg.Logger = logger
+		w1, err := wal.NewWriter(walCfg, idx1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Known topic entry.
+		batch1 := makeTestBatch(0, 5)
+		appendEntry(t, w1, topicID, 0, batch1, 0, 1)
+		// Unknown topic entry.
+		batch2 := makeTestBatch(0, 3)
+		appendEntry(t, w1, unknownID, 0, batch2, 0, 2)
+		w1.Stop()
+
+		// Replay — only the known topic should exist in state.
+		idx2 := wal.NewIndex()
+		walCfg2 := wal.DefaultWriterConfig()
+		walCfg2.Dir = walDir
+		walCfg2.S3Configured = true
+		walCfg2.Logger = logger
+		w2, err := wal.NewWriter(walCfg2, idx2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { w2.Stop() })
+
+		pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+		state2 := cluster.NewState(cluster.Config{
+			NodeID:            0,
+			DefaultPartitions: 1,
+			AutoCreateTopics:  true,
+		})
+		td2, _, err := state2.GetOrCreateTopic("test-topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		td2.ID = topicID
+		pd := td2.Partitions[0]
+		pd.Lock()
+		pd.TopicID = topicID
+		pd.InitWAL(pool, w2, idx2)
+		pd.Unlock()
+
+		b := &Broker{
+			walWriter: w2,
+			walIndex:  idx2,
+			chunkPool: pool,
+			state:     state2,
+			logger:    logger,
+			cfg:       Config{Clock: clock.RealClock{}},
+		}
+		if err := b.replayWAL(w2); err != nil {
+			t.Fatalf("replayWAL: %v", err)
+		}
+
+		// Known topic entry was replayed — HW should be 5.
+		pd.RLock()
+		hw := pd.HW()
+		pd.RUnlock()
+		if hw != 5 {
+			t.Fatalf("HW = %d, want 5 (unknown topic entry should be skipped)", hw)
+		}
+	})
+
+	t.Run("OutOfRangePartition", func(t *testing.T) {
+		t.Parallel()
+		walDir := t.TempDir()
+		topicID := [16]byte{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+		idx1 := wal.NewIndex()
+		walCfg := wal.DefaultWriterConfig()
+		walCfg.Dir = walDir
+		walCfg.S3Configured = true
+		walCfg.Logger = logger
+		w1, err := wal.NewWriter(walCfg, idx1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Valid entry on partition 0.
+		batch1 := makeTestBatch(0, 3)
+		appendEntry(t, w1, topicID, 0, batch1, 0, 1)
+		// Invalid entry on partition 5 (topic has only 1 partition).
+		batch2 := makeTestBatch(0, 3)
+		appendEntry(t, w1, topicID, 5, batch2, 0, 2)
+		w1.Stop()
+
+		idx2 := wal.NewIndex()
+		walCfg2 := wal.DefaultWriterConfig()
+		walCfg2.Dir = walDir
+		walCfg2.S3Configured = true
+		walCfg2.Logger = logger
+		w2, err := wal.NewWriter(walCfg2, idx2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { w2.Stop() })
+
+		pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+		state2 := cluster.NewState(cluster.Config{
+			NodeID:            0,
+			DefaultPartitions: 1,
+			AutoCreateTopics:  true,
+		})
+		td2, _, err := state2.GetOrCreateTopic("test-topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		td2.ID = topicID
+		pd := td2.Partitions[0]
+		pd.Lock()
+		pd.TopicID = topicID
+		pd.InitWAL(pool, w2, idx2)
+		pd.Unlock()
+
+		b := &Broker{
+			walWriter: w2,
+			walIndex:  idx2,
+			chunkPool: pool,
+			state:     state2,
+			logger:    logger,
+			cfg:       Config{Clock: clock.RealClock{}},
+		}
+		if err := b.replayWAL(w2); err != nil {
+			t.Fatalf("replayWAL: %v", err)
+		}
+
+		// Only partition 0 entry was replayed.
+		pd.RLock()
+		hw := pd.HW()
+		pd.RUnlock()
+		if hw != 3 {
+			t.Fatalf("HW = %d, want 3 (out-of-range partition entry should be skipped)", hw)
+		}
+	})
+
+	t.Run("CorruptBatchHeader", func(t *testing.T) {
+		t.Parallel()
+		walDir := t.TempDir()
+		topicID := [16]byte{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160}
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+		idx1 := wal.NewIndex()
+		walCfg := wal.DefaultWriterConfig()
+		walCfg.Dir = walDir
+		walCfg.S3Configured = true
+		walCfg.Logger = logger
+		w1, err := wal.NewWriter(walCfg, idx1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Valid entry first.
+		batch1 := makeTestBatch(0, 3)
+		appendEntry(t, w1, topicID, 0, batch1, 0, 1)
+		// Corrupt entry: too short to parse.
+		corruptData := make([]byte, 30)
+		appendEntry(t, w1, topicID, 0, corruptData, 3, 2)
+		// Another valid entry after the corrupt one.
+		batch3 := makeTestBatch(3, 2)
+		appendEntry(t, w1, topicID, 0, batch3, 3, 3)
+		w1.Stop()
+
+		idx2 := wal.NewIndex()
+		walCfg2 := wal.DefaultWriterConfig()
+		walCfg2.Dir = walDir
+		walCfg2.S3Configured = true
+		walCfg2.Logger = logger
+		w2, err := wal.NewWriter(walCfg2, idx2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { w2.Stop() })
+
+		pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+		state2 := cluster.NewState(cluster.Config{
+			NodeID:            0,
+			DefaultPartitions: 1,
+			AutoCreateTopics:  true,
+		})
+		td2, _, err := state2.GetOrCreateTopic("test-topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		td2.ID = topicID
+		pd := td2.Partitions[0]
+		pd.Lock()
+		pd.TopicID = topicID
+		pd.InitWAL(pool, w2, idx2)
+		pd.Unlock()
+
+		b := &Broker{
+			walWriter: w2,
+			walIndex:  idx2,
+			chunkPool: pool,
+			state:     state2,
+			logger:    logger,
+			cfg:       Config{Clock: clock.RealClock{}},
+		}
+		if err := b.replayWAL(w2); err != nil {
+			t.Fatalf("replayWAL: %v", err)
+		}
+
+		// Corrupt entry was skipped. Both valid entries should have been replayed.
+		// batch1: offsets 0-2, batch3: offsets 3-4 → HW = 5.
+		pd.RLock()
+		hw := pd.HW()
+		pd.RUnlock()
+		if hw != 5 {
+			t.Fatalf("HW = %d, want 5 (corrupt entry skipped, valid entries replayed)", hw)
+		}
+	})
+}
