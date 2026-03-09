@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"encoding/binary"
 	"sync/atomic"
 	"testing"
 
@@ -14,6 +15,9 @@ import (
 // These are NOT actual Kafka-decodable batches.
 func makeMinimalBatch(baseOffset int64, lastOffsetDelta int32) []byte {
 	batch := make([]byte, 80)
+
+	// Offset 0-7: BaseOffset
+	binary.BigEndian.PutUint64(batch[0:8], uint64(baseOffset))
 
 	// Offset 8-11: BatchLength (total length minus 12)
 	batchLength := uint32(len(batch) - 12)
@@ -396,17 +400,22 @@ func TestAppendToListing_SortOrder(t *testing.T) {
 	}
 
 	// Verify binary search resolves all offsets correctly.
+	// Each object covers baseOffset to baseOffset+9 (lastOffsetDelta=9).
+	// Offsets in gaps between objects resolve to the next object (gap handling).
 	tests := []struct {
 		offset      int64
 		wantBaseOff int64
 	}{
 		{0, 0},
-		{50, 0}, // within first object's range
+		{5, 0},    // within first object (0-9)
+		{50, 100}, // gap between 0 and 100 → resolved to next object
 		{100, 100},
-		{150, 100}, // within second object
+		{105, 100}, // within second object (100-109)
+		{150, 200}, // gap between 100 and 200 → next object
 		{300, 300}, // first appended object
-		{350, 300}, // within appended object
-		{450, 400}, // within second appended object
+		{305, 300}, // within appended object (300-309)
+		{350, 400}, // gap → next appended object
+		{400, 400},
 		{500, 500}, // last appended object
 	}
 
