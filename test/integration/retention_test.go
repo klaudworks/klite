@@ -229,6 +229,7 @@ func TestRetentionSurvivesRestart(t *testing.T) {
 			WithS3FlushInterval(200*time.Millisecond),
 			WithRetentionCheckInterval(500*time.Millisecond),
 		)
+		defer tb.Stop() // Must stop before Phase 2 reuses the same dataDir
 
 		cl := produceOldAndNew(t, tb, mem, topic)
 
