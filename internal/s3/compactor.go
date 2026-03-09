@@ -32,10 +32,6 @@ type CompactorConfig struct {
 	// the cleanedUpTo watermark to metadata.log.
 	PersistWatermark func(topic string, partition int32, cleanedUpTo int64) error
 
-	// DeleteRetentionMs is the topic-level delete.retention.ms (default 24h).
-	// Tombstones older than this are removed during compaction.
-	DeleteRetentionMs int64
-
 	// ReadRateLimit is the maximum S3 read throughput in bytes/sec for compaction.
 	// 0 means unlimited. Default 50 MiB/s.
 	ReadRateLimit int
@@ -66,9 +62,6 @@ func NewCompactor(cfg CompactorConfig) *Compactor {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	if cfg.DeleteRetentionMs == 0 {
-		cfg.DeleteRetentionMs = 86400000 // 24 hours
-	}
 	var rl *rate.Limiter
 	if cfg.ReadRateLimit > 0 {
 		rl = rate.NewLimiter(rate.Limit(cfg.ReadRateLimit), cfg.ReadRateLimit)
@@ -84,11 +77,8 @@ func NewCompactor(cfg CompactorConfig) *Compactor {
 	}
 }
 
-func (c *Compactor) SetDeleteRetentionMs(ms int64) {
-	c.cfg.DeleteRetentionMs = ms
-}
-
 // CompactPartition compacts all dirty objects for a single partition.
+// deleteRetentionMs controls how long tombstones are retained (topic-level delete.retention.ms).
 // Returns the new cleanedUpTo watermark.
 func (c *Compactor) CompactPartition(
 	ctx context.Context,
@@ -97,6 +87,7 @@ func (c *Compactor) CompactPartition(
 	partition int32,
 	cleanedUpTo int64,
 	minCompactionLagMs int64,
+	deleteRetentionMs int64,
 	acquireLock func(),
 	releaseLock func(),
 ) (int64, error) {
@@ -184,7 +175,7 @@ func (c *Compactor) CompactPartition(
 		}
 
 		acquireLock()
-		newWatermark, err := c.compactWindow(ctx, topic, topicID, partition, window, cleanedUpTo)
+		newWatermark, err := c.compactWindow(ctx, topic, topicID, partition, window, cleanedUpTo, deleteRetentionMs)
 		releaseLock()
 
 		if err != nil {
@@ -205,6 +196,7 @@ func (c *Compactor) compactWindow(
 	partition int32,
 	window []windowObj,
 	currentCleanedUpTo int64,
+	deleteRetentionMs int64,
 ) (int64, error) {
 	type cachedObj struct {
 		key      string
@@ -286,7 +278,7 @@ func (c *Compactor) compactWindow(
 		if co.footer == nil || len(co.rawBytes) == 0 {
 			continue
 		}
-		batches, err := c.filterBatches(co.rawBytes, co.footer, offsetMap, nowMs)
+		batches, err := c.filterBatches(co.rawBytes, co.footer, offsetMap, nowMs, deleteRetentionMs)
 		if err != nil {
 			return currentCleanedUpTo, fmt.Errorf("filter batches: %w", err)
 		}
@@ -398,7 +390,7 @@ func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap ma
 	return nil
 }
 
-func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map[string]int64, nowMs int64) ([]BatchData, error) {
+func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map[string]int64, nowMs, deleteRetentionMs int64) ([]BatchData, error) {
 	var result []BatchData
 
 	for _, entry := range footer.Entries {
@@ -452,7 +444,7 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 			latestOffset, inMap := offsetMap[string(rec.Key)]
 
 			if !inMap || absOffset >= latestOffset {
-				if rec.Value == nil && c.cfg.DeleteRetentionMs > 0 {
+				if rec.Value == nil && deleteRetentionMs > 0 {
 					var recordTs int64
 					if header.TimestampType() == 1 {
 						// LogAppendTime: use MaxTimestamp from header
@@ -461,7 +453,7 @@ func (c *Compactor) filterBatches(rawBytes []byte, footer *Footer, offsetMap map
 						// CreateTime: use individual record's timestamp
 						recordTs = header.BaseTimestamp + rec.TimestampDelta
 					}
-					if recordTs > 0 && nowMs-recordTs > c.cfg.DeleteRetentionMs {
+					if recordTs > 0 && nowMs-recordTs > deleteRetentionMs {
 						return true
 					}
 				}

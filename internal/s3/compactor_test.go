@@ -62,11 +62,10 @@ func newTestCompactor(t *testing.T, s3mem *InMemoryS3, clk clock.Clock) (*Compac
 	}
 
 	compactor := NewCompactor(CompactorConfig{
-		Client:            client,
-		Reader:            reader,
-		Logger:            logger,
-		Clock:             clk,
-		DeleteRetentionMs: 86400000, // 24h
+		Client: client,
+		Reader: reader,
+		Logger: logger,
+		Clock:  clk,
 	})
 
 	return compactor, reader
@@ -171,7 +170,7 @@ func TestCompactionBasicDedup(t *testing.T) {
 		return nil
 	}
 
-	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, watermark, 0,
+	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, watermark, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Greater(t, newWM, watermark)
@@ -268,7 +267,7 @@ func TestCompactionNilKeyRetained(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -340,7 +339,7 @@ func TestCompactionEmptyKeyDedup(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -383,8 +382,6 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	s3mem := NewInMemoryS3()
 	clk := clock.NewFakeClock(time.Unix(100000, 0)) // 100000 seconds
 	compactor, _ := newTestCompactor(t, s3mem, clk)
-	compactor.cfg.DeleteRetentionMs = 10000 // 10 seconds
-
 	// Object with: key A = value (offset 0), key A = tombstone (offset 1) at timestamp 99990000ms
 	// Tombstone timestamp: 99990 seconds = 99990000 ms
 	obj := buildTestObject(t, []testBatch{{
@@ -417,7 +414,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	// At now=100000s, tombstone timestamp=99990s → age = 10s, exactly at threshold.
 	// With deleteRetentionMs=10000, the tombstone age 10s is NOT greater than 10s,
 	// so it should be retained.
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 10000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -458,7 +455,6 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	// Re-create objects (compaction replaced them)
 	s3mem2 := NewInMemoryS3()
 	compactor2, _ := newTestCompactor(t, s3mem2, clk)
-	compactor2.cfg.DeleteRetentionMs = 10000
 	compactor2.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
 		return nil
 	}
@@ -482,7 +478,7 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 	}})
 	putObject(t, s3mem2, "test-prefix", "topic1", 0, 1, obj4)
 
-	_, err = compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err = compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 10000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -567,13 +563,13 @@ func TestCompactionMinLag(t *testing.T) {
 
 	// With 1h min lag, obj2 (30 min old) should be excluded.
 	// Only 1 object in the window => single-object windows are skipped => no compaction.
-	watermark, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 3600000,
+	watermark, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 3600000, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Equal(t, int64(-1), watermark, "should not compact when recent objects are excluded")
 
 	// With 0 min lag (default), both objects are eligible => compaction happens.
-	watermark, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	watermark, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Greater(t, watermark, int64(-1), "should compact with no min lag")
@@ -612,7 +608,7 @@ func TestCompactionPreservesOrder(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -697,7 +693,7 @@ func TestCompactionEmptyBatchSkipped(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -761,7 +757,7 @@ func TestCompactionSparseOffsets(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -898,7 +894,7 @@ func TestCompactionOrphanCleanup(t *testing.T) {
 	assert.Len(t, objsBefore, 2, "should have 2 objects before orphan cleanup")
 
 	// Run compaction — orphan cleanup should detect and delete the orphan
-	_, err = compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, 4, 0,
+	_, err = compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, 4, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -940,7 +936,7 @@ func TestCompactionCrossWindowDedup(t *testing.T) {
 		return nil
 	}
 
-	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 	assert.Greater(t, newWM, int64(-1))
@@ -978,7 +974,7 @@ func TestCompactionOutputFooter(t *testing.T) {
 		return nil
 	}
 
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1052,7 +1048,7 @@ func TestCompactionFooterCacheInvalidation(t *testing.T) {
 	compactor.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
 		return nil
 	}
-	_, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1094,7 +1090,7 @@ func TestCompactionCRCValidAfterRewrite(t *testing.T) {
 	compactor.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
 		return nil
 	}
-	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1170,7 +1166,7 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 				return nil
 			}
 
-			_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+			_, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 				func() {}, func() {})
 			require.NoError(t, err)
 
@@ -1360,7 +1356,7 @@ func TestFilterBatches_AllRetained(t *testing.T) {
 	offsetMap := map[string]int64{"A": 0, "B": 1, "C": 2}
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1, "single batch should be retained")
 
@@ -1388,7 +1384,7 @@ func TestFilterBatches_AllRemoved(t *testing.T) {
 	offsetMap := map[string]int64{"A": 10, "B": 11}
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	assert.Empty(t, batches, "all records superseded → batch should be dropped")
 }
@@ -1412,7 +1408,7 @@ func TestFilterBatches_PartialFiltering(t *testing.T) {
 	offsetMap := map[string]int64{"A": 10, "B": 1, "C": 20}
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1, "partially filtered batch should be retained")
 
@@ -1458,7 +1454,7 @@ func TestFilterBatches_ControlBatchPassthrough(t *testing.T) {
 	offsetMap := map[string]int64{} // empty — would remove everything if it were a normal batch
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1, "control batch should always be kept")
 
@@ -1471,8 +1467,6 @@ func TestFilterBatches_TombstoneWithinRetention(t *testing.T) {
 	// A tombstone within delete.retention.ms should be retained.
 	s3mem := NewInMemoryS3()
 	compactor, _ := newTestCompactor(t, s3mem, nil)
-	compactor.cfg.DeleteRetentionMs = 60000 // 60s
-
 	nowMs := int64(200000)       // 200 seconds in ms
 	tombstoneTs := int64(180000) // 180s → age = 20s < 60s
 
@@ -1487,7 +1481,7 @@ func TestFilterBatches_TombstoneWithinRetention(t *testing.T) {
 	// A is at its latest offset (0) — tombstone is the final record for this key
 	offsetMap := map[string]int64{"A": 0}
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 60000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1, "tombstone within retention should be kept")
 }
@@ -1496,8 +1490,6 @@ func TestFilterBatches_TombstonePastRetention(t *testing.T) {
 	// A tombstone older than delete.retention.ms should be removed.
 	s3mem := NewInMemoryS3()
 	compactor, _ := newTestCompactor(t, s3mem, nil)
-	compactor.cfg.DeleteRetentionMs = 60000 // 60s
-
 	nowMs := int64(200000)       // 200s
 	tombstoneTs := int64(100000) // 100s → age = 100s > 60s
 
@@ -1511,7 +1503,7 @@ func TestFilterBatches_TombstonePastRetention(t *testing.T) {
 
 	offsetMap := map[string]int64{"A": 0}
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 60000)
 	require.NoError(t, err)
 	assert.Empty(t, batches, "tombstone past retention should be removed")
 }
@@ -1521,8 +1513,6 @@ func TestFilterBatches_LogAppendTimeForTombstone(t *testing.T) {
 	// calculated from MaxTimestamp rather than the individual record's timestamp.
 	s3mem := NewInMemoryS3()
 	compactor, _ := newTestCompactor(t, s3mem, nil)
-	compactor.cfg.DeleteRetentionMs = 60000 // 60s
-
 	nowMs := int64(200000) // 200s
 
 	// Build batch with LogAppendTime attribute (bit 3 = 0x08).
@@ -1555,7 +1545,7 @@ func TestFilterBatches_LogAppendTimeForTombstone(t *testing.T) {
 
 	offsetMap := map[string]int64{"A": 0}
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 60000)
 	require.NoError(t, err)
 	// MaxTimestamp=190000, nowMs=200000, age=10s < 60s retention → should be kept
 	require.Len(t, batches, 1, "LogAppendTime tombstone within retention should be kept")
@@ -1580,7 +1570,7 @@ func TestFilterBatches_MultipleBatches_MixedFiltering(t *testing.T) {
 	offsetMap := map[string]int64{"A": 100, "B": 1} // A superseded, B is latest
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1, "only second batch should survive")
 
@@ -1606,7 +1596,7 @@ func TestFilterBatches_NullKeysAlwaysRetained(t *testing.T) {
 	offsetMap := map[string]int64{"A": 100} // A superseded
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1, "batch with null-key record should be retained")
 
@@ -1644,7 +1634,7 @@ func TestFilterBatches_CompressedBatch(t *testing.T) {
 	offsetMap := map[string]int64{"A": 100, "B": 1} // A superseded, B latest
 	nowMs := time.Now().UnixMilli()
 
-	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs, 86400000)
 	require.NoError(t, err)
 	require.Len(t, batches, 1)
 
@@ -1695,7 +1685,7 @@ func TestCompactionIdempotent(t *testing.T) {
 	}
 
 	// First compaction
-	wm1, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0,
+	wm1, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 
@@ -1732,7 +1722,7 @@ func TestCompactionIdempotent(t *testing.T) {
 
 	// Second compaction (on already-clean data)
 	// wm1 is the cleanedUpTo — single object won't be re-compacted
-	_, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, wm1, 0,
+	_, err = compactor.CompactPartition(ctx, "topic1", testTopicID, 0, wm1, 0, 86400000,
 		func() {}, func() {})
 	require.NoError(t, err)
 

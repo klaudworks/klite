@@ -123,7 +123,6 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 			deleteRetentionMs = parsed
 		}
 	}
-	compactor.SetDeleteRetentionMs(deleteRetentionMs)
 
 	bestPD.RLock()
 	cleanedUpTo := bestPD.CleanedUpTo()
@@ -136,6 +135,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		bestPD.Index,
 		cleanedUpTo,
 		minCompactionLagMs,
+		deleteRetentionMs,
 		func() { bestPD.CompactionMu.Lock() },
 		func() { bestPD.CompactionMu.Unlock() },
 	)
