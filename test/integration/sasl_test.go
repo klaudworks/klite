@@ -56,9 +56,7 @@ func TestSASLPlainBadPassword(t *testing.T) {
 		kgo.RequestRetries(0),
 		PlainSASLOpt("alice", "wrong-pass"),
 	)
-	if err != nil {
-		return // Connection refused — expected
-	}
+	require.NoError(t, err, "client creation should succeed (connection is lazy)")
 	defer cl.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -82,9 +80,7 @@ func TestSASLPlainNoAuth(t *testing.T) {
 		kgo.SeedBrokers(tb.Addr),
 		kgo.RequestRetries(0),
 	)
-	if err != nil {
-		return // Expected: can't even connect
-	}
+	require.NoError(t, err, "client creation should succeed (connection is lazy)")
 	defer cl.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -153,9 +149,7 @@ func TestSASLScramBadPassword(t *testing.T) {
 		kgo.RequestRetries(0),
 		Scram256SASLOpt("user1", "wrong-pass"),
 	)
-	if err != nil {
-		return // Expected
-	}
+	require.NoError(t, err, "client creation should succeed (connection is lazy)")
 	defer cl.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -174,11 +168,22 @@ func TestSASLUnsupportedMechanism(t *testing.T) {
 
 	tb := StartBroker(t, WithSASL(store))
 
-	// Verify broker works with valid auth
-	cl := NewClient(t, tb.Addr, PlainSASLOpt("user", "pass"))
-	admin := kadm.NewClient(cl)
-	_, err := admin.ApiVersions(context.Background())
-	require.NoError(t, err)
+	// Attempt SCRAM-256 auth against a broker that only has PLAIN users.
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(tb.Addr),
+		kgo.RequestRetries(0),
+		Scram256SASLOpt("user", "pass"),
+	)
+	require.NoError(t, err, "client creation should succeed (connection is lazy)")
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	results := cl.ProduceSync(ctx, &kgo.Record{
+		Topic: "test",
+		Value: []byte("should-fail"),
+	})
+	require.Error(t, results[0].Err, "expected produce to fail with unsupported SASL mechanism")
 }
 
 func TestSASLDisabled(t *testing.T) {
@@ -288,9 +293,7 @@ func TestAlterUserScramDeleteUser(t *testing.T) {
 		kgo.RequestRetries(0),
 		Scram256SASLOpt("to-delete", "to-delete-pass"),
 	)
-	if err != nil {
-		return // Expected
-	}
+	require.NoError(t, err, "client creation should succeed (connection is lazy)")
 	defer failCl.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
