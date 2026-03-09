@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -1359,29 +1360,22 @@ func portForward(t *testing.T, ctx context.Context, kubeconfigPath, target strin
 	require.NoError(t, err)
 	require.NoError(t, cmd.Start())
 
-	buf := make([]byte, 256)
-	n, err := stdout.Read(buf)
-	require.NoError(t, err)
-	line := string(buf[:n])
-
+	scanner := bufio.NewScanner(stdout)
 	var localPort int
-	_, err = fmt.Sscanf(extractForwardingLine(line), "Forwarding from 127.0.0.1:%d", &localPort)
-	require.NoError(t, err, "failed to parse port-forward output: %q", line)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if _, serr := fmt.Sscanf(line, "Forwarding from 127.0.0.1:%d", &localPort); serr == nil {
+			break
+		}
+	}
+	require.NoError(t, scanner.Err(), "reading kubectl port-forward stdout")
+	require.Greater(t, localPort, 0, "never saw 'Forwarding from' line in kubectl output")
 	require.Greater(t, localPort, 0)
 	return &portForwardHandle{
 		LocalPort: localPort,
 		Addr:      fmt.Sprintf("127.0.0.1:%d", localPort),
 		Cancel:    pfCancel,
 	}
-}
-
-func extractForwardingLine(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if strings.HasPrefix(line, "Forwarding from") {
-			return line
-		}
-	}
-	return s
 }
 
 func dumpPodInfo(t *testing.T, client *kubernetes.Clientset) {
