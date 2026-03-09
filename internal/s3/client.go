@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -204,6 +205,50 @@ func (c *Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, 
 	return objects, nil
 }
 
+func (c *Client) ListChildDirs(ctx context.Context, prefix string) ([]string, error) {
+	dirs := make(map[string]struct{})
+	var continuationToken *string
+	delimiter := "/"
+
+	for {
+		out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &c.bucket,
+			Prefix:            &prefix,
+			Delimiter:         &delimiter,
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("s3 list child dirs prefix=%s: %w", prefix, err)
+		}
+
+		for _, cp := range out.CommonPrefixes {
+			childPrefix := aws.ToString(cp.Prefix)
+			if !strings.HasPrefix(childPrefix, prefix) {
+				continue
+			}
+			name := strings.TrimPrefix(childPrefix, prefix)
+			name = strings.TrimSuffix(name, delimiter)
+			if name == "" {
+				continue
+			}
+			dirs[name] = struct{}{}
+		}
+
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+
+	children := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		children = append(children, dir)
+	}
+	sort.Strings(children)
+
+	return children, nil
+}
+
 func (c *Client) DeleteObject(ctx context.Context, key string) error {
 	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &c.bucket,
@@ -378,33 +423,97 @@ func (m *InMemoryS3) ListObjectsV2(_ context.Context, input *s3.ListObjectsV2Inp
 	defer m.mu.Unlock()
 
 	prefix := aws.ToString(input.Prefix)
-	var contents []types.Object
+	delimiter := aws.ToString(input.Delimiter)
+
+	type listedEntry struct {
+		name         string
+		object       *types.Object
+		commonPrefix *types.CommonPrefix
+	}
+
+	prefixes := make(map[string]struct{})
+	var entries []listedEntry
 	for key, data := range m.objects {
-		if strings.HasPrefix(key, prefix) {
-			k := key
-			sz := int64(len(data))
-			obj := types.Object{
-				Key:  &k,
-				Size: &sz,
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+
+		remainder := strings.TrimPrefix(key, prefix)
+		if delimiter != "" {
+			if idx := strings.Index(remainder, delimiter); idx >= 0 {
+				cp := key[:len(prefix)+idx+len(delimiter)]
+				if _, seen := prefixes[cp]; seen {
+					continue
+				}
+				prefixes[cp] = struct{}{}
+				common := types.CommonPrefix{Prefix: aws.String(cp)}
+				entries = append(entries, listedEntry{name: cp, commonPrefix: &common})
+				continue
 			}
-			if ts, ok := m.timestamps[key]; ok {
-				t := ts
-				obj.LastModified = &t
-			}
-			contents = append(contents, obj)
+		}
+
+		k := key
+		sz := int64(len(data))
+		obj := types.Object{Key: &k, Size: &sz}
+		if ts, ok := m.timestamps[key]; ok {
+			t := ts
+			obj.LastModified = &t
+		}
+		entries = append(entries, listedEntry{name: k, object: &obj})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].name < entries[j].name
+	})
+
+	start := 0
+	if token := aws.ToString(input.ContinuationToken); token != "" {
+		for start < len(entries) && entries[start].name <= token {
+			start++
 		}
 	}
 
-	for i := range contents {
-		for j := i + 1; j < len(contents); j++ {
-			if aws.ToString(contents[i].Key) > aws.ToString(contents[j].Key) {
-				contents[i], contents[j] = contents[j], contents[i]
-			}
+	max := len(entries) - start
+	if input.MaxKeys != nil {
+		requested := int(*input.MaxKeys)
+		if requested >= 0 && requested < max {
+			max = requested
 		}
+	}
+
+	if max < 0 {
+		max = 0
+	}
+	end := start + max
+	if end > len(entries) {
+		end = len(entries)
+	}
+
+	page := entries[start:end]
+	contents := make([]types.Object, 0, len(page))
+	commonPrefixes := make([]types.CommonPrefix, 0, len(page))
+	for _, entry := range page {
+		if entry.object != nil {
+			contents = append(contents, *entry.object)
+			continue
+		}
+		if entry.commonPrefix != nil {
+			commonPrefixes = append(commonPrefixes, *entry.commonPrefix)
+		}
+	}
+
+	isTruncated := end < len(entries)
+	var nextToken *string
+	if isTruncated && len(page) > 0 {
+		next := page[len(page)-1].name
+		nextToken = &next
 	}
 
 	return &s3.ListObjectsV2Output{
-		Contents: contents,
+		Contents:              contents,
+		CommonPrefixes:        commonPrefixes,
+		IsTruncated:           aws.Bool(isTruncated),
+		NextContinuationToken: nextToken,
 	}, nil
 }
 

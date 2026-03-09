@@ -835,6 +835,56 @@ func TestScanOrphanedS3TopicsEmptyPrefix(t *testing.T) {
 	}
 }
 
+func TestScanOrphanedS3TopicsHandlesPagedDirectoryListing(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+
+	_, _ = b.state.CreateTopicWithConfigs("live", 1, nil)
+	liveID := topicID(b, "live")
+	putTestObject(t, mem, "live", liveID, 0, 0, []int64{90000})
+
+	var orphanA [16]byte
+	orphanA[0] = 11
+	putTestObject(t, mem, "orphan-a", orphanA, 0, 0, []int64{90000})
+
+	var orphanB [16]byte
+	orphanB[0] = 12
+	putTestObject(t, mem, "orphan-b", orphanB, 0, 0, []int64{91000})
+
+	wrapped := &maxKeysListS3{InMemoryS3: mem, maxKeys: 1}
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: wrapped,
+		Bucket:   "test-bucket",
+		Prefix:   "klite/test",
+		Logger:   b.logger,
+	})
+
+	client := s3store.NewClient(s3store.ClientConfig{S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test"})
+	if err := client.PutObject(context.Background(), "klite/test/metadata.log", []byte("meta")); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans := b.scanOrphanedS3Topics()
+	if len(orphans) != 2 {
+		t.Fatalf("expected 2 orphaned topics, got %d", len(orphans))
+	}
+
+	names := make(map[string]struct{}, len(orphans))
+	for _, orphan := range orphans {
+		names[orphan.Name] = struct{}{}
+	}
+	if _, ok := names["orphan-a"]; !ok {
+		t.Fatalf("expected orphan-a in results, got %+v", orphans)
+	}
+	if _, ok := names["orphan-b"]; !ok {
+		t.Fatalf("expected orphan-b in results, got %+v", orphans)
+	}
+	if !wrapped.sawDelimiter {
+		t.Fatal("expected orphan scan to request delimiter-based listing")
+	}
+}
+
 func TestGCDeletedTopicReenqueuesOnListFailure(t *testing.T) {
 	t.Parallel()
 
@@ -1095,6 +1145,21 @@ type cancelOnListS3 struct {
 	cancel func()
 	prefix string
 	once   bool
+}
+
+type maxKeysListS3 struct {
+	*s3store.InMemoryS3
+	maxKeys      int32
+	sawDelimiter bool
+}
+
+func (m *maxKeysListS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObjectsV2Input, opts ...func(*s3svc.Options)) (*s3svc.ListObjectsV2Output, error) {
+	copyInput := *input
+	copyInput.MaxKeys = aws.Int32(m.maxKeys)
+	if aws.ToString(copyInput.Delimiter) == "/" {
+		m.sawDelimiter = true
+	}
+	return m.InMemoryS3.ListObjectsV2(ctx, &copyInput, opts...)
 }
 
 func (c *cancelOnListS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObjectsV2Input, opts ...func(*s3svc.Options)) (*s3svc.ListObjectsV2Output, error) {

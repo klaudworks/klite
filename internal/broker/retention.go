@@ -3,7 +3,6 @@ package broker
 import (
 	"context"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/klaudworks/klite/internal/cluster"
@@ -401,7 +400,7 @@ func (b *Broker) scanOrphanedS3Topics() []cluster.DeletedTopic {
 	defer cancel()
 
 	prefix := b.s3Client.Prefix() + "/"
-	objects, err := b.s3Client.ListObjects(ctx, prefix)
+	dirs, err := b.s3Client.ListChildDirs(ctx, prefix)
 	if err != nil {
 		b.logger.Warn("S3 orphan scan: list failed", "err", err)
 		return nil
@@ -412,30 +411,20 @@ func (b *Broker) scanOrphanedS3Topics() []cluster.DeletedTopic {
 		liveDirs[s3store.TopicDir(td.Name, td.ID)] = true
 	}
 
-	orphanDirs := make(map[string]bool)
-	metaKey := b.s3Client.Prefix() + "/metadata.log"
-	for _, obj := range objects {
-		if obj.Key == metaKey {
+	var result []cluster.DeletedTopic
+	for _, dir := range dirs {
+		if liveDirs[dir] {
 			continue
 		}
-		rel := strings.TrimPrefix(obj.Key, prefix)
-		dir, _, _ := strings.Cut(rel, "/")
-		if dir != "" && !liveDirs[dir] {
-			orphanDirs[dir] = true
-		}
-	}
-
-	if len(orphanDirs) == 0 {
-		return nil
-	}
-
-	var result []cluster.DeletedTopic
-	for dir := range orphanDirs {
 		name, id := s3store.ParseTopicDir(dir)
 		result = append(result, cluster.DeletedTopic{
 			Name:    name,
 			TopicID: id,
 		})
+	}
+
+	if len(result) == 0 {
+		return nil
 	}
 
 	b.logger.Info("S3 orphan scan: found orphaned topic dirs",
