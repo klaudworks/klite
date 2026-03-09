@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -48,16 +49,35 @@ func TestGracefulShutdown(t *testing.T) {
 	// SIGINT should trigger graceful shutdown + S3 flush + exit 0
 	bp.stopGraceful(t)
 
-	// Verify data made it to S3
+	// Verify data made it to S3 and the object contains the expected records.
 	keys := listS3Objects(t, prefix)
-	found := false
+	var matchingKey string
 	for _, key := range keys {
 		if strings.Contains(key, topic+"-") && strings.Contains(key, "/0/") && strings.HasSuffix(key, ".obj") {
-			found = true
+			matchingKey = key
 			break
 		}
 	}
-	require.True(t, found, "graceful shutdown should flush to S3, got keys: %v", keys)
+	require.NotEmpty(t, matchingKey, "graceful shutdown should flush to S3, got keys: %v", keys)
+
+	ctx := context.Background()
+	s3Client, err := newS3Client(ctx)
+	require.NoError(t, err)
+
+	getOut, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(testBucket),
+		Key:    aws.String(matchingKey),
+	})
+	require.NoError(t, err, "GetObject %s", matchingKey)
+	data, err := io.ReadAll(getOut.Body)
+	getOut.Body.Close()
+	require.NoError(t, err)
+	require.NotEmpty(t, data, "S3 object should not be empty")
+
+	footer, err := s3store.ParseFooter(data, int64(len(data)))
+	require.NoError(t, err, "ParseFooter %s", matchingKey)
+	require.Equal(t, int64(5), footer.TotalRecordCount(),
+		"flushed object should contain all 5 produced records")
 }
 
 // TestS3APISmokeTest exercises each S3 API method once against real LocalStack.
