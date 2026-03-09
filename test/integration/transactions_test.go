@@ -753,6 +753,7 @@ func TestIdempotentDedupAfterRestart(t *testing.T) {
 	// Phase 1: Start broker, get a PID, produce 2 batches with known sequences.
 	func() {
 		tb := StartBroker(t, WithDataDir(dataDir))
+		defer tb.Stop()
 		createTopic(t, tb.Addr, topic)
 
 		cl := NewClient(t, tb.Addr)

@@ -32,6 +32,7 @@ func TestWALProduceRestart(t *testing.T) {
 
 			WithDataDir(dataDir),
 		)
+		defer tb.Stop()
 
 		admin := NewAdminClient(t, tb.Addr)
 		_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
@@ -185,6 +186,7 @@ func TestWALTopicConfigSurvivesRestart(t *testing.T) {
 			WithDataDir(dataDir),
 			WithAutoCreateTopics(false),
 		)
+		defer tb.Stop()
 
 		admin := NewAdminClient(t, tb.Addr)
 
@@ -255,6 +257,7 @@ func TestWALCommittedOffsetsSurviveRestart(t *testing.T) {
 
 			WithDataDir(dataDir),
 		)
+		defer tb.Stop()
 
 		admin := NewAdminClient(t, tb.Addr)
 		_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
@@ -336,6 +339,7 @@ func TestWALMultiPartitionRestart(t *testing.T) {
 
 			WithDataDir(dataDir),
 		)
+		defer tb.Stop()
 
 		admin := NewAdminClient(t, tb.Addr)
 		_, err := admin.CreateTopic(context.Background(), int32(numPartitions), 1, nil, topic)
@@ -430,6 +434,7 @@ func TestWALCrashRecovery(t *testing.T) {
 
 			WithDataDir(dataDir),
 		)
+		defer tb.Stop()
 
 		admin := NewAdminClient(t, tb.Addr)
 		_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
@@ -550,6 +555,7 @@ func TestWALSegmentRotation(t *testing.T) {
 			WithDataDir(dataDir),
 			WithWALSegmentMaxBytes(segMaxBytes),
 		)
+		defer tb.Stop()
 
 		admin := NewAdminClient(t, tb.Addr)
 		_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
