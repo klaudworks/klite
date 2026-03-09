@@ -5,12 +5,25 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
 	s3store "github.com/klaudworks/klite/internal/s3"
 )
+
+const maxCompactionFailureBackoff = time.Hour
+
+type compactionPartitionKey struct {
+	topic     string
+	partition int32
+}
+
+type compactionRetryState struct {
+	failures   int
+	retryAfter time.Time
+}
 
 func (b *Broker) compactionLoop(ctx context.Context) {
 	interval := b.cfg.CompactionCheckInterval
@@ -38,13 +51,14 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 
 	ticker := b.cfg.Clock.NewTicker(interval)
 	defer ticker.Stop()
+	retryState := make(map[compactionPartitionKey]compactionRetryState)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			b.logger.Debug("compaction scan tick", "interval", interval, "min_dirty_objects", minDirty)
-			b.compactOneDirtyPartition(ctx, compactor, int32(minDirty))
+			b.compactOneDirtyPartition(ctx, compactor, int32(minDirty), interval, retryState)
 		}
 	}
 }
@@ -52,6 +66,10 @@ func (b *Broker) compactionLoop(ctx context.Context) {
 // selectDirtyPartition picks the best partition eligible for compaction from
 // the given topics. Returns nil, nil if no partition qualifies.
 func selectDirtyPartition(topics []*cluster.TopicData, minDirty int32, clk clock.Clock) (*cluster.TopicData, *cluster.PartData) {
+	return selectDirtyPartitionWithSkip(topics, minDirty, clk, nil)
+}
+
+func selectDirtyPartitionWithSkip(topics []*cluster.TopicData, minDirty int32, clk clock.Clock, skip func(*cluster.TopicData, *cluster.PartData) bool) (*cluster.TopicData, *cluster.PartData) {
 	var bestPD *cluster.PartData
 	var bestTD *cluster.TopicData
 	var bestDirty int32
@@ -66,6 +84,10 @@ func selectDirtyPartition(topics []*cluster.TopicData, minDirty int32, clk clock
 		}
 
 		for _, pd := range td.Partitions {
+			if skip != nil && skip(td, pd) {
+				continue
+			}
+
 			dirty := pd.DirtyObjects()
 
 			// Eligibility check
@@ -104,14 +126,19 @@ func selectDirtyPartition(topics []*cluster.TopicData, minDirty int32, clk clock
 	return bestTD, bestPD
 }
 
-func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32) {
+func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3store.Compactor, minDirty int32, interval time.Duration, retryState map[compactionPartitionKey]compactionRetryState) {
 	topics := b.state.GetAllTopics()
+	now := b.cfg.Clock.Now()
 
-	bestTD, bestPD := selectDirtyPartition(topics, minDirty, b.cfg.Clock)
+	bestTD, bestPD := selectDirtyPartitionWithSkip(topics, minDirty, b.cfg.Clock, func(td *cluster.TopicData, pd *cluster.PartData) bool {
+		state, ok := retryState[compactionPartitionKey{topic: td.Name, partition: pd.Index}]
+		return ok && now.Before(state.retryAfter)
+	})
 	if bestPD == nil {
 		b.logger.Debug("compaction scan found no eligible partitions", "min_dirty_objects", minDirty)
 		return
 	}
+	partitionKey := compactionPartitionKey{topic: bestTD.Name, partition: bestPD.Index}
 	dirtyObjects := bestPD.DirtyObjects()
 
 	minCompactionLagMs := int64(0)
@@ -144,10 +171,20 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		func() { bestPD.CompactionMu.Unlock() },
 	)
 	if err != nil {
+		state := retryState[partitionKey]
+		state.failures++
+		backoff := compactionFailureBackoff(interval, state.failures)
+		state.retryAfter = now.Add(backoff)
+		retryState[partitionKey] = state
 		b.logger.Warn("compaction failed",
-			"topic", bestTD.Name, "partition", bestPD.Index, "err", err)
+			"topic", bestTD.Name, "partition", bestPD.Index,
+			"failure_count", state.failures,
+			"retry_after", state.retryAfter,
+			"backoff", backoff,
+			"err", err)
 		return
 	}
+	delete(retryState, partitionKey)
 
 	if newWatermark > cleanedUpTo {
 		bestPD.Lock()
@@ -160,4 +197,28 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 			"cleaned_up_to", newWatermark,
 			"dirty_objects", dirtyObjects)
 	}
+}
+
+func compactionFailureBackoff(baseInterval time.Duration, failures int) time.Duration {
+	if baseInterval <= 0 {
+		baseInterval = time.Second
+	}
+	if failures <= 1 {
+		if baseInterval > maxCompactionFailureBackoff {
+			return maxCompactionFailureBackoff
+		}
+		return baseInterval
+	}
+
+	backoff := baseInterval
+	for i := 1; i < failures; i++ {
+		if backoff >= maxCompactionFailureBackoff/2 {
+			return maxCompactionFailureBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > maxCompactionFailureBackoff {
+		return maxCompactionFailureBackoff
+	}
+	return backoff
 }

@@ -203,3 +203,36 @@ func TestSelectDirtyPartition_NoTopicsReturnsNil(t *testing.T) {
 	assert.Nil(t, gotTD)
 	assert.Nil(t, gotPD)
 }
+
+func TestSelectDirtyPartitionWithSkip_SkipsCoolingPartition(t *testing.T) {
+	t.Parallel()
+	td := makeTopic("multi", map[string]string{
+		"cleanup.policy": "compact",
+	}, []int32{30, 20})
+
+	clk := clock.NewFakeClock(time.Now())
+	gotTD, gotPD := selectDirtyPartitionWithSkip([]*cluster.TopicData{td}, 1, clk, func(_ *cluster.TopicData, pd *cluster.PartData) bool {
+		return pd.Index == 0
+	})
+
+	require.NotNil(t, gotTD)
+	require.NotNil(t, gotPD)
+	assert.Equal(t, int32(1), gotPD.Index)
+}
+
+func TestCompactionFailureBackoff_DoublesAndCaps(t *testing.T) {
+	t.Parallel()
+
+	base := 2 * time.Minute
+	assert.Equal(t, 2*time.Minute, compactionFailureBackoff(base, 1))
+	assert.Equal(t, 4*time.Minute, compactionFailureBackoff(base, 2))
+	assert.Equal(t, 8*time.Minute, compactionFailureBackoff(base, 3))
+	assert.Equal(t, 32*time.Minute, compactionFailureBackoff(base, 5))
+	assert.Equal(t, maxCompactionFailureBackoff, compactionFailureBackoff(base, 6))
+	assert.Equal(t, maxCompactionFailureBackoff, compactionFailureBackoff(base, 10))
+}
+
+func TestCompactionFailureBackoff_HandlesInvalidBase(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, time.Second, compactionFailureBackoff(0, 1))
+}
