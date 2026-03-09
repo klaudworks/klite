@@ -695,7 +695,6 @@ func TestEndTxnControlBatchDurability(t *testing.T) {
 	pd.Unlock()
 
 	// Set up a transactional producer with an open transaction.
-	const pid int64 = 42
 	const txnTimeoutMs int32 = 30000
 	allocPID, allocEpoch, errCode := state.PIDManager().InitProducerID("test-txn", txnTimeoutMs)
 	if errCode != 0 {
@@ -709,7 +708,7 @@ func TestEndTxnControlBatchDurability(t *testing.T) {
 	}
 
 	// Write a data batch through the WAL (simulating a produce).
-	batch := makeTestBatchPID(0, 5, pid, allocEpoch, 0)
+	batch := makeTestBatchPID(0, 5, allocPID, allocEpoch, 0)
 	// Set transactional attribute (bit 4)
 	binary.BigEndian.PutUint16(batch[17:19], binary.BigEndian.Uint16(batch[17:19])|0x0010)
 	entry := &wal.Entry{
