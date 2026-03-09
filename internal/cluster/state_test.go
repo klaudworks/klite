@@ -841,3 +841,308 @@ func TestSetLogStartOffsetFromReplay_DoesNotDecrease(t *testing.T) {
 		t.Fatalf("logStart should stay at 100, got %d", ls)
 	}
 }
+
+func TestSetLogStartOffsetFromReplay_CascadesNextReserveAndCommit(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	s.CreateTopic("cascade-topic", 1)
+	td := s.GetTopic("cascade-topic")
+
+	// Set logStart higher than all zero-initialized offsets.
+	s.SetLogStartOffsetFromReplay("cascade-topic", 0, 200)
+
+	pd := td.Partitions[0]
+	pd.mu.RLock()
+	ls := pd.LogStart()
+	hw := pd.HW()
+	nr := pd.nextReserve
+	nc := pd.nextCommit
+	pd.mu.RUnlock()
+
+	if ls != 200 {
+		t.Fatalf("expected logStart=200, got %d", ls)
+	}
+	if hw != 200 {
+		t.Fatalf("expected hw=200 (cascaded from logStart), got %d", hw)
+	}
+	if nr != 200 {
+		t.Fatalf("expected nextReserve=200 (cascaded from logStart>hw), got %d", nr)
+	}
+	if nc != 200 {
+		t.Fatalf("expected nextCommit=200 (cascaded from logStart>hw), got %d", nc)
+	}
+}
+
+func TestDeleteTopic(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	s.CreateTopic("del-topic", 2)
+	if !s.TopicExists("del-topic") {
+		t.Fatal("topic should exist after creation")
+	}
+
+	ok := s.DeleteTopic("del-topic")
+	if !ok {
+		t.Fatal("DeleteTopic should return true for existing topic")
+	}
+	if s.TopicExists("del-topic") {
+		t.Fatal("topic should not exist after deletion")
+	}
+	if s.GetTopic("del-topic") != nil {
+		t.Fatal("GetTopic should return nil after deletion")
+	}
+
+	// Normalized name should be removed (no collision with new topic using same normalized name)
+	if col := s.CheckTopicCollision("del-topic"); col != "" {
+		t.Fatalf("expected no collision after deletion, got %q", col)
+	}
+
+	// Deleting non-existent topic returns false
+	ok = s.DeleteTopic("del-topic")
+	if ok {
+		t.Fatal("DeleteTopic should return false for non-existent topic")
+	}
+}
+
+func TestDrainDeletedTopics(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	// No deleted topics yet
+	drained := s.DrainDeletedTopics()
+	if len(drained) != 0 {
+		t.Fatalf("expected 0 deleted topics initially, got %d", len(drained))
+	}
+
+	// Create and delete two topics
+	td1, _ := s.CreateTopic("drain-a", 1)
+	td2, _ := s.CreateTopic("drain-b", 1)
+	id1 := td1.ID
+	id2 := td2.ID
+
+	s.DeleteTopic("drain-a")
+	s.DeleteTopic("drain-b")
+
+	drained = s.DrainDeletedTopics()
+	if len(drained) != 2 {
+		t.Fatalf("expected 2 deleted topics, got %d", len(drained))
+	}
+
+	// Verify contents
+	names := map[string][16]byte{}
+	for _, dt := range drained {
+		names[dt.Name] = dt.TopicID
+	}
+	if names["drain-a"] != id1 {
+		t.Fatalf("drain-a: expected ID %v, got %v", id1, names["drain-a"])
+	}
+	if names["drain-b"] != id2 {
+		t.Fatalf("drain-b: expected ID %v, got %v", id2, names["drain-b"])
+	}
+
+	// Second drain should return empty (already drained)
+	drained2 := s.DrainDeletedTopics()
+	if len(drained2) != 0 {
+		t.Fatalf("expected 0 after second drain, got %d", len(drained2))
+	}
+}
+
+func TestAddPartitions(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	td, _ := s.CreateTopic("grow-topic", 2)
+	if len(td.Partitions) != 2 {
+		t.Fatalf("expected 2 partitions initially, got %d", len(td.Partitions))
+	}
+
+	// Grow from 2 to 5
+	s.AddPartitions("grow-topic", 5)
+	td = s.GetTopic("grow-topic")
+	if len(td.Partitions) != 5 {
+		t.Fatalf("expected 5 partitions after AddPartitions, got %d", len(td.Partitions))
+	}
+
+	// Verify new partition fields
+	for i := 2; i < 5; i++ {
+		pd := td.Partitions[i]
+		if pd.Topic != "grow-topic" {
+			t.Errorf("partition %d: expected topic grow-topic, got %s", i, pd.Topic)
+		}
+		if pd.Index != int32(i) {
+			t.Errorf("partition %d: expected index %d, got %d", i, i, pd.Index)
+		}
+		if pd.TopicID != td.ID {
+			t.Errorf("partition %d: expected topicID %v, got %v", i, td.ID, pd.TopicID)
+		}
+	}
+
+	// AddPartitions with count <= current should be no-op
+	s.AddPartitions("grow-topic", 3)
+	td = s.GetTopic("grow-topic")
+	if len(td.Partitions) != 5 {
+		t.Fatalf("expected 5 partitions (no shrink), got %d", len(td.Partitions))
+	}
+
+	// AddPartitions on non-existent topic should not panic
+	s.AddPartitions("nonexistent", 10)
+}
+
+func TestSnapshotEntries(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+	s.SetShutdownCh(shutdownCh)
+	s.SetLogger(slog.Default())
+
+	// 1. Create a topic with configs
+	s.CreateTopicWithConfigs("snap-topic", 2, map[string]string{
+		"retention.ms": "3600000",
+	})
+
+	// 2. Set logStart on partition 0
+	s.SetLogStartOffsetFromReplay("snap-topic", 0, 10)
+
+	// 3. Set compaction watermark on partition 1
+	s.SetCompactionWatermarkFromReplay("snap-topic", 1, 25)
+
+	// 4. Commit an offset (creates a group)
+	s.SetCommittedOffsetFromReplay("snap-group", "snap-topic", 0, 42, "m1")
+
+	// 5. Set a producer ID
+	s.pidManager.SetNextPID(100)
+
+	entries := s.SnapshotEntries()
+
+	// Count entry types
+	typeCounts := map[byte]int{}
+	for _, e := range entries {
+		if len(e) == 0 {
+			t.Fatal("empty entry in snapshot")
+		}
+		typeCounts[e[0]]++
+	}
+
+	// Should have: 1 CreateTopic, 1 OffsetCommit, 1 ProducerID, 1 LogStartOffset, 1 CompactionWatermark
+	if typeCounts[0x01] != 1 {
+		t.Fatalf("expected 1 CreateTopic entry, got %d", typeCounts[0x01])
+	}
+	if typeCounts[0x04] != 1 {
+		t.Fatalf("expected 1 OffsetCommit entry, got %d", typeCounts[0x04])
+	}
+	if typeCounts[0x05] != 1 {
+		t.Fatalf("expected 1 ProducerID entry, got %d", typeCounts[0x05])
+	}
+	if typeCounts[0x06] != 1 {
+		t.Fatalf("expected 1 LogStartOffset entry, got %d", typeCounts[0x06])
+	}
+	if typeCounts[0x09] != 1 {
+		t.Fatalf("expected 1 CompactionWatermark entry, got %d", typeCounts[0x09])
+	}
+
+	// Verify total count
+	if len(entries) != 5 {
+		t.Fatalf("expected 5 total entries, got %d", len(entries))
+	}
+}
+
+func TestSnapshotEntries_Empty(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	entries := s.SnapshotEntries()
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 entries for empty state, got %d", len(entries))
+	}
+}
+
+func TestNormalizeTopicName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"foo.bar", "foo_bar"},
+		{"foo_bar", "foo_bar"},
+		{"foo.bar.baz", "foo_bar_baz"},
+		{"no-dots", "no-dots"},
+		{"", ""},
+		{"....", "____"},
+		{"a.b_c.d", "a_b_c_d"},
+	}
+
+	for _, tt := range tests {
+		got := NormalizeTopicName(tt.input)
+		if got != tt.want {
+			t.Errorf("NormalizeTopicName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestCheckTopicCollision(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	s.CreateTopic("foo.bar", 1)
+
+	// foo_bar collides with foo.bar (dots and underscores are equivalent)
+	if col := s.CheckTopicCollision("foo_bar"); col != "foo.bar" {
+		t.Fatalf("expected collision with foo.bar, got %q", col)
+	}
+
+	// Same exact name does not count as a collision
+	if col := s.CheckTopicCollision("foo.bar"); col != "" {
+		t.Fatalf("expected no collision for same name, got %q", col)
+	}
+
+	// Unrelated name does not collide
+	if col := s.CheckTopicCollision("baz.qux"); col != "" {
+		t.Fatalf("expected no collision for unrelated name, got %q", col)
+	}
+
+	// After deletion, collision should be gone
+	s.DeleteTopic("foo.bar")
+	if col := s.CheckTopicCollision("foo_bar"); col != "" {
+		t.Fatalf("expected no collision after deletion, got %q", col)
+	}
+}
