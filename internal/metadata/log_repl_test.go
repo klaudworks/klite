@@ -123,12 +123,14 @@ func TestMetadataLogCompactHook(t *testing.T) {
 
 	// Write entries to get file size up, then manually trigger compaction
 	for i := 0; i < 100; i++ {
-		_ = ml.Append(MarshalOffsetCommit(&OffsetCommitEntry{
+		if err := ml.Append(MarshalOffsetCommit(&OffsetCommitEntry{
 			Group:     "g1",
 			Topic:     "t",
 			Partition: 0,
 			Offset:    int64(i),
-		}))
+		})); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
 	}
 
 	// Manually trigger compaction
@@ -237,12 +239,14 @@ func TestMetadataLogCompactHookWithReplicateHook(t *testing.T) {
 	// Write entries
 	numEntries := 50
 	for i := 0; i < numEntries; i++ {
-		_ = ml.Append(MarshalOffsetCommit(&OffsetCommitEntry{
+		if err := ml.Append(MarshalOffsetCommit(&OffsetCommitEntry{
 			Group:     "g1",
 			Topic:     "t",
 			Partition: 0,
 			Offset:    int64(i),
-		}))
+		})); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
 	}
 
 	// Verify replicateHook was called for every append

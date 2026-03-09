@@ -334,12 +334,16 @@ func TestLogDeleteTopic(t *testing.T) {
 
 	// Create topic then delete it
 	topicID := [16]byte{1, 2, 3}
-	_ = ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
+	if err := ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
 		TopicName:      "ephemeral",
 		PartitionCount: 1,
 		TopicID:        topicID,
-	}))
-	_ = ml.AppendSync(MarshalDeleteTopic(&DeleteTopicEntry{TopicName: "ephemeral"}))
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := ml.AppendSync(MarshalDeleteTopic(&DeleteTopicEntry{TopicName: "ephemeral"})); err != nil {
+		t.Fatal(err)
+	}
 	_ = ml.Close()
 
 	// Replay
@@ -380,17 +384,21 @@ func TestLogAlterConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
+	if err := ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
 		TopicName:      "cfg-topic",
 		PartitionCount: 1,
 		TopicID:        [16]byte{7, 8, 9},
 		Configs:        map[string]string{"retention.ms": "1000"},
-	}))
-	_ = ml.Append(MarshalAlterConfig(&AlterConfigEntry{
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := ml.Append(MarshalAlterConfig(&AlterConfigEntry{
 		TopicName: "cfg-topic",
 		Key:       "retention.ms",
 		Value:     "9999",
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	_ = ml.Close()
 
 	// Replay
@@ -440,11 +448,13 @@ func TestLogCrashSafety(t *testing.T) {
 	}
 
 	// Write a good entry
-	_ = ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
+	if err := ml.AppendSync(MarshalCreateTopic(&CreateTopicEntry{
 		TopicName:      "good-topic",
 		PartitionCount: 1,
 		TopicID:        [16]byte{1},
-	}))
+	})); err != nil {
+		t.Fatal(err)
+	}
 	_ = ml.Close()
 
 	// Append garbage to simulate partial write / crash
