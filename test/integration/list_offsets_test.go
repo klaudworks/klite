@@ -148,20 +148,14 @@ func TestListOffsetsUnknownTopic(t *testing.T) {
 	admin := NewAdminClient(t, tb.Addr)
 	ctx := context.Background()
 
-	// List offsets for a topic that doesn't exist
+	// List offsets for a topic that doesn't exist — kadm wraps unknown
+	// topics as an error in the response map with a special -1 partition entry.
 	offsets, err := admin.ListEndOffsets(ctx, "nonexistent-topic")
-	// kadm wraps unknown topics as an error in the response map
-	// with a special -1 partition entry
-	if err != nil {
-		// If there's a top-level error, that's ok too
-		return
-	}
+	require.NoError(t, err)
 
-	// The topic should either not be present or have an error
 	lo, ok := offsets.Lookup("nonexistent-topic", -1)
-	if ok {
-		require.ErrorIs(t, lo.Err, kerr.UnknownTopicOrPartition)
-	}
+	require.True(t, ok, "nonexistent topic should be present in response map")
+	require.ErrorIs(t, lo.Err, kerr.UnknownTopicOrPartition)
 }
 
 func TestListOffsetsMaxTimestampEmptyLog(t *testing.T) {
