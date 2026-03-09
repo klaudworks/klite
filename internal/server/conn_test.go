@@ -174,6 +174,78 @@ func TestHandlerRegistryBasic(t *testing.T) {
 	}
 }
 
+func TestSASLAllowed(t *testing.T) {
+	t.Parallel()
+
+	apiVersions := kmsg.NewApiVersionsRequest()
+	handshake := kmsg.NewSASLHandshakeRequest()
+	authenticate := kmsg.NewSASLAuthenticateRequest()
+	produce := kmsg.NewProduceRequest()
+	fetch := kmsg.NewFetchRequest()
+	metadata := kmsg.NewMetadataRequest()
+
+	tests := []struct {
+		name    string
+		stage   SASLStage
+		req     kmsg.Request
+		allowed bool
+	}{
+		// SASLStageBegin: only ApiVersions + SASLHandshake
+		{"begin_api_versions", SASLStageBegin, &apiVersions, true},
+		{"begin_sasl_handshake", SASLStageBegin, &handshake, true},
+		{"begin_produce_rejected", SASLStageBegin, &produce, false},
+		{"begin_fetch_rejected", SASLStageBegin, &fetch, false},
+		{"begin_sasl_authenticate_rejected", SASLStageBegin, &authenticate, false},
+		{"begin_metadata_rejected", SASLStageBegin, &metadata, false},
+
+		// SASLStageAuthPlain: only ApiVersions + SASLAuthenticate
+		{"auth_plain_api_versions", SASLStageAuthPlain, &apiVersions, true},
+		{"auth_plain_sasl_authenticate", SASLStageAuthPlain, &authenticate, true},
+		{"auth_plain_produce_rejected", SASLStageAuthPlain, &produce, false},
+		{"auth_plain_sasl_handshake_rejected", SASLStageAuthPlain, &handshake, false},
+
+		// SASLStageAuthScram256: only ApiVersions + SASLAuthenticate
+		{"auth_scram256_api_versions", SASLStageAuthScram256, &apiVersions, true},
+		{"auth_scram256_sasl_authenticate", SASLStageAuthScram256, &authenticate, true},
+		{"auth_scram256_produce_rejected", SASLStageAuthScram256, &produce, false},
+		{"auth_scram256_sasl_handshake_rejected", SASLStageAuthScram256, &handshake, false},
+
+		// SASLStageAuthScram512: only ApiVersions + SASLAuthenticate
+		{"auth_scram512_api_versions", SASLStageAuthScram512, &apiVersions, true},
+		{"auth_scram512_sasl_authenticate", SASLStageAuthScram512, &authenticate, true},
+		{"auth_scram512_produce_rejected", SASLStageAuthScram512, &produce, false},
+
+		// SASLStageAuthScram1: only ApiVersions + SASLAuthenticate
+		{"auth_scram1_api_versions", SASLStageAuthScram1, &apiVersions, true},
+		{"auth_scram1_sasl_authenticate", SASLStageAuthScram1, &authenticate, true},
+		{"auth_scram1_produce_rejected", SASLStageAuthScram1, &produce, false},
+
+		// SASLStageComplete: all requests allowed
+		{"complete_api_versions", SASLStageComplete, &apiVersions, true},
+		{"complete_produce", SASLStageComplete, &produce, true},
+		{"complete_fetch", SASLStageComplete, &fetch, true},
+		{"complete_metadata", SASLStageComplete, &metadata, true},
+		{"complete_sasl_handshake", SASLStageComplete, &handshake, true},
+		{"complete_sasl_authenticate", SASLStageComplete, &authenticate, true},
+
+		// Unknown stage: returns false
+		{"unknown_stage", SASLStage(99), &apiVersions, false},
+		{"unknown_stage_produce", SASLStage(99), &produce, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cc := &clientConn{saslStage: tt.stage}
+			got := cc.saslAllowed(tt.req)
+			if got != tt.allowed {
+				t.Errorf("saslAllowed(stage=%d, req=%T) = %v, want %v",
+					tt.stage, tt.req, got, tt.allowed)
+			}
+		})
+	}
+}
+
 func TestCloseConnsUnblocksWait(t *testing.T) {
 	t.Parallel()
 
