@@ -140,6 +140,15 @@ func (g *Group) SetMetadataLog(ml *metadata.Log) {
 }
 
 func (g *Group) Send(req kmsg.Request) (kmsg.Response, error) {
+	// Prioritize shutdown/quit over enqueuing a new request.
+	select {
+	case <-g.quitCh:
+		return nil, fmt.Errorf("group is dead")
+	case <-g.shutdownCh:
+		return nil, fmt.Errorf("broker shutting down")
+	default:
+	}
+
 	respCh := make(chan groupResponse, 1)
 	select {
 	case g.reqCh <- groupRequest{req: req, respCh: respCh}:
@@ -159,6 +168,15 @@ func (g *Group) Send(req kmsg.Request) (kmsg.Response, error) {
 }
 
 func (g *Group) Control(fn func()) {
+	// Prioritize shutdown/quit over enqueuing a new control function.
+	select {
+	case <-g.quitCh:
+		return
+	case <-g.shutdownCh:
+		return
+	default:
+	}
+
 	done := make(chan struct{})
 	wrapped := func() {
 		fn()
