@@ -6,10 +6,12 @@ description: Estimate monthly object storage costs for your klite workload acros
 Estimate your monthly object storage costs based on your workload parameters.
 
 <div id="calc">
-  <div class="provider-tabs" role="tablist">
-    <button role="tab" class="provider-tab active" data-provider="aws">AWS S3</button>
-    <button role="tab" class="provider-tab" data-provider="gcs">GCS</button>
-    <button role="tab" class="provider-tab" data-provider="azure">Azure Blob</button>
+  <div class="tablist-wrapper not-content">
+    <ul role="tablist" class="provider-tablist">
+      <li role="presentation" class="tab"><a role="tab" class="provider-tab active" data-provider="aws">AWS S3</a></li>
+      <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="gcs">GCS</a></li>
+      <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="azure">Azure Blob (on roadmap)</a></li>
+    </ul>
   </div>
   <p class="provider-note" id="providerNote">US East (N. Virginia), S3 Standard.</p>
 
@@ -82,32 +84,34 @@ The main API cost driver is **object store reads**: consumers fetching data that
 **Data transfer**: if klite runs in the same region as the bucket, there are no transfer costs. Running outside the provider's network incurs egress fees (<span id="egressNote">~$0.09/GB</span>) when consumers fetch WAL-evicted data. Writes are always free (ingress is $0).
 
 <style>{`
-  .provider-tabs {
+  .tablist-wrapper {
+    overflow-x: auto;
+  }
+  .provider-tablist {
     display: flex;
     list-style: none;
     border-bottom: 2px solid var(--sl-color-gray-5);
     padding: 0;
     margin: 0;
-    overflow-x: auto;
   }
-  .provider-tab {
+  .provider-tablist .tab {
+    display: flex;
+  }
+  .provider-tablist .tab > [role='tab'] {
     --sl-tab-color-border: var(--sl-color-gray-5);
     display: flex;
     align-items: center;
+    gap: 0.5rem;
+    line-height: var(--sl-line-height-headings);
     padding: 0.275rem 1.25rem;
-    border: none;
-    background: none;
     text-decoration: none;
     box-shadow: 0 2px 0 var(--sl-tab-color-border);
     color: var(--sl-color-gray-3);
-    font-size: inherit;
-    font-family: inherit;
-    line-height: var(--sl-line-height-headings);
     outline-offset: var(--sl-outline-offset-inside);
     overflow-wrap: initial;
     cursor: pointer;
   }
-  .provider-tab.active {
+  .provider-tablist .tab [role='tab'].active {
     --sl-tab-color-border: var(--sl-color-text-accent);
     color: var(--sl-color-white);
     font-weight: 600;
@@ -356,9 +360,10 @@ The main API cost driver is **object store reads**: consumers fetching data that
   }
 
   // Provider tab switching
-  document.querySelectorAll('.provider-tab').forEach(function(tab) {
-    tab.addEventListener('click', function() {
-      document.querySelectorAll('.provider-tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelectorAll('.provider-tablist [role="tab"]').forEach(function(tab) {
+    tab.addEventListener('click', function(e) {
+      e.preventDefault();
+      document.querySelectorAll('.provider-tablist [role="tab"]').forEach(function(t) { t.classList.remove('active'); });
       tab.classList.add('active');
       currentProvider = tab.getAttribute('data-provider');
       updateLabels();
