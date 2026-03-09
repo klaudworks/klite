@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"encoding/binary"
 	"hash/crc32"
 	"log/slog"
 	"os"
@@ -1176,6 +1177,454 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 			assert.Contains(t, recordKeys, "B")
 		})
 	}
+}
+
+// --- Direct unit tests for buildOffsetMap ---
+
+func TestBuildOffsetMap_NullKeysSkipped(t *testing.T) {
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset:    0,
+		baseTimestamp: 1000,
+		records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: nil, Value: []byte("v1")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("A"), Value: []byte("v1")},
+			{OffsetDelta: 2, TimestampDelta: 200, Key: nil, Value: []byte("v2")},
+		},
+		codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := make(map[string]int64)
+	err = compactor.buildOffsetMap(obj, footer, offsetMap)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), offsetMap["A"])
+	assert.Len(t, offsetMap, 1, "null keys should not appear in offset map")
+}
+
+func TestBuildOffsetMap_ControlBatchSkipped(t *testing.T) {
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	// Build a control batch by setting the control bit in attributes
+	controlHeader := BatchHeader{
+		BaseOffset:    0,
+		Attributes:    0x20, // control batch bit
+		BaseTimestamp: 1000,
+		MaxTimestamp:  1000,
+		ProducerID:    100,
+		ProducerEpoch: 0,
+		BaseSequence:  0,
+	}
+	controlRec := []Record{{OffsetDelta: 0, TimestampDelta: 0, Key: []byte{0, 0, 0, 0}, Value: []byte{0, 0}}}
+	controlBatchBytes, err := BuildRecordBatch(controlHeader, controlRec, CompressionNone)
+	require.NoError(t, err)
+
+	// Build a normal batch with key "A"
+	normalBatchBytes, err := BuildTestBatch(1, 2000, []Record{
+		{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("v1")},
+	}, CompressionNone)
+	require.NoError(t, err)
+
+	obj := BuildObject([]BatchData{
+		{RawBytes: controlBatchBytes, BaseOffset: 0, LastOffsetDelta: 0},
+		{RawBytes: normalBatchBytes, BaseOffset: 1, LastOffsetDelta: 0},
+	})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := make(map[string]int64)
+	err = compactor.buildOffsetMap(obj, footer, offsetMap)
+	require.NoError(t, err)
+
+	// Only key "A" from the normal batch should be in the map
+	assert.Equal(t, int64(1), offsetMap["A"])
+	assert.Len(t, offsetMap, 1, "control batch keys should not appear in offset map")
+}
+
+func TestBuildOffsetMap_MultipleBatchesSameKey(t *testing.T) {
+	// Three batches all with key "X" at increasing offsets — map should keep highest offset.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{
+		{baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("X"), Value: []byte("v1")},
+		}, codec: CompressionNone},
+		{baseOffset: 1, baseTimestamp: 2000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("X"), Value: []byte("v2")},
+		}, codec: CompressionNone},
+		{baseOffset: 2, baseTimestamp: 3000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("X"), Value: []byte("v3")},
+		}, codec: CompressionNone},
+	})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := make(map[string]int64)
+	err = compactor.buildOffsetMap(obj, footer, offsetMap)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(2), offsetMap["X"], "should keep highest offset for key X")
+}
+
+func TestBuildOffsetMap_AcrossMultipleObjects(t *testing.T) {
+	// Build two separate objects and call buildOffsetMap on each — the map should
+	// accumulate the highest offset across both.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj1 := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("v1")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("B"), Value: []byte("v1")},
+		}, codec: CompressionNone,
+	}})
+	footer1, err := ParseFooter(obj1, int64(len(obj1)))
+	require.NoError(t, err)
+
+	obj2 := buildTestObject(t, []testBatch{{
+		baseOffset: 2, baseTimestamp: 2000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("v2")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("C"), Value: []byte("v1")},
+		}, codec: CompressionNone,
+	}})
+	footer2, err := ParseFooter(obj2, int64(len(obj2)))
+	require.NoError(t, err)
+
+	offsetMap := make(map[string]int64)
+	err = compactor.buildOffsetMap(obj1, footer1, offsetMap)
+	require.NoError(t, err)
+	err = compactor.buildOffsetMap(obj2, footer2, offsetMap)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(2), offsetMap["A"], "A should have offset from second object")
+	assert.Equal(t, int64(1), offsetMap["B"], "B only in first object")
+	assert.Equal(t, int64(3), offsetMap["C"], "C only in second object")
+}
+
+// --- Direct unit tests for filterBatches ---
+
+func TestFilterBatches_AllRetained(t *testing.T) {
+	// All records have the latest offset for their key — nothing should be removed.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("v1")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("B"), Value: []byte("v1")},
+			{OffsetDelta: 2, TimestampDelta: 200, Key: []byte("C"), Value: []byte("v1")},
+		}, codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{"A": 0, "B": 1, "C": 2}
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "single batch should be retained")
+
+	// Parse the retained batch and count records
+	header, err := ParseBatchHeaderFromRaw(batches[0].RawBytes)
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), header.NumRecords, "all 3 records should be retained")
+}
+
+func TestFilterBatches_AllRemoved(t *testing.T) {
+	// All records are superseded by later offsets — the batch should be dropped entirely.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("old")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("B"), Value: []byte("old")},
+		}, codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	// Both keys have higher offsets elsewhere
+	offsetMap := map[string]int64{"A": 10, "B": 11}
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	assert.Empty(t, batches, "all records superseded → batch should be dropped")
+}
+
+func TestFilterBatches_PartialFiltering(t *testing.T) {
+	// Some records superseded, some retained — the batch should be rebuilt with fewer records.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("old")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("B"), Value: []byte("keep")},
+			{OffsetDelta: 2, TimestampDelta: 200, Key: []byte("C"), Value: []byte("old")},
+		}, codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	// A superseded at offset 10, B is at its latest (offset 1), C superseded at offset 20
+	offsetMap := map[string]int64{"A": 10, "B": 1, "C": 20}
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "partially filtered batch should be retained")
+
+	// Parse the rebuilt batch
+	header, err := ParseBatchHeaderFromRaw(batches[0].RawBytes)
+	require.NoError(t, err)
+	decompressed, err := DecompressRecords(batches[0].RawBytes, header.CompressionCodec())
+	require.NoError(t, err)
+
+	var keys []string
+	_ = IterateRecords(decompressed, func(r Record) bool {
+		keys = append(keys, string(r.Key))
+		return true
+	})
+	assert.Equal(t, []string{"B"}, keys, "only B should survive partial filtering")
+}
+
+func TestFilterBatches_ControlBatchPassthrough(t *testing.T) {
+	// Control batches should be kept as-is regardless of offset map.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	controlHeader := BatchHeader{
+		BaseOffset:    0,
+		Attributes:    0x20, // control batch
+		BaseTimestamp: 1000,
+		MaxTimestamp:  1000,
+		ProducerID:    100,
+		ProducerEpoch: 0,
+		BaseSequence:  0,
+	}
+	controlRec := []Record{{OffsetDelta: 0, TimestampDelta: 0, Key: []byte{0, 0, 0, 0}, Value: []byte{0, 0}}}
+	controlBatchBytes, err := BuildRecordBatch(controlHeader, controlRec, CompressionNone)
+	require.NoError(t, err)
+
+	obj := BuildObject([]BatchData{
+		{RawBytes: controlBatchBytes, BaseOffset: 0, LastOffsetDelta: 0},
+	})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{} // empty — would remove everything if it were a normal batch
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "control batch should always be kept")
+
+	header, err := ParseBatchHeaderFromRaw(batches[0].RawBytes)
+	require.NoError(t, err)
+	assert.True(t, header.IsControlBatch(), "retained batch should be a control batch")
+}
+
+func TestFilterBatches_TombstoneWithinRetention(t *testing.T) {
+	// A tombstone within delete.retention.ms should be retained.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+	compactor.cfg.DeleteRetentionMs = 60000 // 60s
+
+	nowMs := int64(200000)       // 200 seconds in ms
+	tombstoneTs := int64(180000) // 180s → age = 20s < 60s
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: tombstoneTs, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: nil}, // tombstone
+		}, codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	// A is at its latest offset (0) — tombstone is the final record for this key
+	offsetMap := map[string]int64{"A": 0}
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "tombstone within retention should be kept")
+}
+
+func TestFilterBatches_TombstonePastRetention(t *testing.T) {
+	// A tombstone older than delete.retention.ms should be removed.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+	compactor.cfg.DeleteRetentionMs = 60000 // 60s
+
+	nowMs := int64(200000)       // 200s
+	tombstoneTs := int64(100000) // 100s → age = 100s > 60s
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: tombstoneTs, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: nil}, // tombstone
+		}, codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{"A": 0}
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	assert.Empty(t, batches, "tombstone past retention should be removed")
+}
+
+func TestFilterBatches_LogAppendTimeForTombstone(t *testing.T) {
+	// When TimestampType is LogAppendTime (bit 3 = 1), tombstone age should be
+	// calculated from MaxTimestamp rather than the individual record's timestamp.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+	compactor.cfg.DeleteRetentionMs = 60000 // 60s
+
+	nowMs := int64(200000) // 200s
+
+	// Build batch with LogAppendTime attribute (bit 3 = 0x08).
+	// BuildRecordBatch recomputes MaxTimestamp from records, so we manually
+	// patch the MaxTimestamp field (bytes 35-43) and recompute the CRC.
+	header := BatchHeader{
+		BaseOffset:    0,
+		Attributes:    0x08, // LogAppendTime
+		BaseTimestamp: 100000,
+		ProducerID:    -1,
+		ProducerEpoch: -1,
+		BaseSequence:  -1,
+	}
+	recs := []Record{{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: nil}}
+	batchBytes, err := BuildRecordBatch(header, recs, CompressionNone)
+	require.NoError(t, err)
+
+	// Patch MaxTimestamp to 190000 (within retention from nowMs=200000)
+	binary.BigEndian.PutUint64(batchBytes[35:43], uint64(190000))
+	// Recompute CRC (Castagnoli over bytes 21+)
+	crcTable := crc32.MakeTable(crc32.Castagnoli)
+	newCRC := crc32.Checksum(batchBytes[21:], crcTable)
+	binary.BigEndian.PutUint32(batchBytes[17:21], newCRC)
+
+	obj := BuildObject([]BatchData{
+		{RawBytes: batchBytes, BaseOffset: 0, LastOffsetDelta: 0},
+	})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{"A": 0}
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	// MaxTimestamp=190000, nowMs=200000, age=10s < 60s retention → should be kept
+	require.Len(t, batches, 1, "LogAppendTime tombstone within retention should be kept")
+}
+
+func TestFilterBatches_MultipleBatches_MixedFiltering(t *testing.T) {
+	// Object with two batches: first batch all superseded, second batch all retained.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{
+		{baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("old")},
+		}, codec: CompressionNone},
+		{baseOffset: 1, baseTimestamp: 2000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("B"), Value: []byte("keep")},
+		}, codec: CompressionNone},
+	})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{"A": 100, "B": 1} // A superseded, B is latest
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "only second batch should survive")
+
+	header, err := ParseBatchHeaderFromRaw(batches[0].RawBytes)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), header.BaseOffset, "surviving batch should be from offset 1")
+}
+
+func TestFilterBatches_NullKeysAlwaysRetained(t *testing.T) {
+	// Null-key records should always be retained, even with a populated offset map.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: nil, Value: []byte("null-key")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("A"), Value: []byte("old")},
+		}, codec: CompressionNone,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{"A": 100} // A superseded
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1, "batch with null-key record should be retained")
+
+	// Verify null-key record is in the output
+	header, err := ParseBatchHeaderFromRaw(batches[0].RawBytes)
+	require.NoError(t, err)
+	decompressed, err := DecompressRecords(batches[0].RawBytes, header.CompressionCodec())
+	require.NoError(t, err)
+
+	var nullKeyFound bool
+	_ = IterateRecords(decompressed, func(r Record) bool {
+		if r.Key == nil {
+			nullKeyFound = true
+		}
+		return true
+	})
+	assert.True(t, nullKeyFound, "null-key record should be retained")
+}
+
+func TestFilterBatches_CompressedBatch(t *testing.T) {
+	// Verify filterBatches handles compressed batches correctly during partial filtering.
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+
+	obj := buildTestObject(t, []testBatch{{
+		baseOffset: 0, baseTimestamp: 1000, records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("remove-me")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("B"), Value: []byte("keep-me")},
+		}, codec: CompressionSnappy,
+	}})
+	footer, err := ParseFooter(obj, int64(len(obj)))
+	require.NoError(t, err)
+
+	offsetMap := map[string]int64{"A": 100, "B": 1} // A superseded, B latest
+	nowMs := time.Now().UnixMilli()
+
+	batches, err := compactor.filterBatches(obj, footer, offsetMap, nowMs)
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+
+	// Rebuilt batch should be parseable and contain only B
+	header, err := ParseBatchHeaderFromRaw(batches[0].RawBytes)
+	require.NoError(t, err)
+	decompressed, err := DecompressRecords(batches[0].RawBytes, header.CompressionCodec())
+	require.NoError(t, err)
+
+	var keys []string
+	_ = IterateRecords(decompressed, func(r Record) bool {
+		keys = append(keys, string(r.Key))
+		return true
+	})
+	assert.Equal(t, []string{"B"}, keys)
 }
 
 func TestCompactionIdempotent(t *testing.T) {
