@@ -348,8 +348,10 @@ func TestRetentionPartialDeleteFailureAdvancesOnlyPastDeletedObjects(t *testing.
 	if len(keys) != 2 {
 		t.Fatalf("expected 2 objects after partial delete failure, got %d", len(keys))
 	}
-	if strings.HasSuffix(keys[0], "/00000000000000000000.obj") {
-		t.Fatalf("expected oldest object to be deleted, got keys %v", keys)
+	for _, key := range keys {
+		if strings.HasSuffix(key, "/00000000000000000000.obj") {
+			t.Fatalf("expected oldest object to be deleted, got keys %v", keys)
+		}
 	}
 
 	td := b.state.GetTopic(topic)
@@ -358,6 +360,31 @@ func TestRetentionPartialDeleteFailureAdvancesOnlyPastDeletedObjects(t *testing.
 	td.Partitions[0].RUnlock()
 	if logStart != 1 {
 		t.Fatalf("logStartOffset: got %d, want 1", logStart)
+	}
+
+	// A subsequent run should resume from the remaining eligible objects.
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: mem,
+		Bucket:   "test-bucket",
+		Prefix:   "klite/test",
+		Logger:   b.logger,
+	})
+
+	b.enforceRetention(context.Background())
+
+	keys = listObjectKeys(t, mem, topic, tid, 0)
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 object after follow-up retention run, got %d", len(keys))
+	}
+	if !strings.HasSuffix(keys[0], "/00000000000000000002.obj") {
+		t.Fatalf("expected newest object to remain after follow-up run, got %q", keys[0])
+	}
+
+	td.Partitions[0].RLock()
+	logStart = td.Partitions[0].LogStart()
+	td.Partitions[0].RUnlock()
+	if logStart != 2 {
+		t.Fatalf("logStartOffset after follow-up run: got %d, want 2", logStart)
 	}
 }
 
