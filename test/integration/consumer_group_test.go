@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -249,7 +248,7 @@ func TestSyncGroupLeaderFollower(t *testing.T) {
 	require.Equal(t, int16(0), syncResp.ErrorCode)
 
 	// Leader should get its assignment back
-	assert.Equal(t, assignment, syncResp.MemberAssignment)
+	require.Equal(t, assignment, syncResp.MemberAssignment)
 }
 
 // TestHeartbeatKeepsAlive tests that heartbeats reset the session timer.
@@ -321,7 +320,7 @@ func TestSessionTimeout(t *testing.T) {
 	hbResp := sendHeartbeat(t, tb.Addr, group, resp2.Generation, resp2.MemberID, nil)
 	// After session timeout, member is removed. May get UNKNOWN_MEMBER_ID or
 	// REBALANCE_IN_PROGRESS depending on timing
-	assert.True(t, hbResp.ErrorCode == kerr.UnknownMemberID.Code ||
+	require.True(t, hbResp.ErrorCode == kerr.UnknownMemberID.Code ||
 		hbResp.ErrorCode == kerr.RebalanceInProgress.Code ||
 		hbResp.ErrorCode == kerr.IllegalGeneration.Code,
 		"expected UNKNOWN_MEMBER_ID, REBALANCE_IN_PROGRESS, or ILLEGAL_GENERATION, got %d", hbResp.ErrorCode)
@@ -357,7 +356,7 @@ func TestLeaveGroupRebalance(t *testing.T) {
 	// Now heartbeat should fail (member was removed, group is empty)
 	// Use the old generation - should get UNKNOWN_MEMBER_ID since member no longer exists
 	hbResp2 := sendHeartbeat(t, tb.Addr, group, resp1b.Generation, member1, nil)
-	assert.True(t, hbResp2.ErrorCode == kerr.UnknownMemberID.Code ||
+	require.True(t, hbResp2.ErrorCode == kerr.UnknownMemberID.Code ||
 		hbResp2.ErrorCode == kerr.IllegalGeneration.Code,
 		"heartbeat after leave should fail with UNKNOWN_MEMBER_ID or ILLEGAL_GENERATION, got %d", hbResp2.ErrorCode)
 }
