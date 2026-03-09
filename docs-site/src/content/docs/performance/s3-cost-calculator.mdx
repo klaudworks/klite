@@ -75,7 +75,7 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
 
 **Storage dominates** — typically 90%+ of total S3 cost. API costs only matter at very high throughput.
 
-The main API cost driver is **cold reads**: consumers fetching data that's too old to be in the on-disk WAL. If your consumers keep up with producers, all reads are served from the WAL and never hit S3.
+The main API cost driver is **S3 reads**: consumers fetching data that's been evicted from the on-disk WAL because `KLITE_WAL_MAX_DISK_SIZE` was exceeded and must be read back from S3.
 
 <style>{`
   .calc-grid {
