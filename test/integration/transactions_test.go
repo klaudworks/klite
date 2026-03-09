@@ -74,30 +74,43 @@ func TestIdempotentProduceDedup(t *testing.T) {
 	topic := "test-idempotent-dedup"
 	createTopic(t, tb.Addr, topic)
 
-	// Use idempotent client that the franz-go library manages
-	cl := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.RequiredAcks(kgo.AllISRAcks()),
-		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-	)
+	cl := NewClient(t, tb.Addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Produce records
-	for i := 0; i < 3; i++ {
-		rec := &kgo.Record{
-			Topic:     topic,
-			Partition: 0,
-			Value:     []byte("val"),
-		}
-		ProduceSync(t, cl, rec)
-	}
+	// Allocate a producer ID.
+	initReq := kmsg.NewInitProducerIDRequest()
+	initResp, err := initReq.RequestWith(ctx, cl)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), initResp.ErrorCode)
+	pid := initResp.ProducerID
+	epoch := initResp.ProducerEpoch
 
-	// Verify we get exactly 3 records (no duplicates)
+	// Send a batch: PID, epoch, baseSeq=0, 3 records → offsets 0-2.
+	resp1 := rawProduce(t, cl, topic, 0, pid, epoch, 0, 3)
+	require.Equal(t, int16(0), resp1.ErrorCode)
+	require.Equal(t, int64(0), resp1.BaseOffset)
+
+	// Replay the exact same batch (same PID/epoch/baseSeq) — should be deduped.
+	resp2 := rawProduce(t, cl, topic, 0, pid, epoch, 0, 3)
+	require.Equal(t, int16(0), resp2.ErrorCode, "duplicate batch should not error")
+	require.Equal(t, int64(0), resp2.BaseOffset, "duplicate batch should return original base offset")
+
+	// Consume: only 3 records should exist, not 6.
 	consumer := NewClient(t, tb.Addr,
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 	)
 	records := ConsumeN(t, consumer, 3, 5*time.Second)
 	require.Len(t, records, 3)
+
+	// Verify no extra records beyond the 3.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel2()
+	fetches := consumer.PollFetches(ctx2)
+	var extra []*kgo.Record
+	fetches.EachRecord(func(r *kgo.Record) { extra = append(extra, r) })
+	require.Empty(t, extra, "dedup should prevent duplicate records")
 }
 
 func TestTxnProduceCommit(t *testing.T) {
@@ -237,33 +250,27 @@ func TestProducerFencing(t *testing.T) {
 	txnID := "fencing-test"
 	createTopic(t, tb.Addr, topic)
 
-	// First producer with this txnID
-	cl1 := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID(txnID),
-	)
+	cl := NewClient(t, tb.Addr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// First producer: allocate PID with epoch 0.
+	pid, epoch1 := initProducerIDRaw(t, cl, txnID)
 
-	err := cl1.BeginTransaction()
-	require.NoError(t, err)
+	// Produce a batch with the first epoch to establish sequence state.
+	resp1 := rawProduce(t, cl, topic, 0, pid, epoch1, 0, 1)
+	require.Equal(t, int16(0), resp1.ErrorCode, "first producer should succeed")
 
-	// Second producer with same txnID — fences the first
-	cl2 := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID(txnID),
-	)
+	// Second producer with same txnID: bumps epoch, fencing the first.
+	_, epoch2 := initProducerIDRaw(t, cl, txnID)
+	require.Greater(t, epoch2, epoch1, "second init should bump epoch")
 
-	err = cl2.BeginTransaction()
-	require.NoError(t, err)
+	// Produce with the new epoch to prove it works.
+	resp2 := rawProduce(t, cl, topic, 0, pid, epoch2, 0, 1)
+	require.Equal(t, int16(0), resp2.ErrorCode, "new epoch should succeed")
 
-	rec := &kgo.Record{Topic: topic, Value: []byte("from-cl2")}
-	results := cl2.ProduceSync(ctx, rec)
-	require.NoError(t, results.FirstErr())
-
-	err = cl2.EndTransaction(ctx, kgo.TryCommit)
-	require.NoError(t, err)
+	// Attempt to produce with the OLD (fenced) epoch — should be rejected.
+	resp3 := rawProduce(t, cl, topic, 0, pid, epoch1, 1, 1)
+	require.Equal(t, int16(35), resp3.ErrorCode,
+		"old epoch should be fenced")
 }
 
 func TestFenceAfterProducerCommit(t *testing.T) {
@@ -274,31 +281,29 @@ func TestFenceAfterProducerCommit(t *testing.T) {
 	txnID := "fence-after-commit"
 	createTopic(t, tb.Addr, topic)
 
-	cl1 := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID(txnID),
-	)
-
+	cl := NewClient(t, tb.Addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := cl1.BeginTransaction()
-	require.NoError(t, err)
-	results := cl1.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("data1")})
-	require.NoError(t, results.FirstErr())
-	err = cl1.EndTransaction(ctx, kgo.TryCommit)
-	require.NoError(t, err)
+	// First producer: allocate PID, produce within a transaction, and commit.
+	pid, epoch1 := initProducerIDRaw(t, cl, txnID)
+	addPartitionsToTxnRaw(t, cl, ctx, txnID, pid, epoch1, topic, 0)
+	resp := rawProduce(t, cl, topic, 0, pid, epoch1, 0, 1)
+	require.Equal(t, int16(0), resp.ErrorCode)
+	endTxnRaw(t, cl, ctx, txnID, pid, epoch1, true)
 
-	cl2 := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID(txnID),
-	)
-	err = cl2.BeginTransaction()
-	require.NoError(t, err)
-	results = cl2.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("data2")})
-	require.NoError(t, results.FirstErr())
-	err = cl2.EndTransaction(ctx, kgo.TryCommit)
-	require.NoError(t, err)
+	// Second producer with same txnID: bumps epoch, fencing epoch1.
+	_, epoch2 := initProducerIDRaw(t, cl, txnID)
+	require.Greater(t, epoch2, epoch1)
+
+	// Produce with stale epoch1 after the fence — should be rejected.
+	fencedResp := rawProduce(t, cl, topic, 0, pid, epoch1, 1, 1)
+	require.Equal(t, int16(35), fencedResp.ErrorCode,
+		"stale epoch after commit should be fenced")
+
+	// New epoch works fine.
+	resp2 := rawProduce(t, cl, topic, 0, pid, epoch2, 0, 1)
+	require.Equal(t, int16(0), resp2.ErrorCode)
 }
 
 func TestFenceBeforeProducerCommit(t *testing.T) {
@@ -309,29 +314,39 @@ func TestFenceBeforeProducerCommit(t *testing.T) {
 	txnID := "fence-before-commit"
 	createTopic(t, tb.Addr, topic)
 
-	cl1 := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID(txnID),
-	)
-
+	cl := NewClient(t, tb.Addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := cl1.BeginTransaction()
-	require.NoError(t, err)
-	results := cl1.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("data1")})
-	require.NoError(t, results.FirstErr())
+	// First producer: allocate PID, begin transaction, produce (but don't commit).
+	pid, epoch1 := initProducerIDRaw(t, cl, txnID)
+	addPartitionsToTxnRaw(t, cl, ctx, txnID, pid, epoch1, topic, 0)
+	resp := rawProduce(t, cl, topic, 0, pid, epoch1, 0, 1)
+	require.Equal(t, int16(0), resp.ErrorCode)
 
-	cl2 := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID(txnID),
-	)
-	err = cl2.BeginTransaction()
+	// Second producer with same txnID while first txn is still open: bumps epoch.
+	_, epoch2 := initProducerIDRaw(t, cl, txnID)
+	require.Greater(t, epoch2, epoch1)
+
+	// Try to produce with old epoch — should be fenced.
+	fencedResp := rawProduce(t, cl, topic, 0, pid, epoch1, 1, 1)
+	require.Equal(t, int16(35), fencedResp.ErrorCode,
+		"stale epoch during open txn should be fenced")
+
+	// Try to EndTxn with the old epoch — should also be fenced.
+	endReq := kmsg.NewEndTxnRequest()
+	endReq.TransactionalID = txnID
+	endReq.ProducerID = pid
+	endReq.ProducerEpoch = epoch1
+	endReq.Commit = true
+	endResp, err := endReq.RequestWith(ctx, cl)
 	require.NoError(t, err)
-	results = cl2.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("data2")})
-	require.NoError(t, results.FirstErr())
-	err = cl2.EndTransaction(ctx, kgo.TryCommit)
-	require.NoError(t, err)
+	require.Equal(t, int16(35), endResp.ErrorCode,
+		"EndTxn with stale epoch should be fenced")
+
+	// New epoch works.
+	resp2 := rawProduce(t, cl, topic, 0, pid, epoch2, 0, 1)
+	require.Equal(t, int16(0), resp2.ErrorCode)
 }
 
 func TestTxnOffsetCommit(t *testing.T) {
@@ -339,9 +354,14 @@ func TestTxnOffsetCommit(t *testing.T) {
 	tb := StartBroker(t)
 
 	topic := "test-txn-offset-commit"
+	groupID := "txn-offset-commit-group"
+	txnID := "txn-offset-commit-test"
 	createTopic(t, tb.Addr, topic)
 
-	// Produce some records
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Produce 5 records to the topic.
 	producer := NewClient(t, tb.Addr,
 		kgo.DefaultProduceTopic(topic),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
@@ -350,20 +370,64 @@ func TestTxnOffsetCommit(t *testing.T) {
 		ProduceSync(t, producer, &kgo.Record{Topic: topic, Partition: 0, Value: []byte("val")})
 	}
 
-	// Create a transactional producer
-	txnCl := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.TransactionalID("txn-offset-commit-test"),
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err := txnCl.BeginTransaction()
+	// Allocate a transactional PID via raw InitProducerID.
+	rawCl := NewClient(t, tb.Addr)
+	initReq := kmsg.NewInitProducerIDRequest()
+	initReq.TransactionalID = &txnID
+	initReq.TransactionTimeoutMillis = 30000
+	initResp, err := initReq.RequestWith(ctx, rawCl)
 	require.NoError(t, err)
+	require.Equal(t, int16(0), initResp.ErrorCode, "InitProducerID should succeed")
+	pid := initResp.ProducerID
+	epoch := initResp.ProducerEpoch
 
-	err = txnCl.EndTransaction(ctx, kgo.TryCommit)
+	// AddOffsetsToTxn: register the consumer group in the transaction.
+	addOffsetsReq := kmsg.NewAddOffsetsToTxnRequest()
+	addOffsetsReq.TransactionalID = txnID
+	addOffsetsReq.ProducerID = pid
+	addOffsetsReq.ProducerEpoch = epoch
+	addOffsetsReq.Group = groupID
+	addOffsetsResp, err := addOffsetsReq.RequestWith(ctx, rawCl)
 	require.NoError(t, err)
+	require.Equal(t, int16(0), addOffsetsResp.ErrorCode, "AddOffsetsToTxn should succeed")
+
+	// TxnOffsetCommit: commit offset 3 for partition 0 within the transaction.
+	txnOffsetReq := kmsg.NewTxnOffsetCommitRequest()
+	txnOffsetReq.TransactionalID = txnID
+	txnOffsetReq.Group = groupID
+	txnOffsetReq.ProducerID = pid
+	txnOffsetReq.ProducerEpoch = epoch
+	tp := kmsg.NewTxnOffsetCommitRequestTopic()
+	tp.Topic = topic
+	pp := kmsg.NewTxnOffsetCommitRequestTopicPartition()
+	pp.Partition = 0
+	pp.Offset = 3
+	tp.Partitions = append(tp.Partitions, pp)
+	txnOffsetReq.Topics = append(txnOffsetReq.Topics, tp)
+	txnOffsetResp, err := txnOffsetReq.RequestWith(ctx, rawCl)
+	require.NoError(t, err)
+	require.Len(t, txnOffsetResp.Topics, 1)
+	require.Len(t, txnOffsetResp.Topics[0].Partitions, 1)
+	require.Equal(t, int16(0), txnOffsetResp.Topics[0].Partitions[0].ErrorCode,
+		"TxnOffsetCommit should succeed")
+
+	// EndTxn: commit the transaction so offsets become visible.
+	endReq := kmsg.NewEndTxnRequest()
+	endReq.TransactionalID = txnID
+	endReq.ProducerID = pid
+	endReq.ProducerEpoch = epoch
+	endReq.Commit = true
+	endResp, err := endReq.RequestWith(ctx, rawCl)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), endResp.ErrorCode, "EndTxn commit should succeed")
+
+	// OffsetFetch: verify the committed offset is 3.
+	admin := kadm.NewClient(NewClient(t, tb.Addr))
+	offsets, err := admin.FetchOffsets(ctx, groupID)
+	require.NoError(t, err)
+	o, ok := offsets.Lookup(topic, 0)
+	require.True(t, ok, "should find committed offset for %s/0", topic)
+	require.Equal(t, int64(3), o.At, "transactionally committed offset should be 3")
 }
 
 func TestDescribeProducersDefaultRoutesToLeader(t *testing.T) {
@@ -590,52 +654,35 @@ func TestListTransactionsFilterByState(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestIdempotentOutOfOrder tests that sequential idempotent production works correctly.
+// TestIdempotentOutOfOrder verifies that a produce request with a wrong
+// sequence number is rejected with OUT_OF_ORDER_SEQUENCE_NUMBER (error 45).
 func TestIdempotentOutOfOrder(t *testing.T) {
 	t.Parallel()
 	tb := StartBroker(t)
 
 	topic := "test-idempotent-ooo"
+	createTopic(t, tb.Addr, topic)
 
 	cl := NewClient(t, tb.Addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Get a producer ID
+	// Allocate a producer ID.
 	initReq := kmsg.NewInitProducerIDRequest()
 	initResp, err := initReq.RequestWith(ctx, cl)
 	require.NoError(t, err)
 	require.Equal(t, int16(0), initResp.ErrorCode)
+	pid := initResp.ProducerID
+	epoch := initResp.ProducerEpoch
 
-	admin := kadm.NewClient(cl)
+	// First batch with baseSeq=0 should succeed.
+	resp1 := rawProduce(t, cl, topic, 0, pid, epoch, 0, 1)
+	require.Equal(t, int16(0), resp1.ErrorCode, "first batch should succeed")
 
-	// Create the topic
-	_, err = admin.CreateTopics(ctx, 1, 1, nil, topic)
-	require.NoError(t, err)
-
-	// Verify that normal idempotent production works correctly
-	idempotentCl := NewClient(t, tb.Addr,
-		kgo.DefaultProduceTopic(topic),
-		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-	)
-
-	for i := 0; i < 5; i++ {
-		ProduceSync(t, idempotentCl, &kgo.Record{
-			Topic:     topic,
-			Partition: 0,
-			Value:     []byte("data"),
-		})
-	}
-
-	consumer := NewClient(t, tb.Addr,
-		kgo.ConsumeTopics(topic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	)
-	records := ConsumeN(t, consumer, 5, 5*time.Second)
-	require.Len(t, records, 5)
-
-	_ = admin
-	_ = kerr.OutOfOrderSequenceNumber
+	// Send batch with wrong baseSeq=5 (expected 1) — should get error 45.
+	resp2 := rawProduce(t, cl, topic, 0, pid, epoch, 5, 1)
+	require.Equal(t, kerr.OutOfOrderSequenceNumber.Code, resp2.ErrorCode,
+		"wrong sequence number should return OUT_OF_ORDER_SEQUENCE_NUMBER")
 }
 
 // TestIdempotentProduceConcurrent fires many records concurrently using
@@ -764,6 +811,54 @@ func TestIdempotentDedupAfterRestart(t *testing.T) {
 		require.Equal(t, int64(i), r.Offset,
 			"offset continuity at record %d", i)
 	}
+}
+
+// initProducerIDRaw sends a raw InitProducerID request with the given
+// transactional ID and returns the allocated PID and epoch.
+func initProducerIDRaw(t *testing.T, cl *kgo.Client, txnID string) (int64, int16) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req := kmsg.NewInitProducerIDRequest()
+	req.TransactionalID = &txnID
+	req.TransactionTimeoutMillis = 30000
+	resp, err := req.RequestWith(ctx, cl)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), resp.ErrorCode, "InitProducerID should succeed")
+	return resp.ProducerID, resp.ProducerEpoch
+}
+
+// addPartitionsToTxnRaw sends AddPartitionsToTxn to begin a transaction
+// and register a topic-partition.
+func addPartitionsToTxnRaw(t *testing.T, cl *kgo.Client, ctx context.Context, txnID string, pid int64, epoch int16, topic string, partition int32) {
+	t.Helper()
+	req := kmsg.NewAddPartitionsToTxnRequest()
+	req.TransactionalID = txnID
+	req.ProducerID = pid
+	req.ProducerEpoch = epoch
+	rt := kmsg.NewAddPartitionsToTxnRequestTopic()
+	rt.Topic = topic
+	rt.Partitions = []int32{partition}
+	req.Topics = append(req.Topics, rt)
+	resp, err := req.RequestWith(ctx, cl)
+	require.NoError(t, err)
+	require.Len(t, resp.Topics, 1)
+	require.Len(t, resp.Topics[0].Partitions, 1)
+	require.Equal(t, int16(0), resp.Topics[0].Partitions[0].ErrorCode,
+		"AddPartitionsToTxn should succeed")
+}
+
+// endTxnRaw sends a raw EndTxn request and asserts success.
+func endTxnRaw(t *testing.T, cl *kgo.Client, ctx context.Context, txnID string, pid int64, epoch int16, commit bool) {
+	t.Helper()
+	req := kmsg.NewEndTxnRequest()
+	req.TransactionalID = txnID
+	req.ProducerID = pid
+	req.ProducerEpoch = epoch
+	req.Commit = commit
+	resp, err := req.RequestWith(ctx, cl)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), resp.ErrorCode, "EndTxn should succeed")
 }
 
 // rawProduce sends a raw ProduceRequest with a hand-crafted RecordBatch.
