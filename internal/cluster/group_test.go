@@ -447,14 +447,13 @@ func TestRebalanceTimer_AllAbsent_GroupEmpty(t *testing.T) {
 	syncResp := syncLeader(t, g, member1, jr1.Generation, nil)
 	require.Equal(t, int16(0), syncResp.ErrorCode)
 
-	// Member1 joins another member (triggering rebalance), but then we remove
-	// member1 via leave before the rebalance completes
-	_, _ = joinMemberAsync(t, g, nil, makeProtocols("range"))
+	// Member2 joins (triggering rebalance)
+	_, member2Ch := joinMemberAsync(t, g, nil, makeProtocols("range"))
 	runtime.Gosched()
 	time.Sleep(10 * time.Millisecond)
 
-	// Leave member1 — now only member2 is waiting, and after timeout member2
-	// should get its response
+	// Leave member1 — member2 is the only remaining member, so the
+	// rebalance completes synchronously and member2 gets a join response.
 	leaveResp, err := g.Send(&kmsg.LeaveGroupRequest{
 		Group:    "test-group",
 		MemberID: member1,
@@ -462,6 +461,26 @@ func TestRebalanceTimer_AllAbsent_GroupEmpty(t *testing.T) {
 	require.NoError(t, err)
 	lr := leaveResp.(*kmsg.LeaveGroupResponse)
 	assert.Equal(t, int16(0), lr.ErrorCode)
+
+	// Member2 should receive its join response (rebalance completed)
+	select {
+	case jr2 := <-member2Ch:
+		assert.Equal(t, int16(0), jr2.ErrorCode)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for member2 join response")
+	}
+
+	waitForState(t, g, GroupCompletingRebalance, time.Second)
+
+	// Member2 never syncs — advance past pendingSyncTimer (rebalanceTimeout = 5000ms)
+	fc.WaitForTimers(1, time.Second)
+	fc.Advance(6 * time.Second)
+	runtime.Gosched()
+	time.Sleep(50 * time.Millisecond)
+
+	// Group should be Empty with no members
+	waitForState(t, g, GroupEmpty, time.Second)
+	assert.Equal(t, 0, getMemberCount(g))
 }
 
 // ---------------------------------------------------------------------------
