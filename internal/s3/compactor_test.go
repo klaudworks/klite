@@ -426,14 +426,19 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 		Prefix:   "test-prefix",
 	})
 	var tombstoneFound bool
-	objects, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
 	for _, oi := range objects {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
-			header, _ := ParseBatchHeaderFromRaw(batchRaw)
-			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
+			header, err := ParseBatchHeaderFromRaw(batchRaw)
+			require.NoError(t, err)
+			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
+			require.NoError(t, err)
 			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && string(r.Key) == "A" && r.Value == nil {
 					tombstoneFound = true
@@ -485,14 +490,19 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 		Prefix:   "test-prefix",
 	})
 	tombstoneFound = false
-	objects, _ = client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	objects, err = client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
 	for _, oi := range objects {
-		data, _ := client2.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client2.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
-			header, _ := ParseBatchHeaderFromRaw(batchRaw)
-			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
+			header, err := ParseBatchHeaderFromRaw(batchRaw)
+			require.NoError(t, err)
+			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
+			require.NoError(t, err)
 			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && string(r.Key) == "A" && r.Value == nil {
 					tombstoneFound = true
@@ -617,12 +627,16 @@ func TestCompactionPreservesOrder(t *testing.T) {
 	}
 	var records []keyOff
 	for _, oi := range objects {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
-			header, _ := ParseBatchHeaderFromRaw(batchRaw)
-			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
+			header, err := ParseBatchHeaderFromRaw(batchRaw)
+			require.NoError(t, err)
+			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
+			require.NoError(t, err)
 			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					records = append(records, keyOff{
@@ -692,8 +706,10 @@ func TestCompactionEmptyBatchSkipped(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, oi := range objects {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, err := ParseBatchHeaderFromRaw(batchRaw)
@@ -756,12 +772,16 @@ func TestCompactionSparseOffsets(t *testing.T) {
 
 	var recordCount int
 	for _, oi := range objects {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
-			header, _ := ParseBatchHeaderFromRaw(batchRaw)
-			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
+			header, err := ParseBatchHeaderFromRaw(batchRaw)
+			require.NoError(t, err)
+			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
+			require.NoError(t, err)
 			_ = IterateRecords(decompressed, func(r Record) bool {
 				recordCount++
 				return true
@@ -867,16 +887,18 @@ func TestCompactionOrphanCleanup(t *testing.T) {
 	})
 
 	// Before compaction, we have 2 objects
-	objsBefore, _ := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	objsBefore, err := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
 	assert.Len(t, objsBefore, 2, "should have 2 objects before orphan cleanup")
 
 	// Run compaction — orphan cleanup should detect and delete the orphan
-	_, err := compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, 4, 0,
+	_, err = compactor2.CompactPartition(ctx, "topic1", testTopicID, 0, 4, 0,
 		func() {}, func() {})
 	require.NoError(t, err)
 
 	// After orphan cleanup, the offset-3 object should be deleted (covered by offset-0 object)
-	objsAfter, _ := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	objsAfter, err := client2.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
 	assert.Len(t, objsAfter, 1, "orphan should be cleaned up")
 }
 
@@ -1081,8 +1103,10 @@ func TestCompactionCRCValidAfterRewrite(t *testing.T) {
 
 	crcTable := crc32.MakeTable(crc32.Castagnoli)
 	for _, oi := range objects {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 			header, err := ParseBatchHeaderFromRaw(batchRaw)
@@ -1155,8 +1179,10 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 
 			var recordKeys []string
 			for _, oi := range objects {
-				data, _ := client.GetObject(ctx, oi.Key)
-				footer, _ := ParseFooter(data, int64(len(data)))
+				data, err := client.GetObject(ctx, oi.Key)
+				require.NoError(t, err)
+				footer, err := ParseFooter(data, int64(len(data)))
+				require.NoError(t, err)
 				for _, entry := range footer.Entries {
 					batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
 					header, err := ParseBatchHeaderFromRaw(batchRaw)
@@ -1672,16 +1698,21 @@ func TestCompactionIdempotent(t *testing.T) {
 		Bucket:   "test-bucket",
 		Prefix:   "test-prefix",
 	})
-	objects1, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	objects1, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
 
 	var keys1 []string
 	for _, oi := range objects1 {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
-			header, _ := ParseBatchHeaderFromRaw(batchRaw)
-			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
+			header, err := ParseBatchHeaderFromRaw(batchRaw)
+			require.NoError(t, err)
+			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
+			require.NoError(t, err)
 			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					keys1 = append(keys1, string(r.Key))
@@ -1698,15 +1729,20 @@ func TestCompactionIdempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Records should be identical
-	objects2, _ := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	objects2, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
 	var keys2 []string
 	for _, oi := range objects2 {
-		data, _ := client.GetObject(ctx, oi.Key)
-		footer, _ := ParseFooter(data, int64(len(data)))
+		data, err := client.GetObject(ctx, oi.Key)
+		require.NoError(t, err)
+		footer, err := ParseFooter(data, int64(len(data)))
+		require.NoError(t, err)
 		for _, entry := range footer.Entries {
 			batchRaw := data[entry.BytePosition : entry.BytePosition+entry.BatchLength]
-			header, _ := ParseBatchHeaderFromRaw(batchRaw)
-			decompressed, _ := DecompressRecords(batchRaw, header.CompressionCodec())
+			header, err := ParseBatchHeaderFromRaw(batchRaw)
+			require.NoError(t, err)
+			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
+			require.NoError(t, err)
 			_ = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					keys2 = append(keys2, string(r.Key))
