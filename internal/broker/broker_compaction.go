@@ -154,6 +154,7 @@ func (b *Broker) compactOneDirtyPartition(ctx context.Context, compactor *s3stor
 		bestPD.SetCleanedUpTo(newWatermark)
 		bestPD.ResetDirtyObjects(b.cfg.Clock.Now())
 		bestPD.Unlock()
+		b.markRetentionDirty(bestTD.ID, bestPD.Index)
 		b.logger.Info("compaction complete",
 			"topic", bestTD.Name, "partition", bestPD.Index,
 			"cleaned_up_to", newWatermark,

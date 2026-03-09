@@ -110,6 +110,13 @@ func setPartitionHW(t *testing.T, b *Broker, topic string, partition int, hw int
 	td.Partitions[partition].Unlock()
 }
 
+func partitionLogStart(b *Broker, topic string, partition int) int64 {
+	td := b.state.GetTopic(topic)
+	td.Partitions[partition].RLock()
+	defer td.Partitions[partition].RUnlock()
+	return td.Partitions[partition].LogStart()
+}
+
 func TestRetentionByTime(t *testing.T) {
 	t.Parallel()
 
@@ -687,6 +694,106 @@ func TestRetentionAdvancesWithClock(t *testing.T) {
 	}
 }
 
+func TestRetentionSchedulerPrioritizesDirtyPartitions(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(999999999))
+	b, mem := newRetentionTestBroker(t, clk)
+	b.retentionPartitionsPerTick = 1
+
+	topic := "retention-dirty-priority"
+	b.state.CreateTopicWithConfigs(topic, 3, map[string]string{"retention.ms": "1000"})
+	tid := topicID(b, topic)
+
+	for p := 0; p < 3; p++ {
+		putTestObject(t, mem, topic, tid, int32(p), 0, []int64{1000})
+		putTestObject(t, mem, topic, tid, int32(p), 1, []int64{2000})
+		setPartitionHW(t, b, topic, p, 2)
+	}
+
+	b.markRetentionDirty(tid, 2)
+	b.enforceRetention(context.Background())
+
+	if got := partitionLogStart(b, topic, 2); got != 1 {
+		t.Fatalf("dirty partition logStartOffset: got %d, want 1", got)
+	}
+	if got := partitionLogStart(b, topic, 0); got != 0 {
+		t.Fatalf("partition 0 logStartOffset: got %d, want 0", got)
+	}
+	if got := partitionLogStart(b, topic, 1); got != 0 {
+		t.Fatalf("partition 1 logStartOffset: got %d, want 0", got)
+	}
+}
+
+func TestRetentionSchedulerRoundRobinCoversIdlePartitions(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(999999999))
+	b, mem := newRetentionTestBroker(t, clk)
+	b.retentionPartitionsPerTick = 1
+
+	topic := "retention-round-robin"
+	b.state.CreateTopicWithConfigs(topic, 3, map[string]string{"retention.ms": "1000"})
+	tid := topicID(b, topic)
+
+	for p := 0; p < 3; p++ {
+		putTestObject(t, mem, topic, tid, int32(p), 0, []int64{1000})
+		putTestObject(t, mem, topic, tid, int32(p), 1, []int64{2000})
+		setPartitionHW(t, b, topic, p, 2)
+	}
+
+	for i := 0; i < 3; i++ {
+		b.enforceRetention(context.Background())
+	}
+
+	for p := 0; p < 3; p++ {
+		if got := partitionLogStart(b, topic, p); got != 1 {
+			t.Fatalf("partition %d logStartOffset: got %d, want 1", p, got)
+		}
+	}
+}
+
+func TestRetentionSchedulerKeepsDirtyOnFailure(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(999999999))
+	b, mem := newRetentionTestBroker(t, clk)
+	b.retentionPartitionsPerTick = 1
+
+	topic := "retention-dirty-retry"
+	b.state.CreateTopicWithConfigs(topic, 2, map[string]string{"retention.ms": "1000"})
+	tid := topicID(b, topic)
+
+	for p := 0; p < 2; p++ {
+		putTestObject(t, mem, topic, tid, int32(p), 0, []int64{1000})
+		putTestObject(t, mem, topic, tid, int32(p), 1, []int64{2000})
+		setPartitionHW(t, b, topic, p, 2)
+	}
+
+	b.markRetentionDirty(tid, 1)
+	failPrefix := s3store.ObjectKeyPrefix("klite/test", topic, tid, 1)
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: &listFailNTimesS3{
+			InMemoryS3: mem,
+			failPrefix: failPrefix,
+			remaining:  1,
+		},
+		Bucket: "test-bucket",
+		Prefix: "klite/test",
+		Logger: b.logger,
+	})
+
+	b.enforceRetention(context.Background())
+	if got := partitionLogStart(b, topic, 1); got != 0 {
+		t.Fatalf("after failed check, dirty partition logStartOffset: got %d, want 0", got)
+	}
+
+	b.enforceRetention(context.Background())
+	if got := partitionLogStart(b, topic, 1); got != 1 {
+		t.Fatalf("after retry, dirty partition logStartOffset: got %d, want 1", got)
+	}
+}
+
 func TestScanOrphanedS3TopicsDetectsOrphansAndIgnoresMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -955,6 +1062,20 @@ type listFailingS3 struct {
 func (l *listFailingS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObjectsV2Input, opts ...func(*s3svc.Options)) (*s3svc.ListObjectsV2Output, error) {
 	if strings.HasPrefix(aws.ToString(input.Prefix), l.failPrefix) {
 		return nil, errors.New("injected list failure")
+	}
+	return l.InMemoryS3.ListObjectsV2(ctx, input, opts...)
+}
+
+type listFailNTimesS3 struct {
+	*s3store.InMemoryS3
+	failPrefix string
+	remaining  int
+}
+
+func (l *listFailNTimesS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObjectsV2Input, opts ...func(*s3svc.Options)) (*s3svc.ListObjectsV2Output, error) {
+	if strings.HasPrefix(aws.ToString(input.Prefix), l.failPrefix) && l.remaining > 0 {
+		l.remaining--
+		return nil, errors.New("injected transient list failure")
 	}
 	return l.InMemoryS3.ListObjectsV2(ctx, input, opts...)
 }

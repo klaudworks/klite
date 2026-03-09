@@ -62,6 +62,11 @@ type Broker struct {
 	replRole      atomic.Int32       // 0 = single-node/standby, 1 = primary
 	replCancel    context.CancelFunc // protected by mu
 
+	retentionMu                sync.Mutex
+	retentionDirty             map[retentionPartitionKey]struct{}
+	retentionCursor            int
+	retentionPartitionsPerTick int
+
 	// testStepHook, when non-nil, is called at each major step boundary in
 	// onElected and shutdownPrimary. Test-only; nil in production.
 	testStepHook func(string)
@@ -93,14 +98,16 @@ func New(cfg Config) *Broker {
 	state.SetClock(cfg.Clock)
 
 	b := &Broker{
-		cfg:        cfg,
-		state:      state,
-		shutdownCh: shutdownCh,
-		done:       make(chan struct{}),
-		ready:      make(chan struct{}),
-		logger:     logger,
-		server:     srv,
-		handlers:   handlers,
+		cfg:                        cfg,
+		state:                      state,
+		shutdownCh:                 shutdownCh,
+		done:                       make(chan struct{}),
+		ready:                      make(chan struct{}),
+		logger:                     logger,
+		server:                     srv,
+		handlers:                   handlers,
+		retentionDirty:             make(map[retentionPartitionKey]struct{}),
+		retentionPartitionsPerTick: defaultRetentionPartitionsPerTick,
 	}
 
 	if cfg.SASLEnabled {

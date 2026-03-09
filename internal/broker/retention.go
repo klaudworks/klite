@@ -10,6 +10,21 @@ import (
 	s3store "github.com/klaudworks/klite/internal/s3"
 )
 
+const defaultRetentionPartitionsPerTick = 64
+
+type retentionPartitionKey struct {
+	topicID   [16]byte
+	partition int32
+}
+
+type retentionWorkItem struct {
+	topic          string
+	topicID        [16]byte
+	partition      *cluster.PartData
+	retentionMs    int64
+	retentionBytes int64
+}
+
 func (b *Broker) retentionLoop(ctx context.Context) {
 	interval := b.cfg.RetentionCheckInterval
 	ticker := b.cfg.Clock.NewTicker(interval)
@@ -30,34 +45,125 @@ func (b *Broker) enforceRetention(ctx context.Context) {
 	}
 
 	nowMs := b.cfg.Clock.Now().UnixMilli()
-	topics := b.state.GetAllTopics()
-
-	for _, td := range topics {
-		retentionMs := int64(604800000) // 7 days default
-		retentionBytes := int64(-1)     // infinite default
-
-		if v, ok := td.GetConfig("retention.ms"); ok {
-			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-				retentionMs = parsed
-			}
+	work := b.selectRetentionWork()
+	for _, item := range work {
+		if ctx.Err() != nil {
+			return
 		}
-		if v, ok := td.GetConfig("retention.bytes"); ok {
-			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-				retentionBytes = parsed
-			}
-		}
-
-		if retentionMs < 0 && retentionBytes < 0 {
-			continue // infinite retention
-		}
-
-		for _, pd := range td.Partitions {
-			if ctx.Err() != nil {
-				return
-			}
-			b.enforcePartitionRetention(ctx, td.Name, td.ID, pd, retentionMs, retentionBytes, nowMs)
+		if b.enforcePartitionRetention(ctx, item.topic, item.topicID, item.partition, item.retentionMs, item.retentionBytes, nowMs) {
+			b.clearRetentionDirty(item.topicID, item.partition.Index)
 		}
 	}
+}
+
+func (b *Broker) selectRetentionWork() []retentionWorkItem {
+	topics := b.state.GetAllTopics()
+	var candidates []retentionWorkItem
+	for _, td := range topics {
+		retentionMs, retentionBytes := parseTopicRetention(td)
+		if retentionMs < 0 && retentionBytes < 0 {
+			continue
+		}
+		for _, pd := range td.Partitions {
+			candidates = append(candidates, retentionWorkItem{
+				topic:          td.Name,
+				topicID:        td.ID,
+				partition:      pd,
+				retentionMs:    retentionMs,
+				retentionBytes: retentionBytes,
+			})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	budget := b.retentionPartitionsPerTick
+	if budget <= 0 {
+		budget = defaultRetentionPartitionsPerTick
+	}
+	if budget > len(candidates) {
+		budget = len(candidates)
+	}
+
+	b.retentionMu.Lock()
+	defer b.retentionMu.Unlock()
+
+	live := make(map[retentionPartitionKey]struct{}, len(candidates))
+	for _, c := range candidates {
+		live[retentionPartitionKey{topicID: c.topicID, partition: c.partition.Index}] = struct{}{}
+	}
+	for key := range b.retentionDirty {
+		if _, ok := live[key]; !ok {
+			delete(b.retentionDirty, key)
+		}
+	}
+
+	selected := make([]retentionWorkItem, 0, budget)
+	selectedIdx := make(map[int]struct{}, budget)
+	for i, c := range candidates {
+		if len(selected) >= budget {
+			break
+		}
+		key := retentionPartitionKey{topicID: c.topicID, partition: c.partition.Index}
+		if _, ok := b.retentionDirty[key]; ok {
+			selected = append(selected, c)
+			selectedIdx[i] = struct{}{}
+		}
+	}
+
+	start := b.retentionCursor
+	if len(candidates) > 0 {
+		start %= len(candidates)
+	}
+	roundRobinAdded := 0
+	for checked := 0; checked < len(candidates) && len(selected) < budget; checked++ {
+		idx := (start + checked) % len(candidates)
+		if _, alreadySelected := selectedIdx[idx]; alreadySelected {
+			continue
+		}
+		selected = append(selected, candidates[idx])
+		roundRobinAdded++
+	}
+	if len(candidates) > 0 {
+		b.retentionCursor = (start + roundRobinAdded) % len(candidates)
+	}
+
+	return selected
+}
+
+func parseTopicRetention(td *cluster.TopicData) (retentionMs, retentionBytes int64) {
+	retentionMs = int64(604800000) // 7 days default
+	retentionBytes = int64(-1)     // infinite default
+
+	if v, ok := td.GetConfig("retention.ms"); ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			retentionMs = parsed
+		}
+	}
+	if v, ok := td.GetConfig("retention.bytes"); ok {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			retentionBytes = parsed
+		}
+	}
+
+	return retentionMs, retentionBytes
+}
+
+func (b *Broker) markRetentionDirty(topicID [16]byte, partition int32) {
+	b.retentionMu.Lock()
+	if b.retentionDirty == nil {
+		b.retentionDirty = make(map[retentionPartitionKey]struct{})
+	}
+	b.retentionDirty[retentionPartitionKey{topicID: topicID, partition: partition}] = struct{}{}
+	b.retentionMu.Unlock()
+}
+
+func (b *Broker) clearRetentionDirty(topicID [16]byte, partition int32) {
+	b.retentionMu.Lock()
+	delete(b.retentionDirty, retentionPartitionKey{topicID: topicID, partition: partition})
+	b.retentionMu.Unlock()
 }
 
 func (b *Broker) enforcePartitionRetention(
@@ -68,16 +174,16 @@ func (b *Broker) enforcePartitionRetention(
 	retentionMs int64,
 	retentionBytes int64,
 	nowMs int64,
-) {
+) bool {
 	prefix := s3store.ObjectKeyPrefix(b.s3Client.Prefix(), topic, topicID, pd.Index)
 	objects, err := b.s3Client.ListObjects(ctx, prefix)
 	if err != nil {
 		b.logger.Warn("retention: list objects failed",
 			"topic", topic, "partition", pd.Index, "err", err)
-		return
+		return false
 	}
 	if len(objects) == 0 {
-		return
+		return true
 	}
 
 	type objInfo struct {
@@ -105,7 +211,7 @@ func (b *Broker) enforcePartitionRetention(
 		infos = append(infos, info)
 	}
 	if len(infos) == 0 {
-		return
+		return true
 	}
 
 	timeCutoff := nowMs - retentionMs
@@ -150,7 +256,7 @@ func (b *Broker) enforcePartitionRetention(
 	}
 
 	if len(deleteKeys) == 0 {
-		return
+		return true
 	}
 
 	// Delete objects BEFORE advancing logStartOffset. If a delete fails,
@@ -168,7 +274,7 @@ func (b *Broker) enforcePartitionRetention(
 	}
 
 	if deleted == 0 {
-		return
+		return false
 	}
 
 	deletedSet := make(map[string]struct{}, deleted)
@@ -213,7 +319,7 @@ func (b *Broker) enforcePartitionRetention(
 		b.logger.Warn("retention: failed to advance logStartOffset",
 			"topic", topic, "partition", pd.Index,
 			"new_log_start", actualLogStart, "err", err)
-		return
+		return false
 	}
 
 	b.s3Reader.InvalidateFooters(topic, topicID, pd.Index)
@@ -221,6 +327,8 @@ func (b *Broker) enforcePartitionRetention(
 	b.logger.Info("retention: deleted S3 objects",
 		"topic", topic, "partition", pd.Index,
 		"objects_deleted", deleted, "new_log_start", actualLogStart)
+
+	return true
 }
 
 func (b *Broker) s3GCLoop(ctx context.Context) {

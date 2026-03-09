@@ -59,7 +59,8 @@ func (b *Broker) initS3() error {
 	}
 
 	partAdapter := &s3PartitionAdapter{
-		state: b.state,
+		state:              b.state,
+		markRetentionDirty: b.markRetentionDirty,
 	}
 
 	flusherCfg := s3store.FlusherConfig{
@@ -396,7 +397,8 @@ func createAWSS3Client(cfg Config) (s3store.S3API, error) {
 }
 
 type s3PartitionAdapter struct {
-	state *cluster.State
+	state              *cluster.State
+	markRetentionDirty func(topicID [16]byte, partition int32)
 }
 
 func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
@@ -405,6 +407,8 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 
 	for _, fp := range parts {
 		pd := fp.Partition_ // captured partition reference
+		topicID := fp.TopicID
+		partition := fp.Partition
 
 		pd.RLock()
 		hasData := pd.HasChunkData()
@@ -441,6 +445,9 @@ func (a *s3PartitionAdapter) FlushablePartitions() []s3store.FlushPartition {
 				pd.SetS3FlushWatermark(newWatermark)
 				pd.IncrementDirtyObjects()
 				pd.Unlock()
+				if a.markRetentionDirty != nil {
+					a.markRetentionDirty(topicID, partition)
+				}
 			},
 		})
 	}
