@@ -297,15 +297,20 @@ func TestS3LeaseRenewTransientError(t *testing.T) {
 	waitFor(t, elected, 2*time.Second, "OnElected")
 
 	// Now start failing PutObject with transient errors
+	failStart := time.Now()
 	failS3.mu.Lock()
 	failS3.failPut = true
 	failS3.mu.Unlock()
 
-	// Should NOT be demoted immediately
+	// Should be demoted eventually, but NOT instantly — the elector should
+	// wait for the lease to expire before demoting.
 	select {
 	case <-demoted:
-		// Check that enough time passed (should be close to leaseDuration)
-		// The fact we got here means demotion happened — verify it wasn't instant
+		elapsed := time.Since(failStart)
+		minExpected := cfg.LeaseDuration / 2
+		if elapsed < minExpected {
+			t.Fatalf("demoted too quickly: %v elapsed, expected at least %v", elapsed, minExpected)
+		}
 	case <-time.After(cfg.LeaseDuration + 200*time.Millisecond):
 		t.Fatal("should have been demoted after leaseDuration of transient errors")
 	}
