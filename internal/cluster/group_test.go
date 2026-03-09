@@ -101,6 +101,7 @@ func joinMemberAsync(t *testing.T, g *Group, instanceID *string, protos []kmsg.J
 	go func() {
 		resp, err2 := g.Send(joinRequest(memberID, instanceID, 4, protos))
 		if err2 != nil {
+			ch <- &kmsg.JoinGroupResponse{ErrorCode: -1}
 			return
 		}
 		ch <- resp.(*kmsg.JoinGroupResponse)
