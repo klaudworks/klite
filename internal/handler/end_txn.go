@@ -12,7 +12,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) server.Handler {
+type endTxnWALWriter interface {
+	AppendAsync(entry *wal.Entry, opts ...wal.AppendOpts) (<-chan error, error)
+}
+
+func HandleEndTxn(state *cluster.State, walWriter endTxnWALWriter, clk clock.Clock) server.Handler {
 	return func(req kmsg.Request) (kmsg.Response, error) {
 		r := req.(*kmsg.EndTxnRequest)
 		resp := r.ResponseKind().(*kmsg.EndTxnResponse)
@@ -99,7 +103,8 @@ func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) 
 			})
 		}
 
-		// Phase 2: Wait for WAL fsync, then commit to chunks.
+		// Phase 2: Wait for WAL fsync for every partition first.
+		walFailed := false
 		for i := range pending {
 			pc := &pending[i]
 
@@ -108,12 +113,24 @@ func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) 
 				slog.Error("EndTxn WAL write failed",
 					"topic", pc.tp.Topic, "partition", pc.tp.Partition,
 					"baseOffset", pc.baseOffset, "err", walErr)
+				walFailed = true
+			}
+		}
+
+		if walFailed {
+			for i := range pending {
+				pc := &pending[i]
 				pc.pd.Lock()
 				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
 				pc.pd.Unlock()
-				resp.ErrorCode = kerr.KafkaStorageError.Code
-				continue
 			}
+			resp.ErrorCode = kerr.KafkaStorageError.Code
+			return resp, nil
+		}
+
+		// Phase 3: WAL is durable for all partitions; now commit to chunks.
+		for i := range pending {
+			pc := &pending[i]
 
 			spare := pc.pd.AcquireSpareChunk(len(pc.stored))
 

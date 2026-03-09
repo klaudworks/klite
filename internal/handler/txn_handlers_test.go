@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -140,7 +141,7 @@ func callEndTxn(t *testing.T, state *cluster.State, clk clock.Clock, req *kmsg.E
 	return resp.(*kmsg.EndTxnResponse)
 }
 
-func callEndTxnWithWriter(t *testing.T, state *cluster.State, walWriter *wal.Writer, clk clock.Clock, req *kmsg.EndTxnRequest) *kmsg.EndTxnResponse {
+func callEndTxnWithWriter(t *testing.T, state *cluster.State, walWriter endTxnWALWriter, clk clock.Clock, req *kmsg.EndTxnRequest) *kmsg.EndTxnResponse {
 	t.Helper()
 	h := HandleEndTxn(state, walWriter, clk)
 	resp, err := h(req)
@@ -148,6 +149,17 @@ func callEndTxnWithWriter(t *testing.T, state *cluster.State, walWriter *wal.Wri
 		t.Fatalf("handler returned error: %v", err)
 	}
 	return resp.(*kmsg.EndTxnResponse)
+}
+
+type testEndTxnWALWriter struct {
+	errByPartition map[int32]error
+}
+
+func (w *testEndTxnWALWriter) AppendAsync(entry *wal.Entry, _ ...wal.AppendOpts) (<-chan error, error) {
+	err := w.errByPartition[entry.Partition]
+	ch := make(chan error, 1)
+	ch <- err
+	return ch, nil
 }
 
 func TestEndTxn_UnsupportedVersion(t *testing.T) {
@@ -302,6 +314,64 @@ func TestEndTxn_WALSubmitFailureRetryDoesNotShortCircuit(t *testing.T) {
 	ps = state.PIDManager().GetProducer(pid)
 	if ps.TxnState != cluster.TxnOngoing {
 		t.Fatalf("TxnState after retry submit failure = %d, want TxnOngoing", ps.TxnState)
+	}
+}
+
+func TestEndTxn_MixedWALResults_DoesNotApplyTxnOffsets(t *testing.T) {
+	t.Parallel()
+
+	state := cluster.NewState(cluster.Config{NodeID: 0, DefaultPartitions: 2})
+	state.CreateTopic("t", 2)
+	clk := clock.NewFakeClock(time.Unix(1000, 0))
+
+	txnID := "txn-mixed-wal"
+	pid, epoch, _ := state.PIDManager().InitProducerID(txnID, 5000)
+	tps := []cluster.TopicPartition{{Topic: "t", Partition: 0}, {Topic: "t", Partition: 1}}
+	if ec := state.PIDManager().AddPartitionsToTxn(pid, epoch, tps); ec != 0 {
+		t.Fatalf("AddPartitionsToTxn: errCode=%d", ec)
+	}
+	meta := "m"
+	offsetCommitReq := kmsg.NewPtrTxnOffsetCommitRequest()
+	offsetCommitReq.Version = 3
+	offsetCommitReq.ProducerID = pid
+	offsetCommitReq.ProducerEpoch = epoch
+	offsetCommitReq.Group = "g"
+	offsetCommitReq.Topics = []kmsg.TxnOffsetCommitRequestTopic{{
+		Topic: "t",
+		Partitions: []kmsg.TxnOffsetCommitRequestTopicPartition{{
+			Partition:   0,
+			Offset:      42,
+			LeaderEpoch: -1,
+			Metadata:    &meta,
+		}},
+	}}
+	offsetCommitResp := callTxnOffsetCommit(t, state, offsetCommitReq)
+	if got := offsetCommitResp.Topics[0].Partitions[0].ErrorCode; got != 0 {
+		t.Fatalf("TxnOffsetCommit error = %d, want 0", got)
+	}
+
+	fakeWriter := &testEndTxnWALWriter{errByPartition: map[int32]error{1: fmt.Errorf("disk full")}}
+
+	r := kmsg.NewPtrEndTxnRequest()
+	r.Version = 3
+	r.ProducerID = pid
+	r.ProducerEpoch = epoch
+	r.Commit = true
+
+	resp := callEndTxnWithWriter(t, state, fakeWriter, clk, r)
+	if resp.ErrorCode != kerr.KafkaStorageError.Code {
+		t.Fatalf("EndTxn error = %d, want %d", resp.ErrorCode, kerr.KafkaStorageError.Code)
+	}
+
+	ps := state.PIDManager().GetProducer(pid)
+	if ps.TxnState != cluster.TxnOngoing {
+		t.Fatalf("TxnState after mixed WAL result = %d, want TxnOngoing", ps.TxnState)
+	}
+
+	g := state.GetOrCreateGroup("g")
+	committed := g.GetCommittedOffsets()
+	if len(committed) != 0 {
+		t.Fatalf("committed offsets = %+v, want none", committed)
 	}
 }
 
