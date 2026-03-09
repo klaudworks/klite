@@ -17,6 +17,11 @@ import (
 	saslscram "github.com/twmb/franz-go/pkg/sasl/scram"
 )
 
+// testLogLevel is the default log level for test brokers. Debug is appropriate
+// because without -v Go only shows output for failing tests, so debug logs
+// appear only when they're useful.
+const testLogLevel = "debug"
+
 // TestBroker wraps a running broker for tests.
 type TestBroker struct {
 	Addr   string
@@ -153,7 +158,7 @@ func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
 	cfg.Listener = ln
 	cfg.HealthListener = healthLn
 	cfg.DataDir = t.TempDir()
-	cfg.LogLevel = "warn"
+	cfg.LogLevel = testLogLevel
 	for _, o := range opts {
 		o(&cfg)
 	}

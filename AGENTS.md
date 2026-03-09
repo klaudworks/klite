@@ -46,7 +46,7 @@ Follow the **testing pyramid**: test at the lowest layer that can verify the beh
 ## Running Tests
 
 - **Do not use `-v` by default** when running tests. Go captures output and only displays it for failing tests, which keeps the output clean. Use `-v` only when actively debugging a specific test failure.
-- Integration and e2e test helpers default to `warn` log level. Use `WithLogLevel("debug")` only when debugging a specific test.
+- Integration and e2e test helpers default to `debug` log level. This is intentional: without `-v`, Go suppresses output for passing tests, so debug logs only appear when a test fails — exactly when you want them.
 
 ```sh
 # Good: clean output, shows only failures

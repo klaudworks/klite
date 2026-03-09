@@ -142,7 +142,7 @@ func StartReplicaPair(t *testing.T, extraOpts ...BrokerOpt) *ReplicaPair {
 	cfgA.HealthAddr = healthAddrA
 	cfgA.HealthListener = healthLnA
 	cfgA.DataDir = t.TempDir()
-	cfgA.LogLevel = "warn"
+	cfgA.LogLevel = testLogLevel
 	cfgA.ClusterID = sharedClusterID
 	cfgA.ReplicationAddr = replAddrA
 	cfgA.ReplicationAdvertisedAddr = replAddrA
@@ -168,7 +168,7 @@ func StartReplicaPair(t *testing.T, extraOpts ...BrokerOpt) *ReplicaPair {
 	cfgB.HealthAddr = healthAddrB
 	cfgB.HealthListener = healthLnB
 	cfgB.DataDir = t.TempDir()
-	cfgB.LogLevel = "warn"
+	cfgB.LogLevel = testLogLevel
 	cfgB.ClusterID = sharedClusterID
 	cfgB.ReplicationAddr = replAddrB
 	cfgB.ReplicationAdvertisedAddr = replAddrB
@@ -576,7 +576,7 @@ func TestReplicationRoleChangeHookSequence(t *testing.T) {
 	cfgA.HealthAddr = healthLnA.Addr().String()
 	cfgA.HealthListener = healthLnA
 	cfgA.DataDir = t.TempDir()
-	cfgA.LogLevel = "warn"
+	cfgA.LogLevel = testLogLevel
 	cfgA.ReplicationAddr = replAddrA
 	cfgA.ReplicationAdvertisedAddr = replAddrA
 	cfgA.LeaseElector = electorA
@@ -1232,7 +1232,7 @@ func TestReplicationS3LeaseFailover(t *testing.T) {
 		cfg.HealthAddr = healthLn.Addr().String()
 		cfg.HealthListener = healthLn
 		cfg.DataDir = t.TempDir()
-		cfg.LogLevel = "warn"
+		cfg.LogLevel = testLogLevel
 		cfg.ClusterID = sharedClusterID
 		cfg.ReplicationAddr = replAddr
 		cfg.ReplicationAdvertisedAddr = replAddr
