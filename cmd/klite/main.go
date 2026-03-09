@@ -231,24 +231,28 @@ func main() {
 			&cli.DurationFlag{
 				Name:        "replication-ack-timeout",
 				Usage:       "Timeout for standby ACK in sync mode (default: 5s)",
+				Value:       cfg.ReplicationAckTimeout,
 				Destination: &cfg.ReplicationAckTimeout,
 				Sources:     cli.EnvVars("KLITE_REPLICATION_ACK_TIMEOUT"),
 			},
 			&cli.DurationFlag{
 				Name:        "lease-duration",
 				Usage:       "How long the lease is valid without renewal (default: 15s)",
+				Value:       cfg.LeaseDuration,
 				Destination: &cfg.LeaseDuration,
 				Sources:     cli.EnvVars("KLITE_LEASE_DURATION"),
 			},
 			&cli.DurationFlag{
 				Name:        "lease-renew-interval",
 				Usage:       "How often the primary renews the lease (default: 5s)",
+				Value:       cfg.LeaseRenewInterval,
 				Destination: &cfg.LeaseRenewInterval,
 				Sources:     cli.EnvVars("KLITE_LEASE_RENEW_INTERVAL"),
 			},
 			&cli.DurationFlag{
 				Name:        "lease-retry-interval",
 				Usage:       "How often the standby polls the lease (default: 2s)",
+				Value:       cfg.LeaseRetryInterval,
 				Destination: &cfg.LeaseRetryInterval,
 				Sources:     cli.EnvVars("KLITE_LEASE_RETRY_INTERVAL"),
 			},
