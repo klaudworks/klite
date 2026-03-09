@@ -46,6 +46,12 @@ type Compactor struct {
 	rateLimiter *rate.Limiter // nil if unlimited
 }
 
+type compactionCachedObj struct {
+	key      string
+	rawBytes []byte
+	footer   *Footer
+}
+
 func NewCompactor(cfg CompactorConfig) *Compactor {
 	if cfg.WindowBytes == 0 {
 		cfg.WindowBytes = 256 * 1024 * 1024 // 256 MiB
@@ -167,12 +173,7 @@ func (c *Compactor) compactWindow(
 		sourceBytes += wo.size
 	}
 
-	type cachedObj struct {
-		key      string
-		rawBytes []byte
-		footer   *Footer
-	}
-	cached := make([]cachedObj, len(window))
+	cached := make([]compactionCachedObj, len(window))
 
 	sem := make(chan struct{}, c.cfg.S3Concurrency)
 	var wg sync.WaitGroup
@@ -219,7 +220,7 @@ func (c *Compactor) compactWindow(
 			}
 
 			mu.Lock()
-			cached[idx] = cachedObj{key: w.key, rawBytes: data, footer: footer}
+			cached[idx] = compactionCachedObj{key: w.key, rawBytes: data, footer: footer}
 			mu.Unlock()
 		}(i, wo)
 	}
@@ -229,29 +230,10 @@ func (c *Compactor) compactWindow(
 		return currentCleanedUpTo, fetchErr
 	}
 
-	offsetMap := make(map[string]int64)
-
-	for _, co := range cached {
-		if co.footer == nil || len(co.rawBytes) == 0 {
-			continue
-		}
-		if err := c.buildOffsetMap(co.rawBytes, co.footer, offsetMap); err != nil {
-			return currentCleanedUpTo, fmt.Errorf("build offset map: %w", err)
-		}
-	}
-
-	var outputBatches []BatchData
 	nowMs := c.clock.Now().UnixMilli()
-
-	for _, co := range cached {
-		if co.footer == nil || len(co.rawBytes) == 0 {
-			continue
-		}
-		batches, err := c.filterBatches(co.rawBytes, co.footer, offsetMap, nowMs, deleteRetentionMs)
-		if err != nil {
-			return currentCleanedUpTo, fmt.Errorf("filter batches: %w", err)
-		}
-		outputBatches = append(outputBatches, batches...)
+	outputBatches, err := c.filterWindowBatches(cached, nowMs, deleteRetentionMs)
+	if err != nil {
+		return currentCleanedUpTo, fmt.Errorf("filter window batches: %w", err)
 	}
 
 	if len(outputBatches) == 0 {
@@ -329,6 +311,171 @@ func (c *Compactor) compactWindow(
 		"watermark", newWatermark)
 
 	return newWatermark, nil
+}
+
+func (c *Compactor) filterWindowBatches(cached []compactionCachedObj, nowMs, deleteRetentionMs int64) ([]BatchData, error) {
+	seenKeys := make(map[string]struct{})
+	byObject := make([][]BatchData, len(cached))
+
+	for objIdx := len(cached) - 1; objIdx >= 0; objIdx-- {
+		co := cached[objIdx]
+		if co.footer == nil || len(co.rawBytes) == 0 {
+			continue
+		}
+
+		entries := co.footer.Entries
+		objBatchesRev := make([]BatchData, 0, len(entries))
+		for entryIdx := len(entries) - 1; entryIdx >= 0; entryIdx-- {
+			entry := entries[entryIdx]
+			if int(entry.BytePosition)+int(entry.BatchLength) > len(co.rawBytes) {
+				continue
+			}
+			batchRaw := co.rawBytes[entry.BytePosition : entry.BytePosition+entry.BatchLength]
+
+			batchData, keep := c.compactBatchWithSeenKeys(batchRaw, seenKeys, nowMs, deleteRetentionMs)
+			if !keep {
+				continue
+			}
+			objBatchesRev = append(objBatchesRev, batchData)
+		}
+
+		reverseBatches(objBatchesRev)
+		byObject[objIdx] = objBatchesRev
+	}
+
+	var outputBatches []BatchData
+	for _, batches := range byObject {
+		outputBatches = append(outputBatches, batches...)
+	}
+
+	return outputBatches, nil
+}
+
+func (c *Compactor) compactBatchWithSeenKeys(batchRaw []byte, seenKeys map[string]struct{}, nowMs, deleteRetentionMs int64) (BatchData, bool) {
+	header, err := ParseBatchHeaderFromRaw(batchRaw)
+	if err != nil {
+		c.logger.Warn("compactor: skipping batch with unparseable header in compactBatchWithSeenKeys", "err", err)
+		return BatchData{}, false
+	}
+
+	if header.IsControlBatch() {
+		bd := BatchData{
+			RawBytes:        make([]byte, len(batchRaw)),
+			BaseOffset:      header.BaseOffset,
+			LastOffsetDelta: header.LastOffsetDelta,
+		}
+		copy(bd.RawBytes, batchRaw)
+		return bd, true
+	}
+
+	codec := header.CompressionCodec()
+	decompressed, err := DecompressRecords(batchRaw, codec)
+	if err != nil {
+		c.logger.Warn("compactor: keeping batch as-is due to decompression error in compactBatchWithSeenKeys",
+			"base_offset", header.BaseOffset, "err", err)
+		bd := BatchData{
+			RawBytes:        make([]byte, len(batchRaw)),
+			BaseOffset:      header.BaseOffset,
+			LastOffsetDelta: header.LastOffsetDelta,
+		}
+		copy(bd.RawBytes, batchRaw)
+		return bd, true
+	}
+
+	records := make([]Record, 0, header.NumRecords)
+	err = IterateRecords(decompressed, func(rec Record) bool {
+		records = append(records, rec)
+		return true
+	})
+	if err != nil {
+		c.logger.Debug("error iterating records for streaming filter", "err", err)
+		return BatchData{}, false
+	}
+
+	if len(records) == 0 {
+		return BatchData{}, false
+	}
+
+	keepFlags := make([]bool, len(records))
+	allKept := true
+	for i := len(records) - 1; i >= 0; i-- {
+		rec := records[i]
+
+		if rec.Key == nil {
+			keepFlags[i] = true
+			continue
+		}
+
+		key := string(rec.Key)
+		if _, seen := seenKeys[key]; seen {
+			allKept = false
+			continue
+		}
+
+		seenKeys[key] = struct{}{}
+		if rec.Value == nil && deleteRetentionMs > 0 {
+			recordTs := c.recordTimestampMs(header, rec)
+			if recordTs > 0 && nowMs-recordTs > deleteRetentionMs {
+				allKept = false
+				continue
+			}
+		}
+
+		keepFlags[i] = true
+	}
+
+	if allKept {
+		bd := BatchData{
+			RawBytes:        make([]byte, len(batchRaw)),
+			BaseOffset:      header.BaseOffset,
+			LastOffsetDelta: header.LastOffsetDelta,
+		}
+		copy(bd.RawBytes, batchRaw)
+		return bd, true
+	}
+
+	retained := make([]Record, 0, len(records))
+	for i, keep := range keepFlags {
+		if keep {
+			retained = append(retained, records[i])
+		}
+	}
+
+	if len(retained) == 0 {
+		return BatchData{}, false
+	}
+
+	newBatchBytes, err := BuildRecordBatch(header, retained, codec)
+	if err != nil {
+		c.logger.Warn("failed to build compacted batch, keeping original", "err", err)
+		bd := BatchData{
+			RawBytes:        make([]byte, len(batchRaw)),
+			BaseOffset:      header.BaseOffset,
+			LastOffsetDelta: header.LastOffsetDelta,
+		}
+		copy(bd.RawBytes, batchRaw)
+		return bd, true
+	}
+
+	lastOD := retained[len(retained)-1].OffsetDelta
+	return BatchData{
+		RawBytes:        newBatchBytes,
+		BaseOffset:      header.BaseOffset,
+		LastOffsetDelta: int32(lastOD),
+	}, true
+}
+
+func (c *Compactor) recordTimestampMs(header BatchHeader, rec Record) int64 {
+	if header.TimestampType() == 1 {
+		return header.MaxTimestamp
+	}
+	return header.BaseTimestamp + rec.TimestampDelta
+}
+
+func reverseBatches(batches []BatchData) {
+	for i, j := 0, len(batches)-1; i < j; i, j = i+1, j-1 {
+		batches[i], batches[j] = batches[j], batches[i]
+	}
 }
 
 func (c *Compactor) buildOffsetMap(rawBytes []byte, footer *Footer, offsetMap map[string]int64) error {
