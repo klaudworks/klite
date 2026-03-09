@@ -8,37 +8,36 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
 <div id="calc">
   <div class="calc-grid">
     <div class="calc-field">
-      <label for="msgRate">Message rate (msgs/sec)</label>
+      <label for="msgRate">Message rate (msgs/sec) <span class="info-icon" data-tip="Total messages produced per second across all partitions.">i</span></label>
       <input type="number" id="msgRate" value="100000" min="1" />
     </div>
     <div class="calc-field">
-      <label for="msgSize">Average message size (bytes)</label>
+      <label for="msgSize">Average message size (bytes) <span class="info-icon" data-tip="Uncompressed size of a single message (key + value + headers). Compression is applied separately.">i</span></label>
       <input type="number" id="msgSize" value="1024" min="1" />
     </div>
     <div class="calc-field">
-      <label for="partitions">Partitions</label>
+      <label for="partitions">Partitions <span class="info-icon" data-tip="Total partition count across all topics. Each partition flushes to S3 independently.">i</span></label>
       <input type="number" id="partitions" value="10" min="1" />
     </div>
     <div class="calc-field">
-      <label for="consumers">S3-tier consumers (lagging)</label>
+      <label for="consumers">S3-tier consumers <span class="info-icon" data-tip="Consumers reading data already flushed to S3 (lagging behind the WAL). Real-time consumers reading from the WAL generate zero S3 calls.">i</span></label>
       <input type="number" id="consumers" value="1" min="0" />
     </div>
     <div class="calc-field">
-      <label for="retention">Retention (days)</label>
+      <label for="retention">Retention (days) <span class="info-icon" data-tip="How long data is kept in S3 before deletion. Directly determines storage volume.">i</span></label>
       <input type="number" id="retention" value="7" min="1" />
     </div>
     <div class="calc-field">
-      <label for="objectSize">Target object size (MiB)</label>
+      <label for="objectSize">Target object size (MiB) <span class="info-icon" data-tip="Flush threshold per partition. Larger objects mean fewer PUTs and GETs but higher flush latency. Tune with --s3-target-object-size.">i</span></label>
       <input type="number" id="objectSize" value="64" min="1" />
     </div>
     <div class="calc-field">
-      <label for="flushInterval">Flush interval (seconds)</label>
+      <label for="flushInterval">Flush interval (seconds) <span class="info-icon" data-tip="Maximum age before a partition is flushed to S3, even if the target object size hasn't been reached. Tune with --s3-flush-interval.">i</span></label>
       <input type="number" id="flushInterval" value="60" min="1" />
     </div>
     <div class="calc-field">
-      <label for="compression">Compression ratio</label>
+      <label for="compression">Compression ratio <span class="info-icon" data-tip="Ratio of uncompressed to compressed size. 1.0 = no compression, 1.5 = typical Snappy, 2.0+ = highly compressible data. Set by the client (e.g. franz-go, librdkafka).">i</span></label>
       <input type="number" id="compression" value="1.5" min="1" step="0.1" />
-      <span class="calc-hint">1.0 = none, 1.5 = typical Snappy</span>
     </div>
   </div>
 
@@ -62,10 +61,6 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
     </div>
   </div>
 </div>
-
-:::note
-S3-tier consumers are consumers reading data that has already been flushed to S3 (i.e., lagging behind the in-memory buffer). Real-time consumers reading from the WAL do not generate S3 API calls.
-:::
 
 ### Pricing reference
 
@@ -117,11 +112,48 @@ After the listing cache append optimization, **PUTs are the largest API cost**. 
     outline: 2px solid var(--sl-color-accent);
     outline-offset: -1px;
   }
-  .calc-hint {
-    display: block;
-    font-size: 0.75rem;
+  .calc-field {
+    position: relative;
+  }
+  .info-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1rem;
+    height: 1rem;
+    font-size: 0.65rem;
+    font-style: italic;
+    font-weight: 600;
+    border-radius: 50%;
+    border: 1px solid var(--sl-color-gray-4);
     color: var(--sl-color-gray-3);
-    margin-top: 0.2rem;
+    cursor: help;
+    position: relative;
+    vertical-align: middle;
+    margin-left: 0.15rem;
+  }
+  .info-icon:hover {
+    border-color: var(--sl-color-accent);
+    color: var(--sl-color-accent);
+  }
+  .info-icon:hover::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 0.4rem);
+    right: -0.5rem;
+    width: 220px;
+    padding: 0.5rem 0.6rem;
+    font-size: 0.75rem;
+    font-style: normal;
+    font-weight: 400;
+    line-height: 1.4;
+    color: var(--sl-color-text);
+    background: var(--sl-color-bg);
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    z-index: 10;
+    pointer-events: none;
   }
   .calc-results {
     margin-top: 1rem;
