@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -243,6 +244,266 @@ func TestSASLAllowed(t *testing.T) {
 					tt.stage, tt.req, got, tt.allowed)
 			}
 		})
+	}
+}
+
+// writeLoopHarness sets up a clientConn with a net.Pipe suitable for testing
+// writeLoop in isolation. The caller sends clientResp values on respCh and
+// reads framed Kafka responses from the returned reader. Close shutdownCh or
+// respCh to terminate the write loop.
+type writeLoopHarness struct {
+	cc         *clientConn
+	respCh     chan clientResp
+	shutdownCh chan struct{}
+	clientConn net.Conn // test reads from this side
+	serverConn net.Conn // writeLoop writes to this side
+}
+
+func newWriteLoopHarness() *writeLoopHarness {
+	client, server := net.Pipe()
+	shutdownCh := make(chan struct{})
+	respCh := make(chan clientResp, maxInFlight)
+
+	cc := &clientConn{
+		conn:       server,
+		respCh:     respCh,
+		bw:         bufio.NewWriterSize(server, connWriteBufSize),
+		shutdownCh: shutdownCh,
+		logger:     slog.Default(),
+	}
+
+	return &writeLoopHarness{
+		cc:         cc,
+		respCh:     respCh,
+		shutdownCh: shutdownCh,
+		clientConn: client,
+		serverConn: server,
+	}
+}
+
+// readCorrID reads one framed response from the client side of the pipe
+// and returns the correlation ID.
+func (h *writeLoopHarness) readCorrID(t *testing.T) int32 {
+	t.Helper()
+	var sizeBuf [4]byte
+	if _, err := io.ReadFull(h.clientConn, sizeBuf[:]); err != nil {
+		t.Fatalf("reading frame size: %v", err)
+	}
+	size := int(binary.BigEndian.Uint32(sizeBuf[:]))
+	frame := make([]byte, size)
+	if _, err := io.ReadFull(h.clientConn, frame); err != nil {
+		t.Fatalf("reading frame body: %v", err)
+	}
+	return int32(binary.BigEndian.Uint32(frame[:4]))
+}
+
+// makeResp creates a clientResp with a HeartbeatResponse for a given seq/corrID.
+func makeResp(seq uint32, corr int32) clientResp {
+	resp := kmsg.NewHeartbeatResponse()
+	return clientResp{
+		kresp: &resp,
+		corr:  corr,
+		seq:   seq,
+	}
+}
+
+func TestWriteLoopInOrderDelivery(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	go h.cc.writeLoop()
+
+	// Send 5 responses in order, verify they arrive in order.
+	for i := 0; i < 5; i++ {
+		h.respCh <- makeResp(uint32(i), int32(i+100))
+	}
+
+	for i := 0; i < 5; i++ {
+		got := h.readCorrID(t)
+		want := int32(i + 100)
+		if got != want {
+			t.Fatalf("response %d: got corrID %d, want %d", i, got, want)
+		}
+	}
+
+	close(h.respCh)
+}
+
+func TestWriteLoopReverseOrderReassembly(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	go h.cc.writeLoop()
+
+	// Send 4 responses in reverse order (3, 2, 1, 0). The writeLoop should
+	// buffer them and only emit once seq 0 arrives.
+	h.respCh <- makeResp(3, 300)
+	h.respCh <- makeResp(2, 200)
+	h.respCh <- makeResp(1, 100)
+	h.respCh <- makeResp(0, 0) // triggers drain of all buffered
+
+	for i := 0; i < 4; i++ {
+		got := h.readCorrID(t)
+		want := int32(i * 100)
+		if got != want {
+			t.Fatalf("response %d: got corrID %d, want %d", i, got, want)
+		}
+	}
+
+	close(h.respCh)
+}
+
+func TestWriteLoopSkipInterleavedWithNormal(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	go h.cc.writeLoop()
+
+	// seq 0: normal, seq 1: skip, seq 2: normal, seq 3: skip, seq 4: normal
+	h.respCh <- makeResp(0, 10)
+	h.respCh <- clientResp{seq: 1, skip: true}
+	h.respCh <- makeResp(2, 20)
+	h.respCh <- clientResp{seq: 3, skip: true}
+	h.respCh <- makeResp(4, 30)
+
+	// Only the non-skip responses should appear on the wire.
+	expected := []int32{10, 20, 30}
+	for i, want := range expected {
+		got := h.readCorrID(t)
+		if got != want {
+			t.Fatalf("response %d: got corrID %d, want %d", i, got, want)
+		}
+	}
+
+	close(h.respCh)
+}
+
+func TestWriteLoopSkipOutOfOrder(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	go h.cc.writeLoop()
+
+	// seq 2 arrives first (normal), seq 1 arrives (skip), seq 0 arrives (normal)
+	// Expected write order: corrID 10 (seq 0), then corrID 30 (seq 2). Seq 1 is skipped.
+	h.respCh <- makeResp(2, 30)
+	h.respCh <- clientResp{seq: 1, skip: true}
+	h.respCh <- makeResp(0, 10)
+
+	expected := []int32{10, 30}
+	for i, want := range expected {
+		got := h.readCorrID(t)
+		if got != want {
+			t.Fatalf("response %d: got corrID %d, want %d", i, got, want)
+		}
+	}
+
+	close(h.respCh)
+}
+
+func TestWriteLoopErrorClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	done := make(chan struct{})
+	go func() {
+		h.cc.writeLoop()
+		close(done)
+	}()
+
+	// Send an error response — writeLoop should return and close the connection.
+	h.respCh <- clientResp{seq: 0, err: fmt.Errorf("handler failed")}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeLoop did not exit after error response")
+	}
+
+	// The server side should be closed; reading from clientConn should get EOF.
+	var buf [1]byte
+	_, err := h.clientConn.Read(buf[:])
+	if err == nil {
+		t.Fatal("expected error reading from closed pipe")
+	}
+}
+
+func TestWriteLoopErrorMidOOOBuffer(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	done := make(chan struct{})
+	go func() {
+		h.cc.writeLoop()
+		close(done)
+	}()
+
+	// Send seq 0 (normal), seq 2 (buffered), seq 1 (error).
+	// Seq 0 should be written, seq 1 error closes the connection,
+	// and seq 2 is never delivered.
+	h.respCh <- makeResp(0, 10)
+
+	// Read seq 0 to confirm it was written.
+	got := h.readCorrID(t)
+	if got != 10 {
+		t.Fatalf("got corrID %d, want 10", got)
+	}
+
+	// Now send seq 2 (buffered) and seq 1 (error).
+	h.respCh <- makeResp(2, 30)
+	h.respCh <- clientResp{seq: 1, err: fmt.Errorf("mid-sequence error")}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeLoop did not exit after error in OOO sequence")
+	}
+}
+
+func TestWriteLoopShutdownDuringWait(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	done := make(chan struct{})
+	go func() {
+		h.cc.writeLoop()
+		close(done)
+	}()
+
+	// Don't send any responses — writeLoop is blocked on respCh.
+	// Close shutdownCh to unblock it.
+	close(h.shutdownCh)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeLoop did not exit after shutdown")
+	}
+}
+
+func TestWriteLoopChannelCloseDuringOOODrain(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteLoopHarness()
+	done := make(chan struct{})
+	go func() {
+		h.cc.writeLoop()
+		close(done)
+	}()
+
+	// Send seq 2 and seq 1 (both buffered, waiting for seq 0).
+	// Then close the channel without sending seq 0.
+	h.respCh <- makeResp(2, 20)
+	h.respCh <- makeResp(1, 10)
+
+	// Give the writeLoop time to buffer both responses.
+	time.Sleep(50 * time.Millisecond)
+	close(h.respCh)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeLoop did not exit after channel close with buffered OOO responses")
 	}
 }
 
