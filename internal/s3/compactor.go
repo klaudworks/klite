@@ -586,12 +586,7 @@ func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error
 			lastOff: p.baseOffset, // minimum
 		}
 
-		data, err := c.client.GetObject(ctx, p.key)
-		if err != nil {
-			ranges[i].footerErr = true
-			continue
-		}
-		footer, err := ParseFooter(data, int64(len(data)))
+		footer, err := c.reader.GetFooter(ctx, p.key, p.size)
 		if err != nil {
 			ranges[i].footerErr = true
 			continue
