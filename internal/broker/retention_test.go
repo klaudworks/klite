@@ -274,6 +274,50 @@ func TestRetentionBySizeWithCorruptFooterStillProgresses(t *testing.T) {
 	}
 }
 
+func TestRetentionByTimeWithCorruptMiddleFooterStillDeletesLaterExpiredObject(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(100000))
+	b, mem := newRetentionTestBroker(t, clk)
+
+	topic := "time-corrupt-footer-test"
+	b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+		"retention.ms": "1000",
+	})
+
+	tid := topicID(b, topic)
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{90000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{91000})
+	putTestObject(t, mem, topic, tid, 0, 2, []int64{92000})
+	setPartitionHW(t, b, topic, 0, 3)
+
+	client := s3store.NewClient(s3store.ClientConfig{
+		S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test",
+	})
+	key1 := s3store.ObjectKey("klite/test", topic, tid, 0, 1)
+	if err := client.PutObject(context.Background(), key1, []byte("corrupt")); err != nil {
+		t.Fatal(err)
+	}
+
+	b.enforceRetention(context.Background())
+
+	keys := listObjectKeys(t, mem, topic, tid, 0)
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 object after time retention with corrupt footer, got %d", len(keys))
+	}
+	if !strings.HasSuffix(keys[0], "/00000000000000000001.obj") {
+		t.Fatalf("expected only corrupt middle object to remain, got %q", keys[0])
+	}
+
+	td := b.state.GetTopic(topic)
+	td.Partitions[0].RLock()
+	logStart := td.Partitions[0].LogStart()
+	td.Partitions[0].RUnlock()
+	if logStart != 1 {
+		t.Fatalf("logStartOffset: got %d, want 1", logStart)
+	}
+}
+
 func TestRetentionPartialDeleteFailureAdvancesOnlyPastDeletedObjects(t *testing.T) {
 	t.Parallel()
 
