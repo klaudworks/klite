@@ -303,8 +303,8 @@ func TestValidateAndDedupFencesLowerEpoch(t *testing.T) {
 
 	// Lower epoch should be fenced.
 	errCode, _, _ := m.ValidateAndDedup(1, 2, tp, 0, 1, 100)
-	if errCode != 35 {
-		t.Fatalf("errCode = %d, want 35 (PRODUCER_FENCED)", errCode)
+	if errCode != 90 {
+		t.Fatalf("errCode = %d, want 90 (PRODUCER_FENCED)", errCode)
 	}
 }
 
@@ -589,8 +589,8 @@ func TestStoreTxnOffsetFencedEpoch(t *testing.T) {
 
 	// Old epoch (0) should be fenced.
 	errCode := m.StoreTxnOffset(pid, 0, "group-1", "t", 0, 42, 0, "")
-	if errCode != 35 {
-		t.Fatalf("StoreTxnOffset fenced: errCode=%d, want 35 (PRODUCER_FENCED)", errCode)
+	if errCode != 90 {
+		t.Fatalf("StoreTxnOffset fenced: errCode=%d, want 90 (PRODUCER_FENCED)", errCode)
 	}
 }
 
@@ -719,8 +719,8 @@ func TestAddOffsetsToTxnFencedEpoch(t *testing.T) {
 	_ = epoch
 
 	errCode := m.AddOffsetsToTxn(pid, 0, "group-1")
-	if errCode != 35 {
-		t.Fatalf("AddOffsetsToTxn fenced: errCode=%d, want 35", errCode)
+	if errCode != 90 {
+		t.Fatalf("AddOffsetsToTxn fenced: errCode=%d, want 90", errCode)
 	}
 }
 
@@ -907,8 +907,8 @@ func TestPrepareEndTxnFencedEpoch(t *testing.T) {
 	}
 
 	_, errCode := m.PrepareEndTxn(pid, 0, true)
-	if errCode != 35 {
-		t.Fatalf("PrepareEndTxn fenced: errCode=%d, want 35", errCode)
+	if errCode != 90 {
+		t.Fatalf("PrepareEndTxn fenced: errCode=%d, want 90", errCode)
 	}
 }
 
@@ -1127,8 +1127,8 @@ func TestAddPartitionsToTxnFencedEpoch(t *testing.T) {
 
 	// Old epoch (0) should be fenced.
 	errCode := m.AddPartitionsToTxn(pid, 0, []TopicPartition{{Topic: "t", Partition: 0}})
-	if errCode != 35 {
-		t.Fatalf("AddPartitionsToTxn fenced: errCode=%d, want 35 (PRODUCER_FENCED)", errCode)
+	if errCode != 90 {
+		t.Fatalf("AddPartitionsToTxn fenced: errCode=%d, want 90 (PRODUCER_FENCED)", errCode)
 	}
 }
 

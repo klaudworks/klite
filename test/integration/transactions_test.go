@@ -270,7 +270,7 @@ func TestProducerFencing(t *testing.T) {
 
 	// Attempt to produce with the OLD (fenced) epoch — should be rejected.
 	resp3 := rawProduce(t, cl, topic, 0, pid, epoch1, 1, 1)
-	require.Equal(t, int16(35), resp3.ErrorCode,
+	require.Equal(t, int16(90), resp3.ErrorCode,
 		"old epoch should be fenced")
 }
 
@@ -299,7 +299,7 @@ func TestFenceAfterProducerCommit(t *testing.T) {
 
 	// Produce with stale epoch1 after the fence — should be rejected.
 	fencedResp := rawProduce(t, cl, topic, 0, pid, epoch1, 1, 1)
-	require.Equal(t, int16(35), fencedResp.ErrorCode,
+	require.Equal(t, int16(90), fencedResp.ErrorCode,
 		"stale epoch after commit should be fenced")
 
 	// New epoch works fine.
@@ -331,7 +331,7 @@ func TestFenceBeforeProducerCommit(t *testing.T) {
 
 	// Try to produce with old epoch — should be fenced.
 	fencedResp := rawProduce(t, cl, topic, 0, pid, epoch1, 1, 1)
-	require.Equal(t, int16(35), fencedResp.ErrorCode,
+	require.Equal(t, int16(90), fencedResp.ErrorCode,
 		"stale epoch during open txn should be fenced")
 
 	// Try to EndTxn with the old epoch — should also be fenced.
@@ -342,7 +342,7 @@ func TestFenceBeforeProducerCommit(t *testing.T) {
 	endReq.Commit = true
 	endResp, err := endReq.RequestWith(ctx, cl)
 	require.NoError(t, err)
-	require.Equal(t, int16(35), endResp.ErrorCode,
+	require.Equal(t, int16(90), endResp.ErrorCode,
 		"EndTxn with stale epoch should be fenced")
 
 	// New epoch works.

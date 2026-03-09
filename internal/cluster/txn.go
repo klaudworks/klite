@@ -285,7 +285,7 @@ func (m *ProducerIDManager) ValidateAndDedup(pid int64, epoch int16, tp TopicPar
 		if epoch < ps.Epoch {
 			slog.Warn("ValidateAndDedup: PRODUCER_FENCED",
 				"pid", pid, "epoch", epoch, "currentEpoch", ps.Epoch)
-			return 35, false, 0 // PRODUCER_FENCED
+			return 90, false, 0 // PRODUCER_FENCED
 		}
 		// KIP-360: accept a higher epoch from the same PID. The client
 		// bumps the epoch locally after a disconnect/failover and resets
@@ -389,7 +389,7 @@ func (m *ProducerIDManager) AddPartitionsToTxn(pid int64, epoch int16, partition
 	}
 	if epoch != ps.Epoch {
 		if epoch < ps.Epoch {
-			return 35 // PRODUCER_FENCED
+			return 90 // PRODUCER_FENCED
 		}
 		return 47 // INVALID_PRODUCER_EPOCH
 	}
@@ -423,7 +423,7 @@ func (m *ProducerIDManager) AddOffsetsToTxn(pid int64, epoch int16, groupID stri
 	}
 	if epoch != ps.Epoch {
 		if epoch < ps.Epoch {
-			return 35
+			return 90 // PRODUCER_FENCED
 		}
 		return 47
 	}
@@ -455,7 +455,7 @@ func (m *ProducerIDManager) StoreTxnOffset(pid int64, epoch int16, groupID, topi
 	}
 	if epoch != ps.Epoch {
 		if epoch < ps.Epoch {
-			return 35
+			return 90 // PRODUCER_FENCED
 		}
 		return 47
 	}
@@ -518,7 +518,7 @@ func (m *ProducerIDManager) PrepareEndTxn(pid int64, epoch int16, commit bool) (
 	}
 	if epoch != ps.Epoch {
 		if epoch < ps.Epoch {
-			return nil, 35 // PRODUCER_FENCED
+			return nil, 90 // PRODUCER_FENCED
 		}
 		return nil, 47 // INVALID_PRODUCER_EPOCH
 	}

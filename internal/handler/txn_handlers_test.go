@@ -185,9 +185,9 @@ func TestEndTxn_FencedEpoch(t *testing.T) {
 	r.Commit = true
 
 	resp := callEndTxn(t, state, clk, r)
-	// Error code 35 = PRODUCER_FENCED
-	if resp.ErrorCode != 35 {
-		t.Errorf("expected PRODUCER_FENCED (35), got %d", resp.ErrorCode)
+	// Error code 90 = PRODUCER_FENCED
+	if resp.ErrorCode != 90 {
+		t.Errorf("expected PRODUCER_FENCED (90), got %d", resp.ErrorCode)
 	}
 }
 
@@ -402,9 +402,9 @@ func TestTxnOffsetCommit_FencedEpoch(t *testing.T) {
 	if len(resp.Topics) != 1 || len(resp.Topics[0].Partitions) != 1 {
 		t.Fatalf("unexpected response structure: %+v", resp)
 	}
-	// Error code 35 = PRODUCER_FENCED
-	if resp.Topics[0].Partitions[0].ErrorCode != 35 {
-		t.Errorf("expected PRODUCER_FENCED (35), got %d", resp.Topics[0].Partitions[0].ErrorCode)
+	// Error code 90 = PRODUCER_FENCED
+	if resp.Topics[0].Partitions[0].ErrorCode != 90 {
+		t.Errorf("expected PRODUCER_FENCED (90), got %d", resp.Topics[0].Partitions[0].ErrorCode)
 	}
 }
 
