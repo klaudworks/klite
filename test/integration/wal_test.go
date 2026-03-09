@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -724,4 +726,130 @@ func TestWALProduceConsume(t *testing.T) {
 	require.Equal(t, int64(0), consumed[0].Offset)
 	require.Equal(t, int64(1), consumed[1].Offset)
 	require.Equal(t, int64(2), consumed[2].Offset)
+}
+
+// TestWALBackPressureS3Recovery verifies the end-to-end back-pressure path:
+// when the WAL fills up (all segments unflushed to S3), produce fails or
+// times out. After the S3 flusher runs and advances the watermark, produce
+// succeeds again and all data remains consumable.
+func TestWALBackPressureS3Recovery(t *testing.T) {
+	t.Parallel()
+
+	const (
+		walSegmentSize = 4 * 1024  // 4 KiB segments — rotate frequently
+		walMaxDisk     = 16 * 1024 // 16 KiB total WAL — fills after a few segments
+		s3ObjSize      = 4 * 1024  // 4 KiB S3 objects — flush small batches
+		valuePadding   = 512       // pad each record to fill WAL faster
+	)
+
+	mem := s3store.NewInMemoryS3()
+	topic := "wal-backpressure-s3"
+	pad := strings.Repeat("x", valuePadding)
+
+	tb := StartBroker(t,
+		WithS3(mem, "test-bucket", "klite/test"),
+		WithWALSegmentMaxBytes(walSegmentSize),
+		WithWALMaxDiskSize(walMaxDisk),
+		WithS3FlushInterval(1*time.Second),
+		WithS3FlushCheckInterval(200*time.Millisecond),
+		WithS3TargetObjectSize(s3ObjSize),
+	)
+
+	admin := NewAdminClient(t, tb.Addr)
+	_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
+	require.NoError(t, err)
+
+	// Phase 1: Produce until WAL back-pressure causes a failure.
+	// A short timeout ensures we detect the back-pressure quickly — the
+	// error may be KafkaStorageError (WAL full on submit) or a context
+	// timeout (WAL full causes fsync to stall).
+	producer := NewClient(t, tb.Addr,
+		kgo.DefaultProduceTopic(topic),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		kgo.MaxBufferedRecords(1),
+		kgo.ProducerLinger(0),
+		kgo.RequestRetries(0),
+	)
+
+	var ackedCount int
+	var hitBackPressure bool
+
+	for i := 0; i < 500; i++ {
+		rec := &kgo.Record{
+			Topic:     topic,
+			Partition: 0,
+			Key:       []byte(fmt.Sprintf("key-%d", i)),
+			Value:     []byte(fmt.Sprintf("v-%d-%s", i, pad)),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		results := producer.ProduceSync(ctx, rec)
+		cancel()
+
+		if len(results) == 1 && results[0].Err != nil {
+			t.Logf("produce failed at record %d: %v", i, results[0].Err)
+			hitBackPressure = true
+			break
+		}
+		require.Len(t, results, 1)
+		require.NoError(t, results[0].Err, "record %d", i)
+		ackedCount++
+	}
+	require.True(t, hitBackPressure, "expected produce to fail from WAL back-pressure after %d records", ackedCount)
+	require.Greater(t, ackedCount, 0, "should have produced at least some records before back-pressure")
+	t.Logf("produced %d acked records before WAL back-pressure", ackedCount)
+
+	// Phase 2: Wait for S3 flusher to flush data and clear back-pressure.
+	require.Eventually(t, func() bool {
+		for _, k := range mem.Keys() {
+			if s3KeyMatchesPartition(k, topic, 0) && strings.HasSuffix(k, ".obj") {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 200*time.Millisecond, "S3 flush did not occur")
+
+	// Phase 3: Produce should succeed again after S3 flush clears WAL pressure.
+	// Use a fresh producer to avoid idempotent dedup complications from the
+	// timed-out produce (which may have been durably written).
+	producer2 := NewClient(t, tb.Addr,
+		kgo.DefaultProduceTopic(topic),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		kgo.MaxBufferedRecords(1),
+		kgo.ProducerLinger(0),
+		kgo.RequestRetries(0),
+	)
+
+	require.Eventually(t, func() bool {
+		rec := &kgo.Record{
+			Topic:     topic,
+			Partition: 0,
+			Key:       []byte("recovery"),
+			Value:     []byte("recovered"),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		results := producer2.ProduceSync(ctx, rec)
+		cancel()
+		return len(results) == 1 && results[0].Err == nil
+	}, 15*time.Second, 500*time.Millisecond, "produce did not recover after S3 flush")
+	t.Logf("produce recovered after S3 flush")
+
+	// Phase 4: Verify all data is consumable from offset 0.
+	// The timed-out record may or may not have been durably written, so the
+	// total consumable count is at least ackedCount + 1 (the recovery record)
+	// but may be ackedCount + 2 if the timed-out record was also persisted.
+	consumer := NewClient(t, tb.Addr,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+
+	minExpected := ackedCount + 1 // acked + recovery
+	consumed := ConsumeN(t, consumer, minExpected, 30*time.Second)
+	require.GreaterOrEqual(t, len(consumed), minExpected)
+
+	// Verify ordering: offsets should be monotonically increasing.
+	for i := 1; i < len(consumed); i++ {
+		require.Greater(t, consumed[i].Offset, consumed[i-1].Offset,
+			"offsets should be monotonically increasing at position %d", i)
+	}
+	t.Logf("consumed %d records total (acked %d + extras)", len(consumed), ackedCount)
 }
