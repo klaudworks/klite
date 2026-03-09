@@ -21,7 +21,7 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
     </div>
     <div class="calc-field">
       <label for="consumers">S3-tier consumers <span class="info-icon" data-tip="Consumers reading data already flushed to S3 (lagging behind the WAL). Real-time consumers reading from the WAL generate zero S3 calls.">i</span></label>
-      <input type="number" id="consumers" value="1" min="0" />
+      <input type="number" id="consumers" value="0" min="0" />
     </div>
     <div class="calc-field">
       <label for="retention">Retention (days) <span class="info-icon" data-tip="How long data is kept in S3 before deletion. Directly determines storage volume.">i</span></label>
@@ -140,8 +140,13 @@ After the listing cache append optimization, **PUTs are the largest API cost**. 
     content: attr(data-tip);
     position: absolute;
     bottom: calc(100% + 0.4rem);
-    left: 0;
     width: 220px;
+  }
+  .calc-field:nth-child(odd) .info-icon:hover::after {
+    left: 0;
+  }
+  .calc-field:nth-child(even) .info-icon:hover::after {
+    right: 0;
     padding: 0.5rem 0.6rem;
     font-size: 0.75rem;
     font-style: normal;
