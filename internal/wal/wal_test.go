@@ -3,6 +3,8 @@ package wal
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -30,6 +32,83 @@ func makeTestBatch(numRecords int32, maxTimestamp int64) []byte {
 	binary.BigEndian.PutUint32(raw[53:57], ^uint32(0)) // baseSequence = -1
 	binary.BigEndian.PutUint32(raw[57:61], uint32(numRecords))
 	return raw
+}
+
+type scriptedWriter struct {
+	writes []scriptedWrite
+	call   int
+	buf    bytes.Buffer
+}
+
+type scriptedWrite struct {
+	n   int
+	err error
+}
+
+func (w *scriptedWriter) Write(p []byte) (int, error) {
+	if w.call >= len(w.writes) {
+		_, _ = w.buf.Write(p)
+		return len(p), nil
+	}
+	step := w.writes[w.call]
+	w.call++
+	n := step.n
+	if n > len(p) {
+		n = len(p)
+	}
+	if n > 0 {
+		_, _ = w.buf.Write(p[:n])
+	}
+	return n, step.err
+}
+
+func TestWriteAll(t *testing.T) {
+	t.Parallel()
+
+	t.Run("retries partial writes", func(t *testing.T) {
+		t.Parallel()
+
+		sw := &scriptedWriter{writes: []scriptedWrite{{n: 3}, {n: 2}}}
+		payload := []byte("abcdef")
+
+		n, err := writeAll(sw, payload)
+		if err != nil {
+			t.Fatalf("writeAll returned error: %v", err)
+		}
+		if n != len(payload) {
+			t.Fatalf("bytes written: got %d want %d", n, len(payload))
+		}
+		if got := sw.buf.Bytes(); !bytes.Equal(got, payload) {
+			t.Fatalf("payload mismatch: got %q want %q", got, payload)
+		}
+	})
+
+	t.Run("returns short write when writer makes no progress", func(t *testing.T) {
+		t.Parallel()
+
+		sw := &scriptedWriter{writes: []scriptedWrite{{n: 0}}}
+		n, err := writeAll(sw, []byte("abc"))
+		if n != 0 {
+			t.Fatalf("bytes written: got %d want 0", n)
+		}
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("error: got %v want %v", err, io.ErrShortWrite)
+		}
+	})
+
+	t.Run("returns partial byte count with write error", func(t *testing.T) {
+		t.Parallel()
+
+		boom := errors.New("boom")
+		sw := &scriptedWriter{writes: []scriptedWrite{{n: 2, err: boom}}}
+		n, err := writeAll(sw, []byte("abcd"))
+		if n != 2 {
+			t.Fatalf("bytes written: got %d want 2", n)
+		}
+		if !errors.Is(err, boom) {
+			t.Fatalf("error: got %v want %v", err, boom)
+		}
+	})
 }
 
 func TestMarshalUnmarshalEntry(t *testing.T) {

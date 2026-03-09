@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -580,12 +581,12 @@ func (w *Writer) appendEntry(serialized []byte) error {
 
 	fileOffset := w.current.size
 
-	n, err := w.current.file.Write(serialized)
+	n, err := writeAll(w.current.file, serialized)
+	w.current.size += int64(n)
+	w.diskUsage.Add(int64(n))
 	if err != nil {
 		return fmt.Errorf("write entry: %w", err)
 	}
-	w.current.size += int64(n)
-	w.diskUsage.Add(int64(n))
 
 	if len(serialized) > 4 {
 		entry, parseErr := UnmarshalEntry(serialized[4:]) // skip 4-byte length prefix
@@ -622,6 +623,21 @@ func (w *Writer) appendEntry(serialized []byte) error {
 	}
 
 	return nil
+}
+
+func writeAll(w io.Writer, p []byte) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := w.Write(p[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
 }
 
 func (w *Writer) flushAndSync(pending []writeRequest) {
