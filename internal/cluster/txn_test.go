@@ -1028,3 +1028,293 @@ func TestInitProducerIDReuseTxnIDResetsOngoingTxn(t *testing.T) {
 		t.Fatalf("TxnPartitions should be empty after re-init, got %d", len(ps.TxnPartitions))
 	}
 }
+
+// --- AddPartitionsToTxn tests ---
+
+func TestAddPartitionsToTxnHappyPath(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	pid, epoch, _ := m.InitProducerID("txn-apt", 5000)
+	tp0 := TopicPartition{Topic: "t", Partition: 0}
+	tp1 := TopicPartition{Topic: "t", Partition: 1}
+
+	errCode := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0, tp1})
+	if errCode != 0 {
+		t.Fatalf("AddPartitionsToTxn: errCode=%d, want 0", errCode)
+	}
+
+	ps := m.GetProducer(pid)
+	if ps.TxnState != TxnOngoing {
+		t.Fatalf("TxnState = %d, want TxnOngoing", ps.TxnState)
+	}
+	if !ps.TxnPartitions[tp0] || !ps.TxnPartitions[tp1] {
+		t.Fatalf("expected both partitions in TxnPartitions, got %v", ps.TxnPartitions)
+	}
+}
+
+func TestAddPartitionsToTxnUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	errCode := m.AddPartitionsToTxn(999, 0, []TopicPartition{{Topic: "t", Partition: 0}})
+	if errCode != 3 {
+		t.Fatalf("AddPartitionsToTxn unknown PID: errCode=%d, want 3", errCode)
+	}
+}
+
+func TestAddPartitionsToTxnFencedEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, _, _ := m.InitProducerID("txn-apt-fence", 5000)
+	// Re-init bumps epoch to 1.
+	_, epoch, _ := m.InitProducerID("txn-apt-fence", 5000)
+	_ = epoch
+
+	// Old epoch (0) should be fenced.
+	errCode := m.AddPartitionsToTxn(pid, 0, []TopicPartition{{Topic: "t", Partition: 0}})
+	if errCode != 35 {
+		t.Fatalf("AddPartitionsToTxn fenced: errCode=%d, want 35 (PRODUCER_FENCED)", errCode)
+	}
+}
+
+func TestAddPartitionsToTxnFutureEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-apt-future", 5000)
+
+	errCode := m.AddPartitionsToTxn(pid, epoch+1, []TopicPartition{{Topic: "t", Partition: 0}})
+	if errCode != 47 {
+		t.Fatalf("AddPartitionsToTxn future epoch: errCode=%d, want 47 (INVALID_PRODUCER_EPOCH)", errCode)
+	}
+}
+
+func TestAddPartitionsToTxnNonTransactional(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	// Non-transactional producer (empty txnID).
+	pid, epoch, _ := m.InitProducerID("", 0)
+
+	errCode := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{{Topic: "t", Partition: 0}})
+	if errCode != 49 {
+		t.Fatalf("AddPartitionsToTxn non-transactional: errCode=%d, want 49", errCode)
+	}
+}
+
+func TestAddPartitionsToTxnAddsToExisting(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-apt-add", 5000)
+	tp0 := TopicPartition{Topic: "t", Partition: 0}
+	tp1 := TopicPartition{Topic: "t", Partition: 1}
+
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0})
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp1})
+
+	ps := m.GetProducer(pid)
+	if len(ps.TxnPartitions) != 2 {
+		t.Fatalf("expected 2 partitions, got %d", len(ps.TxnPartitions))
+	}
+	if !ps.TxnPartitions[tp0] || !ps.TxnPartitions[tp1] {
+		t.Fatalf("expected both partitions, got %v", ps.TxnPartitions)
+	}
+}
+
+// --- UpdateDedupOffset tests ---
+
+func TestUpdateDedupOffset(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	pid, _, _ := m.InitProducerID("", 0)
+
+	// Produce a batch with a tentative offset of 0.
+	errCode, isDup, _ := m.ValidateAndDedup(pid, 0, tp, 0, 5, 0)
+	if errCode != 0 || isDup {
+		t.Fatalf("initial produce: errCode=%d isDup=%v", errCode, isDup)
+	}
+
+	// Update the offset to the actual assigned value.
+	m.UpdateDedupOffset(pid, tp, 0, 42)
+
+	// Retry should return the updated offset.
+	errCode, isDup, dupOff := m.ValidateAndDedup(pid, 0, tp, 0, 5, 999)
+	if errCode != 0 {
+		t.Fatalf("retry: errCode=%d", errCode)
+	}
+	if !isDup {
+		t.Fatal("retry should be detected as duplicate")
+	}
+	if dupOff != 42 {
+		t.Fatalf("dupOffset = %d, want 42", dupOff)
+	}
+}
+
+func TestUpdateDedupOffsetUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	// Should not panic.
+	m.UpdateDedupOffset(999, TopicPartition{Topic: "t", Partition: 0}, 0, 100)
+}
+
+func TestUpdateDedupOffsetUnknownPartition(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, _, _ := m.InitProducerID("", 0)
+
+	// Should not panic — PID exists but partition has no window.
+	m.UpdateDedupOffset(pid, TopicPartition{Topic: "t", Partition: 99}, 0, 100)
+}
+
+// --- GetProducersForPartition tests ---
+
+func TestGetProducersForPartition(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	// Create two producers that have written to the same partition.
+	pid1, _, _ := m.InitProducerID("", 0)
+	m.ValidateAndDedup(pid1, 0, tp, 0, 5, 0)
+
+	pid2, _, _ := m.InitProducerID("", 0)
+	m.ValidateAndDedup(pid2, 0, tp, 0, 3, 100)
+
+	// A third producer writing to a different partition.
+	pid3, _, _ := m.InitProducerID("", 0)
+	m.ValidateAndDedup(pid3, 0, TopicPartition{Topic: "t", Partition: 1}, 0, 1, 200)
+
+	snaps := m.GetProducersForPartition("t", 0)
+	if len(snaps) != 2 {
+		t.Fatalf("expected 2 producers for t-0, got %d", len(snaps))
+	}
+
+	found := map[int64]ProducerSnapshot{}
+	for _, s := range snaps {
+		found[s.ProducerID] = s
+	}
+
+	s1, ok := found[pid1]
+	if !ok {
+		t.Fatalf("producer %d not found in results", pid1)
+	}
+	if s1.LastSequence != 4 {
+		t.Fatalf("pid1 LastSequence = %d, want 4", s1.LastSequence)
+	}
+
+	s2, ok := found[pid2]
+	if !ok {
+		t.Fatalf("producer %d not found in results", pid2)
+	}
+	if s2.LastSequence != 2 {
+		t.Fatalf("pid2 LastSequence = %d, want 2", s2.LastSequence)
+	}
+}
+
+func TestGetProducersForPartitionWithTxn(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	tp := TopicPartition{Topic: "t", Partition: 0}
+
+	pid, epoch, _ := m.InitProducerID("txn-gpp", 5000)
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	m.ValidateAndDedup(pid, epoch, tp, 0, 5, 0)
+	m.RecordTxnBatch(pid, "t", 0, 50)
+
+	snaps := m.GetProducersForPartition("t", 0)
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 producer, got %d", len(snaps))
+	}
+
+	s := snaps[0]
+	if s.ProducerID != pid {
+		t.Fatalf("ProducerID = %d, want %d", s.ProducerID, pid)
+	}
+	if s.LastSequence != 4 {
+		t.Fatalf("LastSequence = %d, want 4", s.LastSequence)
+	}
+	if s.TxnStartOffset != 50 {
+		t.Fatalf("TxnStartOffset = %d, want 50", s.TxnStartOffset)
+	}
+	if s.TxnState != TxnOngoing {
+		t.Fatalf("TxnState = %d, want TxnOngoing", s.TxnState)
+	}
+}
+
+func TestGetProducersForPartitionEmpty(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	snaps := m.GetProducersForPartition("nonexistent", 0)
+	if len(snaps) != 0 {
+		t.Fatalf("expected 0 producers, got %d", len(snaps))
+	}
+}
+
+// --- Concurrent access race test ---
+
+func TestProducerIDManagerConcurrentAccess(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	const goroutines = 10
+	const opsPerGoroutine = 50
+
+	// Pre-create some transactional producers.
+	var pids [goroutines]int64
+	var epochs [goroutines]int16
+	for i := range goroutines {
+		txnID := ""
+		if i%2 == 0 {
+			txnID = "txn-" + string(rune('a'+i))
+		}
+		pids[i], epochs[i], _ = m.InitProducerID(txnID, 5000)
+	}
+
+	done := make(chan struct{})
+	for i := range goroutines {
+		go func(idx int) {
+			defer func() { done <- struct{}{} }()
+			pid := pids[idx]
+			epoch := epochs[idx]
+			tp := TopicPartition{Topic: "t", Partition: int32(idx % 3)}
+
+			for j := range opsPerGoroutine {
+				switch j % 5 {
+				case 0:
+					m.ValidateAndDedup(pid, epoch, tp, int32(j*5), 5, int64(j*100))
+				case 1:
+					m.GetProducersForPartition("t", int32(idx%3))
+				case 2:
+					if idx%2 == 0 {
+						m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+					}
+				case 3:
+					if idx%2 == 0 {
+						m.AddOffsetsToTxn(pid, epoch, "group-race")
+					}
+				case 4:
+					m.UpdateDedupOffset(pid, tp, int32(j*5), int64(j*100+1))
+				}
+			}
+		}(i)
+	}
+
+	for range goroutines {
+		<-done
+	}
+}
