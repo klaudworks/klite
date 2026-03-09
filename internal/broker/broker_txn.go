@@ -104,6 +104,7 @@ func (b *Broker) abortExpiredTransactions() {
 					"topic", pc.tp.Topic, "partition", pc.tp.Partition, "err", walErr)
 				pc.pd.Lock()
 				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
+				pc.pd.RemoveOpenTxn(endState.ProducerID)
 				pc.pd.Unlock()
 				continue
 			}

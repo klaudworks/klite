@@ -102,6 +102,7 @@ func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) 
 					"baseOffset", pc.baseOffset, "err", walErr)
 				pc.pd.Lock()
 				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
+				pc.pd.RemoveOpenTxn(endState.ProducerID)
 				pc.pd.Unlock()
 				resp.ErrorCode = kerr.KafkaStorageError.Code
 				continue

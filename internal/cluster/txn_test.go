@@ -1318,3 +1318,95 @@ func TestProducerIDManagerConcurrentAccess(t *testing.T) {
 		<-done
 	}
 }
+
+// TestLSOStallAfterPrepareEndTxnWithoutRemoveOpenTxn proves that if
+// PrepareEndTxn transitions a producer's TxnState to TxnNone but the
+// partition's openTxnPIDs entry is NOT removed, the LSO is permanently
+// stuck: ExpiredTransactions returns empty (the PID won't be retried)
+// while LSO remains pinned at the open txn's first offset.
+func TestLSOStallAfterPrepareEndTxnWithoutRemoveOpenTxn(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	pid, epoch, errCode := m.InitProducerID("txn-stall", 5000)
+	if errCode != 0 {
+		t.Fatalf("InitProducerID errCode=%d", errCode)
+	}
+
+	tp := TopicPartition{Topic: "test-topic", Partition: 0}
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("AddPartitionsToTxn errCode=%d", ec)
+	}
+	m.RecordTxnBatch(pid, "test-topic", 0, 0)
+
+	// Set up partition: HW at 10, open txn from offset 0.
+	pd := &PartData{}
+	pd.Lock()
+	pd.SetHW(10)
+	pd.AddOpenTxn(pid, 0)
+	pd.Unlock()
+
+	// LSO should be pinned at 0 (open txn blocks it).
+	pd.RLock()
+	if lso := pd.LSO(); lso != 0 {
+		t.Fatalf("LSO before PrepareEndTxn = %d, want 0", lso)
+	}
+	pd.RUnlock()
+
+	// Advance clock past timeout so the txn is expired.
+	fc.Advance(6 * time.Second)
+
+	expired := m.ExpiredTransactions()
+	if len(expired) != 1 {
+		t.Fatalf("expected 1 expired txn, got %d", len(expired))
+	}
+
+	// PrepareEndTxn transitions TxnState to TxnNone.
+	_, ec := m.PrepareEndTxn(pid, epoch, false)
+	if ec != 0 {
+		t.Fatalf("PrepareEndTxn errCode=%d", ec)
+	}
+
+	// Simulate WAL failure path: SkipOffsets is called but RemoveOpenTxn is NOT.
+	// (This is the bug in abortExpiredTransactions.)
+	pd.Lock()
+	pd.SkipOffsets(10, 1) // skip the control batch offset
+	pd.Unlock()
+
+	// ExpiredTransactions should now return empty — the PID has TxnState == TxnNone.
+	expired = m.ExpiredTransactions()
+	if len(expired) != 0 {
+		t.Fatalf("expected 0 expired txns after PrepareEndTxn, got %d", len(expired))
+	}
+
+	// But LSO is still stuck at 0 — the openTxnPIDs entry was never removed.
+	pd.RLock()
+	lso := pd.LSO()
+	openPIDs := pd.OpenTxnPIDs()
+	pd.RUnlock()
+
+	if lso != 0 {
+		t.Fatalf("LSO = %d, want 0 (still stuck without RemoveOpenTxn)", lso)
+	}
+	if len(openPIDs) != 1 {
+		t.Fatalf("expected 1 open txn PID still present, got %d", len(openPIDs))
+	}
+
+	// Fix: calling RemoveOpenTxn should unstick the LSO.
+	pd.Lock()
+	pd.RemoveOpenTxn(pid)
+	pd.Unlock()
+
+	pd.RLock()
+	lsoAfter := pd.LSO()
+	hwAfter := pd.HW()
+	pd.RUnlock()
+
+	// After RemoveOpenTxn, LSO should equal HW (11 due to SkipOffsets advancing past 10).
+	if lsoAfter != hwAfter {
+		t.Fatalf("LSO after RemoveOpenTxn = %d, want HW = %d", lsoAfter, hwAfter)
+	}
+}
