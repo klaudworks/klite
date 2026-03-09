@@ -927,6 +927,53 @@ func TestWriterAcks1_ReplFailureDoesNotAffectProducer(t *testing.T) {
 	repl.resolvePending(0, fmt.Errorf("repl: standby crashed"))
 }
 
+func TestReadSequenceBatch(t *testing.T) {
+	t.Parallel()
+
+	w := newTestWriter(t, nil)
+	topicID := [16]byte{1, 2, 3}
+
+	for i := 0; i < 5; i++ {
+		e := &Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      makeTestBatch(1, 1000),
+		}
+		if err := w.Append(e); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	batch, first, last, count, err := w.ReadSequenceBatch(1, 3, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadSequenceBatch: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("count: got %d, want 3", count)
+	}
+	if first != 1 || last != 3 {
+		t.Fatalf("range: got [%d,%d], want [1,3]", first, last)
+	}
+
+	var seqs []uint64
+	reader := bytes.NewReader(batch)
+	_, scanErr := ScanFramedEntries(reader, func(payload []byte) bool {
+		e, parseErr := UnmarshalEntry(payload)
+		if parseErr != nil {
+			t.Fatalf("UnmarshalEntry: %v", parseErr)
+		}
+		seqs = append(seqs, e.Sequence)
+		return true
+	})
+	if scanErr != nil {
+		t.Fatalf("ScanFramedEntries: %v", scanErr)
+	}
+	if len(seqs) != 3 || seqs[0] != 1 || seqs[1] != 2 || seqs[2] != 3 {
+		t.Fatalf("unexpected sequence list: %v", seqs)
+	}
+}
+
 func TestWriterMixedAcks_SplitBatch(t *testing.T) {
 	t.Parallel()
 

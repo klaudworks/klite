@@ -999,6 +999,95 @@ func (w *Writer) ReadBatch(entry IndexEntry) ([]byte, error) {
 	return parsed.Data, nil
 }
 
+// ReadSequenceBatch returns a serialized WAL batch (length-prefixed entries)
+// containing entries with sequence in [startSeq, endSeq], capped at maxBytes.
+// It returns the first/last sequence included and the number of entries.
+func (w *Writer) ReadSequenceBatch(startSeq, endSeq uint64, maxBytes int) ([]byte, uint64, uint64, int, error) {
+	if startSeq > endSeq {
+		return nil, 0, 0, 0, nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = 4 * 1024 * 1024
+	}
+
+	type segSnapshot struct {
+		path   string
+		minSeq uint64
+		maxSeq uint64
+	}
+
+	w.segMu.Lock()
+	segments := make([]segSnapshot, 0, len(w.segments))
+	for _, seg := range w.segments {
+		segments = append(segments, segSnapshot{path: seg.path, minSeq: seg.minSeq, maxSeq: seg.maxSeq})
+	}
+	w.segMu.Unlock()
+
+	batch := make([]byte, 0, maxBytes)
+	var firstSeq uint64
+	var lastSeq uint64
+	count := 0
+	stopAll := false
+
+	for _, seg := range segments {
+		if stopAll {
+			break
+		}
+		if seg.minSeq == math.MaxUint64 {
+			continue
+		}
+		if seg.maxSeq < startSeq || seg.minSeq > endSeq {
+			continue
+		}
+
+		f, err := os.Open(seg.path)
+		if err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("open segment for sequence batch: %w", err)
+		}
+
+		_, scanErr := ScanFramedEntries(f, func(payload []byte) bool {
+			entry, parseErr := UnmarshalEntry(payload)
+			if parseErr != nil {
+				return false
+			}
+			seq := entry.Sequence
+			if seq < startSeq {
+				return true
+			}
+			if seq > endSeq {
+				stopAll = true
+				return false
+			}
+
+			entryBytes := 4 + len(payload)
+			if count > 0 && len(batch)+entryBytes > maxBytes {
+				stopAll = true
+				return false
+			}
+
+			if count == 0 {
+				firstSeq = seq
+			}
+			lastSeq = seq
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+			batch = append(batch, lenBuf[:]...)
+			batch = append(batch, payload...)
+			count++
+			return true
+		})
+		_ = f.Close()
+		if scanErr != nil {
+			return nil, 0, 0, 0, fmt.Errorf("scan segment for sequence batch: %w", scanErr)
+		}
+	}
+
+	if count == 0 {
+		return nil, 0, 0, 0, nil
+	}
+	return batch, firstSeq, lastSeq, count, nil
+}
+
 // Replay scans all WAL segments and calls fn for each valid entry.
 // Used during startup to rebuild in-memory state.
 // If the last segment has a corrupted tail (CRC mismatch or truncated entry),

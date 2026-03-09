@@ -313,6 +313,10 @@ func newHandshakeBroker(t *testing.T, clk clock.Clock, epoch uint64) *Broker {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w.Stop)
 	w.SetNextSequence(42)
 
 	metaLog, err := metadata.NewLog(metadata.LogConfig{DataDir: dir})
@@ -609,4 +613,92 @@ func TestKeepaliveLoop_StopsOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("keepaliveLoop did not exit after context cancel")
 	}
+}
+
+func TestHandleStandbyConn_BackfillsMissingWALOnReconnect(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.Now())
+	brokerEpoch := uint64(9)
+	b := newHandshakeBroker(t, clk, brokerEpoch)
+
+	// Seed WAL with sequences 0,1,2.
+	b.walWriter.SetNextSequence(0)
+	topicID := [16]byte{1, 2, 3}
+	for i := 0; i < 3; i++ {
+		err := b.walWriter.Append(&wal.Entry{
+			TopicID:   topicID,
+			Partition: 0,
+			Offset:    int64(i),
+			Data:      make([]byte, 27),
+		})
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	brokerConn, standbyConn := net.Pipe()
+	defer standbyConn.Close() //nolint:errcheck
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type result struct {
+		msgType byte
+		payload []byte
+		err     error
+	}
+	resCh := make(chan result, 1)
+
+	go func() {
+		var r result
+		hello := repl.MarshalHello(0, brokerEpoch) // standby has seq 0, missing 1 and 2
+		if err := repl.WriteFrame(standbyConn, repl.MsgHello, hello); err != nil {
+			r.err = err
+			resCh <- r
+			return
+		}
+
+		r.msgType, r.payload, r.err = repl.ReadFrame(standbyConn)
+		if r.err != nil {
+			resCh <- r
+			return
+		}
+
+		_, lastSeq, _, _, _, err := repl.UnmarshalWALBatch(r.payload)
+		if err != nil {
+			r.err = err
+			resCh <- r
+			return
+		}
+
+		r.err = repl.WriteFrame(standbyConn, repl.MsgACK, repl.MarshalACK(lastSeq))
+		resCh <- r
+	}()
+
+	b.handleStandbyConn(ctx, brokerConn)
+
+	r := <-resCh
+	if r.err != nil {
+		t.Fatalf("standby handshake/read failed: %v", r.err)
+	}
+	if r.msgType != repl.MsgWALBatch {
+		t.Fatalf("expected WAL_BATCH backfill, got type 0x%02x", r.msgType)
+	}
+
+	firstSeq, lastSeq, entryCount, _, _, err := repl.UnmarshalWALBatch(r.payload)
+	if err != nil {
+		t.Fatalf("unmarshal WAL_BATCH: %v", err)
+	}
+	if firstSeq != 1 || lastSeq != 2 {
+		t.Fatalf("backfill range: got [%d,%d], want [1,2]", firstSeq, lastSeq)
+	}
+	if entryCount != 2 {
+		t.Fatalf("backfill entryCount: got %d, want 2", entryCount)
+	}
+
+	if b.replSender == nil {
+		t.Fatal("replSender should be set after successful reconnect")
+	}
+	b.replSender.Close()
 }

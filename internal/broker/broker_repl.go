@@ -543,6 +543,14 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 	sender.S3FlushWatermarkFn = b.walWriter.S3FlushWatermark
 	b.replSender = sender
 
+	// Best-effort WAL backfill for reconnects within the same epoch.
+	// This closes the historical gap while the standby was disconnected.
+	if epoch != 0 && epoch == b.currentEpoch() {
+		if err := b.backfillStandbyFromWAL(sender, lastWALSeq); err != nil {
+			b.logger.Warn("replication: WAL backfill on reconnect failed", "err", err)
+		}
+	}
+
 	b.walWriter.SetReplicator(sender)
 
 	// Re-wire metadata hooks
@@ -572,6 +580,61 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 
 	// Start keepalive goroutine
 	go b.keepaliveLoop(ctx, sender)
+}
+
+func (b *Broker) backfillStandbyFromWAL(sender *repl.Sender, standbyLastSeq uint64) error {
+	if b.walWriter == nil {
+		return nil
+	}
+
+	nextSeq := b.walWriter.NextSequence()
+	startSeq := standbyLastSeq + 1
+	if startSeq >= nextSeq {
+		return nil
+	}
+
+	const maxBatchBytes = 4 * 1024 * 1024
+	var sentEntries int
+	var sentFrom uint64
+	var sentTo uint64
+
+	for startSeq < nextSeq {
+		batch, firstSeq, lastSeq, count, err := b.walWriter.ReadSequenceBatch(startSeq, nextSeq-1, maxBatchBytes)
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			break
+		}
+		if firstSeq > startSeq {
+			b.logger.Warn("replication backfill gap detected",
+				"requested_start_seq", startSeq,
+				"available_start_seq", firstSeq,
+				"requested_end_seq", nextSeq-1)
+		}
+
+		if err := <-sender.Send(batch, firstSeq, lastSeq); err != nil {
+			return err
+		}
+
+		if sentEntries == 0 {
+			sentFrom = firstSeq
+		}
+		sentTo = lastSeq
+		sentEntries += count
+		startSeq = lastSeq + 1
+		nextSeq = b.walWriter.NextSequence()
+	}
+
+	if sentEntries > 0 {
+		b.logger.Info("replication backfill complete",
+			"entries", sentEntries,
+			"from_seq", sentFrom,
+			"to_seq", sentTo,
+			"standby_last_seq", standbyLastSeq)
+	}
+
+	return nil
 }
 
 // keepaliveLoop sends empty WAL_BATCH (keepalive) every 5s while the sender is connected.
