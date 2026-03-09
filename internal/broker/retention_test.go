@@ -274,6 +274,177 @@ func TestRetentionBySizeWithCorruptFooterStillProgresses(t *testing.T) {
 	}
 }
 
+func TestRetentionPartialDeleteFailureAdvancesOnlyPastDeletedObjects(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(999999999))
+	b, mem := newRetentionTestBroker(t, clk)
+
+	topic := "partial-delete-failure-test"
+	b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+		"retention.ms": "1000",
+	})
+
+	tid := topicID(b, topic)
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{1000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{2000})
+	putTestObject(t, mem, topic, tid, 0, 2, []int64{3000})
+	setPartitionHW(t, b, topic, 0, 3)
+
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: &deleteFailAfterNS3{InMemoryS3: mem, failAfter: 1},
+		Bucket:   "test-bucket",
+		Prefix:   "klite/test",
+		Logger:   b.logger,
+	})
+
+	b.enforceRetention(context.Background())
+
+	keys := listObjectKeys(t, mem, topic, tid, 0)
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 objects after partial delete failure, got %d", len(keys))
+	}
+	if strings.HasSuffix(keys[0], "/00000000000000000000.obj") {
+		t.Fatalf("expected oldest object to be deleted, got keys %v", keys)
+	}
+
+	td := b.state.GetTopic(topic)
+	td.Partitions[0].RLock()
+	logStart := td.Partitions[0].LogStart()
+	td.Partitions[0].RUnlock()
+	if logStart != 1 {
+		t.Fatalf("logStartOffset: got %d, want 1", logStart)
+	}
+}
+
+func TestRetentionByTimeAndSizeCombined(t *testing.T) {
+	t.Parallel()
+
+	t.Run("union of time and size deletions", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.UnixMilli(100000))
+		b, mem := newRetentionTestBroker(t, clk)
+
+		topic := "time-size-union-test"
+		b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+			"retention.ms":    "5000",
+			"retention.bytes": "-1",
+		})
+
+		tid := topicID(b, topic)
+		putTestObject(t, mem, topic, tid, 0, 0, []int64{80000})
+		putTestObject(t, mem, topic, tid, 0, 1, []int64{98000})
+		putTestObject(t, mem, topic, tid, 0, 2, []int64{99000})
+		putTestObject(t, mem, topic, tid, 0, 3, []int64{99500})
+		setPartitionHW(t, b, topic, 0, 4)
+
+		client := s3store.NewClient(s3store.ClientConfig{S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test"})
+		objs, err := client.ListObjects(context.Background(), s3store.ObjectKeyPrefix("klite/test", topic, tid, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := s3store.NewReader(client, nil)
+		footer0, err := reader.GetFooter(context.Background(), objs[0].Key, objs[0].Size)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		b.state.SetTopicConfig(topic, "retention.bytes", intToStr(2*footer0.DataSize()+1))
+
+		b.enforceRetention(context.Background())
+
+		keys := listObjectKeys(t, mem, topic, tid, 0)
+		if len(keys) != 2 {
+			t.Fatalf("expected 2 objects after combined retention, got %d", len(keys))
+		}
+		if !strings.HasSuffix(keys[0], "/00000000000000000002.obj") {
+			t.Fatalf("expected offset 2 object to remain, got %q", keys[0])
+		}
+		if !strings.HasSuffix(keys[1], "/00000000000000000003.obj") {
+			t.Fatalf("expected offset 3 object to remain, got %q", keys[1])
+		}
+	})
+
+	t.Run("time-deleted data reduces size pressure", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.UnixMilli(100000))
+		b, mem := newRetentionTestBroker(t, clk)
+
+		topic := "time-size-interaction-test"
+		b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+			"retention.ms":    "5000",
+			"retention.bytes": "-1",
+		})
+
+		tid := topicID(b, topic)
+		putTestObject(t, mem, topic, tid, 0, 0, []int64{80000})
+		putTestObject(t, mem, topic, tid, 0, 1, []int64{98000})
+		putTestObject(t, mem, topic, tid, 0, 2, []int64{99000})
+		setPartitionHW(t, b, topic, 0, 3)
+
+		client := s3store.NewClient(s3store.ClientConfig{S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test"})
+		objs, err := client.ListObjects(context.Background(), s3store.ObjectKeyPrefix("klite/test", topic, tid, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := s3store.NewReader(client, nil)
+		footer0, err := reader.GetFooter(context.Background(), objs[0].Key, objs[0].Size)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		b.state.SetTopicConfig(topic, "retention.bytes", intToStr(2*footer0.DataSize()+1))
+
+		b.enforceRetention(context.Background())
+
+		keys := listObjectKeys(t, mem, topic, tid, 0)
+		if len(keys) != 2 {
+			t.Fatalf("expected only time-expired object to be deleted, got %d remaining", len(keys))
+		}
+		if !strings.HasSuffix(keys[0], "/00000000000000000001.obj") {
+			t.Fatalf("expected offset 1 object to remain, got %q", keys[0])
+		}
+		if !strings.HasSuffix(keys[1], "/00000000000000000002.obj") {
+			t.Fatalf("expected offset 2 object to remain, got %q", keys[1])
+		}
+	})
+}
+
+func TestRetentionBytesZeroKeepsLastObject(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(100000))
+	b, mem := newRetentionTestBroker(t, clk)
+
+	topic := "retention-bytes-zero-test"
+	b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+		"retention.ms":    "-1",
+		"retention.bytes": "0",
+	})
+
+	tid := topicID(b, topic)
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{90000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{91000})
+	putTestObject(t, mem, topic, tid, 0, 2, []int64{92000})
+	setPartitionHW(t, b, topic, 0, 3)
+
+	b.enforceRetention(context.Background())
+
+	keys := listObjectKeys(t, mem, topic, tid, 0)
+	if len(keys) != 1 {
+		t.Fatalf("expected only last object to remain, got %d", len(keys))
+	}
+	if !strings.HasSuffix(keys[0], "/00000000000000000002.obj") {
+		t.Fatalf("expected newest object to remain, got %q", keys[0])
+	}
+
+	td := b.state.GetTopic(topic)
+	td.Partitions[0].RLock()
+	logStart := td.Partitions[0].LogStart()
+	td.Partitions[0].RUnlock()
+	if logStart != 2 {
+		t.Fatalf("logStartOffset: got %d, want 2", logStart)
+	}
+}
+
 func TestRetentionNeverDeletesLastObject(t *testing.T) {
 	t.Parallel()
 
@@ -638,6 +809,20 @@ func (c *cancelOnListS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObj
 		c.cancel()
 	}
 	return c.InMemoryS3.ListObjectsV2(ctx, input, opts...)
+}
+
+type deleteFailAfterNS3 struct {
+	*s3store.InMemoryS3
+	failAfter int
+	deletes   int
+}
+
+func (d *deleteFailAfterNS3) DeleteObject(ctx context.Context, input *s3svc.DeleteObjectInput, opts ...func(*s3svc.Options)) (*s3svc.DeleteObjectOutput, error) {
+	if d.deletes >= d.failAfter {
+		return nil, errors.New("injected delete failure")
+	}
+	d.deletes++
+	return d.InMemoryS3.DeleteObject(ctx, input, opts...)
 }
 
 func intToStr(n int64) string {
