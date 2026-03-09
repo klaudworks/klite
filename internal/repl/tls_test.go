@@ -208,7 +208,10 @@ func TestEnsureTLSRejectsRogue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rogueCASerial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	rogueCASerial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
 	rogueCACert := &x509.Certificate{
 		SerialNumber:          rogueCASerial,
 		Subject:               pkix.Name{CommonName: "rogue-ca"},
@@ -227,7 +230,10 @@ func TestEnsureTLSRejectsRogue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rogueNodeSerial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	rogueNodeSerial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
 	rogueNodeCert := &x509.Certificate{
 		SerialNumber: rogueNodeSerial,
 		Subject:      pkix.Name{CommonName: "rogue-node"},
@@ -236,20 +242,29 @@ func TestEnsureTLSRejectsRogue(t *testing.T) {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
-	parsedRogueCA, _ := x509.ParseCertificate(rogueCACertDER)
+	parsedRogueCA, err := x509.ParseCertificate(rogueCACertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
 	rogueNodeCertDER, err := x509.CreateCertificate(rand.Reader, rogueNodeCert, parsedRogueCA, &rogueNodeKey.PublicKey, rogueCA)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rogueNodeCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rogueNodeCertDER})
-	rogueNodeKeyDER, _ := x509.MarshalECPrivateKey(rogueNodeKey)
+	rogueNodeKeyDER, err := x509.MarshalECPrivateKey(rogueNodeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	rogueNodeKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: rogueNodeKeyDER})
 	rogueCACertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rogueCACertDER})
 
 	roguePool := x509.NewCertPool()
 	roguePool.AppendCertsFromPEM(rogueCACertPEM)
-	rogueTLSCert, _ := tls.X509KeyPair(rogueNodeCertPEM, rogueNodeKeyPEM)
+	rogueTLSCert, err := tls.X509KeyPair(rogueNodeCertPEM, rogueNodeKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	rogueCfg := &tls.Config{
 		Certificates: []tls.Certificate{rogueTLSCert},
