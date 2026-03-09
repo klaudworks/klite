@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"hash/crc32"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -714,19 +715,19 @@ func TestIdempotentProduceConcurrent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	var errCount int64
+	var errCount atomic.Int64
 	payload := make([]byte, 200)
 	for i := 0; i < numRecords; i++ {
 		rec := &kgo.Record{Partition: 0, Value: payload}
 		cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
 			if err != nil {
-				errCount++
+				errCount.Add(1)
 			}
 		})
 	}
 
 	require.NoError(t, cl.Flush(ctx))
-	require.Zero(t, errCount, "expected zero produce errors with idempotent writes")
+	require.Zero(t, errCount.Load(), "expected zero produce errors with idempotent writes")
 
 	// Consume and verify all records arrived
 	consumer := NewClient(t, tb.Addr,
