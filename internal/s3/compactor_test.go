@@ -1390,10 +1390,11 @@ func TestFilterBatches_PartialFiltering(t *testing.T) {
 	require.NoError(t, err)
 
 	var keys []string
-	_ = IterateRecords(decompressed, func(r Record) bool {
+	err = IterateRecords(decompressed, func(r Record) bool {
 		keys = append(keys, string(r.Key))
 		return true
 	})
+	require.NoError(t, err)
 	assert.Equal(t, []string{"B"}, keys, "only B should survive partial filtering")
 }
 
@@ -1583,12 +1584,13 @@ func TestFilterBatches_NullKeysAlwaysRetained(t *testing.T) {
 	require.NoError(t, err)
 
 	var nullKeyFound bool
-	_ = IterateRecords(decompressed, func(r Record) bool {
+	err = IterateRecords(decompressed, func(r Record) bool {
 		if r.Key == nil {
 			nullKeyFound = true
 		}
 		return true
 	})
+	require.NoError(t, err)
 	assert.True(t, nullKeyFound, "null-key record should be retained")
 }
 
@@ -1620,10 +1622,11 @@ func TestFilterBatches_CompressedBatch(t *testing.T) {
 	require.NoError(t, err)
 
 	var keys []string
-	_ = IterateRecords(decompressed, func(r Record) bool {
+	err = IterateRecords(decompressed, func(r Record) bool {
 		keys = append(keys, string(r.Key))
 		return true
 	})
+	require.NoError(t, err)
 	assert.Equal(t, []string{"B"}, keys)
 }
 
