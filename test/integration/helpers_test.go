@@ -101,6 +101,11 @@ func WithCompactionMinDirtyObjects(n int) BrokerOpt {
 	return func(c *broker.Config) { c.CompactionMinDirtyObjects = n }
 }
 
+// WithLogLevel sets the broker log level (e.g. "debug", "info", "warn", "error").
+func WithLogLevel(level string) BrokerOpt {
+	return func(c *broker.Config) { c.LogLevel = level }
+}
+
 // WithSASL enables SASL authentication with a pre-configured store.
 func WithSASL(store *sasl.Store) BrokerOpt {
 	return func(c *broker.Config) {
@@ -148,7 +153,7 @@ func StartBroker(t *testing.T, opts ...BrokerOpt) *TestBroker {
 	cfg.Listener = ln
 	cfg.HealthListener = healthLn
 	cfg.DataDir = t.TempDir()
-	cfg.LogLevel = "debug"
+	cfg.LogLevel = "warn"
 	for _, o := range opts {
 		o(&cfg)
 	}

@@ -43,6 +43,19 @@ Follow the **testing pyramid**: test at the lowest layer that can verify the beh
 - When adding a new feature, ask: "What is the cheapest test that can verify this?" — prefer unit over integration.
 - **`-race` is deterministic** — running `go test -race -count=5` does not catch more race conditions than `-count=1`. The race detector instruments every memory access; repeating runs only helps catch timing-dependent _logic_ flakiness, not data races. A single `-race -count=1` pass is sufficient.
 
+## Running Tests
+
+- **Do not use `-v` by default** when running tests. Go captures output and only displays it for failing tests, which keeps the output clean. Use `-v` only when actively debugging a specific test failure.
+- Integration and e2e test helpers default to `warn` log level. Use `WithLogLevel("debug")` only when debugging a specific test.
+
+```sh
+# Good: clean output, shows only failures
+go test ./test/integration/... -count=1 -race
+
+# Only when debugging a specific failure
+go test ./test/integration/ -run TestSpecificTest -v -count=1
+```
+
 ## Code Comments
 
 - Do not write low-value comments. Comments should be reserved for high-value information that is not easily understood by reading the code alone.
