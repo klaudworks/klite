@@ -141,12 +141,6 @@ After the listing cache append optimization, **PUTs are the largest API cost**. 
     position: absolute;
     bottom: calc(100% + 0.4rem);
     width: 220px;
-  }
-  .calc-field:nth-child(odd) .info-icon:hover::after {
-    left: 0;
-  }
-  .calc-field:nth-child(even) .info-icon:hover::after {
-    right: 0;
     padding: 0.5rem 0.6rem;
     font-size: 0.75rem;
     font-style: normal;
@@ -159,6 +153,12 @@ After the listing cache append optimization, **PUTs are the largest API cost**. 
     box-shadow: 0 2px 8px rgba(0,0,0,0.12);
     z-index: 10;
     pointer-events: none;
+  }
+  .calc-field:nth-child(odd) .info-icon:hover::after {
+    left: 0;
+  }
+  .calc-field:nth-child(even) .info-icon:hover::after {
+    right: 0;
   }
   .calc-results {
     margin-top: 1rem;
