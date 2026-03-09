@@ -1,6 +1,6 @@
 ---
 title: Object Storage Cost Calculator
-description: Estimate monthly object storage costs for your klite workload across AWS S3, GCS, and Azure Blob.
+description: Estimate monthly object storage costs for your klite workload across Hetzner, AWS S3, GCS, and Azure Blob.
 ---
 
 Estimate your monthly object storage costs based on your workload parameters.
@@ -14,7 +14,7 @@ Estimate your monthly object storage costs based on your workload parameters.
       <li role="presentation" class="tab"><a role="tab" class="provider-tab" data-provider="azure">Azure Blob (on roadmap)</a></li>
     </ul>
   </div>
-  <p class="provider-note" id="providerNote">US East (N. Virginia), S3 Standard.</p>
+  <p class="provider-note" id="providerNote">Fsn1 / Hel1, S3-compatible. Base fee includes 1 TB storage + 1 TB egress.</p>
 
   <div class="calc-grid">
     <div class="calc-field">
@@ -57,7 +57,7 @@ Estimate your monthly object storage costs based on your workload parameters.
         <tr><th></th><th>Count/month</th><th>Cost/month</th></tr>
       </thead>
       <tbody>
-        <tr id="baseFeeRow" style="display:none"><td>Base fee</td><td id="baseFeeNote"></td><td id="baseFeeCost">—</td></tr>
+        <tr id="baseFeeRow" style="display:none"><td id="baseFeeLabel">Base fee</td><td id="baseFeeNote"></td><td id="baseFeeCost">—</td></tr>
         <tr><td id="putLabel">PUT</td><td id="putCount">—</td><td id="putCost">—</td></tr>
         <tr><td id="getLabel">GET</td><td id="getCount">—</td><td id="getCost">—</td></tr>
         <tr><td id="listLabel">LIST</td><td id="listCount">—</td><td id="listCost">—</td></tr>
@@ -317,7 +317,8 @@ The main API cost driver is **object store reads**: consumers fetching data that
     var baseFeeRow = document.getElementById('baseFeeRow');
     if (p.baseFee > 0) {
       baseFeeRow.style.display = '';
-      document.getElementById('baseFeeNote').textContent = 'incl. ' + (p.includedStorageGB / 1024).toFixed(0) + ' TB storage';
+      document.getElementById('baseFeeLabel').textContent = 'Base fee (incl. 1 TB storage + 1 TB egress)';
+      document.getElementById('baseFeeNote').textContent = '';
       document.getElementById('baseFeeCost').textContent = usd(p.baseFee);
     } else {
       baseFeeRow.style.display = 'none';
