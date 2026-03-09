@@ -1165,6 +1165,7 @@ func TestIndexConcurrentAccess(t *testing.T) {
 					LastOffset:  offset,
 					BatchSize:   100,
 					WALSequence: uint64(offset),
+					SegmentSeq:  99, // must not overlap with PruneSegment(0..9) range
 				})
 			}
 		}(w)
