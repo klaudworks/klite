@@ -295,12 +295,13 @@ func TestCompactionNilKeyRetained(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key == nil {
 					nullKeyCount++
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 
@@ -364,12 +365,13 @@ func TestCompactionEmptyKeyDedup(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && len(r.Key) == 0 {
 					emptyKeyRecords = append(emptyKeyRecords, string(r.Value))
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 
@@ -439,12 +441,13 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && string(r.Key) == "A" && r.Value == nil {
 					tombstoneFound = true
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 	assert.True(t, tombstoneFound, "tombstone should be retained when within delete.retention.ms")
@@ -503,12 +506,13 @@ func TestCompactionTombstoneRetention(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil && string(r.Key) == "A" && r.Value == nil {
 					tombstoneFound = true
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 	assert.False(t, tombstoneFound, "tombstone should be removed after delete.retention.ms")
@@ -637,7 +641,7 @@ func TestCompactionPreservesOrder(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					records = append(records, keyOff{
 						key:    string(r.Key),
@@ -646,6 +650,7 @@ func TestCompactionPreservesOrder(t *testing.T) {
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 
@@ -782,10 +787,11 @@ func TestCompactionSparseOffsets(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				recordCount++
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 
@@ -1189,12 +1195,13 @@ func TestCompactionCompressionRoundTrip(t *testing.T) {
 					require.NoError(t, err)
 					decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 					require.NoError(t, err, "decompression should work after compaction")
-					_ = IterateRecords(decompressed, func(r Record) bool {
+					err = IterateRecords(decompressed, func(r Record) bool {
 						if r.Key != nil {
 							recordKeys = append(recordKeys, string(r.Key))
 						}
 						return true
 					})
+					require.NoError(t, err)
 				}
 			}
 
@@ -1713,12 +1720,13 @@ func TestCompactionIdempotent(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					keys1 = append(keys1, string(r.Key))
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 
@@ -1743,12 +1751,13 @@ func TestCompactionIdempotent(t *testing.T) {
 			require.NoError(t, err)
 			decompressed, err := DecompressRecords(batchRaw, header.CompressionCodec())
 			require.NoError(t, err)
-			_ = IterateRecords(decompressed, func(r Record) bool {
+			err = IterateRecords(decompressed, func(r Record) bool {
 				if r.Key != nil {
 					keys2 = append(keys2, string(r.Key))
 				}
 				return true
 			})
+			require.NoError(t, err)
 		}
 	}
 
