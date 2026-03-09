@@ -214,14 +214,17 @@ func TestAlterConfigsLegacy(t *testing.T) {
 	// Verify: retention.ms should be 5000, cleanup.policy should revert to default
 	resources, err := admin.DescribeTopicConfigs(ctx, "legacy-alter")
 	require.NoError(t, err)
+	var foundRetention, foundCleanup bool
 	for _, c := range resources[0].Configs {
 		if c.Key == "retention.ms" {
+			foundRetention = true
 			require.NotNil(t, c.Value)
 			require.Equal(t, "5000", *c.Value)
 			require.Equal(t, kmsg.ConfigSourceDynamicTopicConfig, c.Source,
 				"retention.ms should be a topic config override")
 		}
 		if c.Key == "cleanup.policy" {
+			foundCleanup = true
 			require.NotNil(t, c.Value)
 			require.Equal(t, "delete", *c.Value,
 				"cleanup.policy should revert to default after full replacement")
@@ -229,6 +232,8 @@ func TestAlterConfigsLegacy(t *testing.T) {
 				"cleanup.policy should be DEFAULT source after full replacement")
 		}
 	}
+	require.True(t, foundRetention, "retention.ms config should be present")
+	require.True(t, foundCleanup, "cleanup.policy config should be present")
 }
 
 // ---- DescribeGroups / ListGroups / DeleteGroups ----
