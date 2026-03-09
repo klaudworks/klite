@@ -215,13 +215,16 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
-// DeleteObjectsBatch deletes multiple objects (best-effort, errors are logged).
-func (c *Client) DeleteObjectsBatch(ctx context.Context, keys []string) {
+// DeleteObjectsBatch deletes multiple objects and returns how many failed.
+func (c *Client) DeleteObjectsBatch(ctx context.Context, keys []string) int {
+	failed := 0
 	for _, key := range keys {
 		if err := c.DeleteObject(ctx, key); err != nil {
+			failed++
 			c.logger.Warn("s3 delete failed", "key", key, "err", err)
 		}
 	}
+	return failed
 }
 
 func (c *Client) HeadObject(ctx context.Context, key string) (int64, error) {

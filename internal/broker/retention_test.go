@@ -703,6 +703,43 @@ func TestGCDeletedTopicDeletesObjectsAndHandlesEmptyList(t *testing.T) {
 	}
 }
 
+func TestGCDeletedTopicReenqueuesOnPartialDeleteFailure(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+
+	var flakyID [16]byte
+	flakyID[0] = 10
+	dt := cluster.DeletedTopic{Name: "flaky", TopicID: flakyID}
+	putTestObject(t, mem, dt.Name, dt.TopicID, 0, 0, []int64{90000})
+	putTestObject(t, mem, dt.Name, dt.TopicID, 0, 1, []int64{90000})
+
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: &deleteFailAfterNS3{InMemoryS3: mem, failAfter: 1},
+		Bucket:   "test-bucket",
+		Prefix:   "klite/test",
+		Logger:   b.logger,
+	})
+
+	b.gcDeletedTopic(context.Background(), dt)
+
+	remaining, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir(dt.Name, dt.TopicID)+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("expected 1 remaining object after partial delete failure, got %d", len(remaining))
+	}
+
+	drained := b.state.DrainDeletedTopics()
+	if len(drained) != 1 {
+		t.Fatalf("expected topic re-enqueued after partial delete failure, got %d", len(drained))
+	}
+	if drained[0] != dt {
+		t.Fatalf("unexpected re-enqueued topic: got %+v, want %+v", drained[0], dt)
+	}
+}
+
 func TestDeleteTopicObjectsRespectsContextCancellationBetweenTopics(t *testing.T) {
 	t.Parallel()
 

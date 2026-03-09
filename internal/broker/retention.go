@@ -273,7 +273,13 @@ func (b *Broker) gcDeletedTopic(ctx context.Context, dt cluster.DeletedTopic) {
 	for _, obj := range objects {
 		keys = append(keys, obj.Key)
 	}
-	b.s3Client.DeleteObjectsBatch(ctx, keys)
+	failed := b.s3Client.DeleteObjectsBatch(ctx, keys)
+	if failed > 0 {
+		b.logger.Warn("S3 GC: delete failed for some objects, will retry",
+			"topic", dt.Name, "failed", failed, "total", len(keys))
+		b.state.AddDeletedTopic(dt)
+		return
+	}
 
 	b.logger.Info("S3 GC: deleted objects for topic",
 		"topic", dt.Name, "objects", len(keys))
