@@ -481,6 +481,60 @@ func TestListOffsets(t *testing.T) {
 	})
 }
 
+func TestLSOMultipleOpenTransactions(t *testing.T) {
+	t.Parallel()
+
+	pd := newTestPartition()
+
+	pd.Lock()
+	pushTestBatch(t, pd, 10, 1000) // offsets 0-9, HW=10
+	pd.AddOpenTxn(100, 7)          // producer 100 started at offset 7
+	pd.AddOpenTxn(200, 3)          // producer 200 started at offset 3
+	pd.AddOpenTxn(300, 5)          // producer 300 started at offset 5
+	pd.Unlock()
+
+	pd.RLock()
+	lso := pd.LSO()
+	hw := pd.HW()
+	pd.RUnlock()
+
+	if hw != 10 {
+		t.Errorf("HW: got %d, want 10", hw)
+	}
+	// LSO should be min(HW, 7, 3, 5) = 3
+	if lso != 3 {
+		t.Errorf("LSO with 3 open txns: got %d, want 3 (min of open txn offsets)", lso)
+	}
+
+	// Remove the txn with the smallest offset; LSO should advance to next min
+	pd.Lock()
+	pd.RemoveOpenTxn(200) // remove producer 200 (offset 3)
+	pd.Unlock()
+
+	pd.RLock()
+	lso = pd.LSO()
+	pd.RUnlock()
+
+	// LSO should now be min(HW=10, 7, 5) = 5
+	if lso != 5 {
+		t.Errorf("LSO after removing producer 200: got %d, want 5", lso)
+	}
+
+	// Remove all open txns; LSO should equal HW
+	pd.Lock()
+	pd.RemoveOpenTxn(100)
+	pd.RemoveOpenTxn(300)
+	pd.Unlock()
+
+	pd.RLock()
+	lso = pd.LSO()
+	pd.RUnlock()
+
+	if lso != 10 {
+		t.Errorf("LSO with no open txns: got %d, want 10 (HW)", lso)
+	}
+}
+
 func TestNotifyWaiters(t *testing.T) {
 	t.Parallel()
 
@@ -1735,6 +1789,130 @@ func TestReattachSealedChunks(t *testing.T) {
 	if allSealed[0] != detached[0] {
 		t.Error("reattached chunk should be first (prepended)")
 	}
+}
+
+// TestDetachSealedChunksIncludeCurrent verifies that DetachSealedChunks with
+// includeCurrentIfNonEmpty=true seals the current chunk and includes it in the
+// returned slice. After detach, chunkCurrent should be nil.
+func TestDetachSealedChunksIncludeCurrent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("seals non-empty current chunk", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		pd.Lock()
+		pushTestBatch(t, pd, 3, 1000) // writes to chunkCurrent
+		pd.Unlock()
+
+		pd.Lock()
+		chunks := pd.DetachSealedChunks(true)
+		pd.Unlock()
+
+		if len(chunks) != 1 {
+			t.Fatalf("expected 1 chunk (sealed current), got %d", len(chunks))
+		}
+		if len(chunks[0].Batches) != 1 {
+			t.Errorf("chunk batches: got %d, want 1", len(chunks[0].Batches))
+		}
+		if chunks[0].Batches[0].BaseOffset != 0 {
+			t.Errorf("chunk batch base offset: got %d, want 0", chunks[0].Batches[0].BaseOffset)
+		}
+
+		// After detach, a new produce should get a fresh chunk
+		pd.Lock()
+		pushTestBatch(t, pd, 1, 2000)
+		chunks2 := pd.DetachSealedChunks(true)
+		pd.Unlock()
+
+		if len(chunks2) != 1 {
+			t.Fatalf("expected 1 chunk after re-produce, got %d", len(chunks2))
+		}
+		if chunks2[0] == chunks[0] {
+			t.Error("new chunk should be different from the previously sealed one")
+		}
+	})
+
+	t.Run("empty current chunk not sealed", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		// No data written, chunkCurrent is nil
+		pd.Lock()
+		chunks := pd.DetachSealedChunks(true)
+		pd.Unlock()
+
+		if len(chunks) != 0 {
+			t.Errorf("expected 0 chunks for empty partition, got %d", len(chunks))
+		}
+	})
+
+	t.Run("false flag does not seal current", func(t *testing.T) {
+		t.Parallel()
+		pd := newTestPartition()
+
+		pd.Lock()
+		pushTestBatch(t, pd, 3, 1000) // data in chunkCurrent only (no sealed chunks)
+		pd.Unlock()
+
+		pd.Lock()
+		chunks := pd.DetachSealedChunks(false)
+		pd.Unlock()
+
+		if len(chunks) != 0 {
+			t.Errorf("expected 0 chunks with includeCurrentIfNonEmpty=false, got %d", len(chunks))
+		}
+
+		// Data should still be fetchable from current chunk
+		fr := pd.Fetch(0, 1024*1024)
+		if len(fr.Batches) != 1 {
+			t.Errorf("data should still be in current chunk, got %d batches", len(fr.Batches))
+		}
+	})
+
+	t.Run("mixed sealed and current", func(t *testing.T) {
+		t.Parallel()
+
+		chunkSize := 128
+		pool := chunk.NewPool(int64(16*chunkSize), chunkSize)
+		pd := &PartData{
+			Topic:     "test-topic",
+			Index:     0,
+			chunkPool: pool,
+		}
+
+		// Fill enough batches to seal at least one chunk and have data in current
+		pd.Lock()
+		for i := 0; i < 10; i++ {
+			raw := makeSimpleBatch(1, int64(1000+i*100))
+			meta, err := ParseBatchHeader(raw)
+			if err != nil {
+				t.Fatalf("ParseBatchHeader: %v", err)
+			}
+			pd.PushBatch(raw, meta, nil)
+		}
+		pd.Unlock()
+
+		pd.Lock()
+		chunks := pd.DetachSealedChunks(true)
+		pd.Unlock()
+
+		// Should have at least 2 chunks (some sealed + current sealed)
+		if len(chunks) < 2 {
+			t.Errorf("expected at least 2 chunks (sealed + current), got %d", len(chunks))
+		}
+
+		// Verify offsets are monotonically increasing across chunks
+		var lastOffset int64 = -1
+		for ci, c := range chunks {
+			for bi, b := range c.Batches {
+				if b.BaseOffset <= lastOffset {
+					t.Errorf("chunk[%d].batch[%d] offset %d <= previous %d", ci, bi, b.BaseOffset, lastOffset)
+				}
+				lastOffset = b.BaseOffset + int64(b.LastOffsetDelta)
+			}
+		}
+	})
 }
 
 // --- Cold-path tests (WAL and S3 fallback) ---
