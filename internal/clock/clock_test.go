@@ -86,8 +86,10 @@ func TestFakeClock_Sleep(t *testing.T) {
 		close(done)
 	}()
 
-	// Give the goroutine time to register the sleep.
-	time.Sleep(5 * time.Millisecond)
+	// Wait for the goroutine to register its sleep timer.
+	if !c.WaitForTimers(1, time.Second) {
+		t.Fatal("timed out waiting for sleep timer to register")
+	}
 
 	c.Advance(5 * time.Second)
 
