@@ -14,8 +14,12 @@ import (
 
 func (b *Broker) initMetadataLog() error {
 	ml, err := metadata.NewLog(metadata.LogConfig{
-		DataDir: b.cfg.DataDir,
-		Logger:  b.logger,
+		DataDir:                 b.cfg.DataDir,
+		Logger:                  b.logger,
+		CompactionCheckInterval: b.cfg.MetadataCompactionCheckInterval,
+		CompactionMinSizeBytes:  b.cfg.MetadataCompactionMinSizeBytes,
+		CompactionMinStaleRatio: b.cfg.MetadataCompactionMinStaleRatio,
+		CompactionMinStaleBytes: b.cfg.MetadataCompactionMinStaleBytes,
 	})
 	if err != nil {
 		return err

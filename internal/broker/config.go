@@ -62,6 +62,12 @@ type Config struct {
 	CompactionS3Concurrency   int           // Max concurrent S3 GETs for compaction (default 4)
 	CompactionReadRate        int           // Max S3 read bytes/sec for compaction (default 50 MiB/s, 0 = unlimited)
 
+	// Metadata compaction configuration.
+	MetadataCompactionCheckInterval time.Duration // How often metadata compaction eligibility is checked (default 30s)
+	MetadataCompactionMinSizeBytes  int64         // Minimum metadata.log size before compaction is considered (default 64 MiB)
+	MetadataCompactionMinStaleRatio float64       // Minimum stale ratio before metadata compaction is considered (default 0.75)
+	MetadataCompactionMinStaleBytes int64         // Minimum stale bytes before metadata compaction is considered (default 32 MiB)
+
 	// SASLStore allows injecting a pre-configured SASL credential store (for tests).
 	SASLStore *sasl.Store
 
@@ -120,9 +126,13 @@ func DefaultConfig() Config {
 		RetentionCheckInterval: 1 * time.Hour,
 
 		// Compaction defaults
-		CompactionCheckInterval:   30 * time.Second,
-		CompactionMinDirtyObjects: 4,
-		CompactionReadRate:        50 * 1024 * 1024, // 50 MiB/s
+		CompactionCheckInterval:         30 * time.Second,
+		CompactionMinDirtyObjects:       4,
+		CompactionReadRate:              50 * 1024 * 1024, // 50 MiB/s
+		MetadataCompactionCheckInterval: 30 * time.Second,
+		MetadataCompactionMinSizeBytes:  64 * 1024 * 1024,
+		MetadataCompactionMinStaleRatio: 0.75,
+		MetadataCompactionMinStaleBytes: 32 * 1024 * 1024,
 
 		// Replication defaults
 		ReplicationAckTimeout: 5 * time.Second,

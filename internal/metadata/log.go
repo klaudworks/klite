@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
+	"time"
 
 	"github.com/klaudworks/klite/internal/wal"
 )
@@ -16,12 +16,17 @@ import (
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
-	// compactionThreshold is the file size threshold for triggering compaction (64 MiB).
-	compactionThreshold = 64 * 1024 * 1024
-
-	// compactionCheckInterval is how many appends between compaction checks.
-	compactionCheckInterval = 1000
+	defaultCompactionCheckInterval = 30 * time.Second
+	defaultCompactionMinSizeBytes  = 64 * 1024 * 1024
+	defaultCompactionMinStaleRatio = 0.75
+	defaultCompactionMinStaleBytes = 32 * 1024 * 1024
 )
+
+type offsetCommitKey struct {
+	group     string
+	topic     string
+	partition int32
+}
 
 // Log manages the metadata.log file. It provides append-only writes with
 // optional synchronous fsync, startup replay, and compaction.
@@ -38,7 +43,15 @@ type Log struct {
 	logger *slog.Logger
 
 	// Compaction state
-	appendCount atomic.Int64
+	compactionCheckInterval time.Duration
+	compactionMinSizeBytes  int64
+	compactionMinStaleRatio float64
+	compactionMinStaleBytes int64
+	lastCompactionCheck     time.Time
+
+	offsetEntryBytes map[offsetCommitKey]int64
+	offsetTotalBytes int64
+	offsetLiveBytes  int64
 
 	// For replay callbacks
 	topicCallback                 func(CreateTopicEntry)
@@ -67,13 +80,32 @@ type Log struct {
 }
 
 type LogConfig struct {
-	DataDir string
-	Logger  *slog.Logger
+	DataDir                 string
+	Logger                  *slog.Logger
+	CompactionCheckInterval time.Duration
+	CompactionMinSizeBytes  int64
+	CompactionMinStaleRatio float64
+	CompactionMinStaleBytes int64
 }
 
 func NewLog(cfg LogConfig) (*Log, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.CompactionCheckInterval <= 0 {
+		cfg.CompactionCheckInterval = defaultCompactionCheckInterval
+	}
+	if cfg.CompactionMinSizeBytes <= 0 {
+		cfg.CompactionMinSizeBytes = defaultCompactionMinSizeBytes
+	}
+	if cfg.CompactionMinStaleRatio < 0 {
+		cfg.CompactionMinStaleRatio = 0
+	}
+	if cfg.CompactionMinStaleRatio > 1 {
+		cfg.CompactionMinStaleRatio = 1
+	}
+	if cfg.CompactionMinStaleBytes <= 0 {
+		cfg.CompactionMinStaleBytes = defaultCompactionMinStaleBytes
 	}
 
 	path := filepath.Join(cfg.DataDir, "metadata.log")
@@ -94,11 +126,17 @@ func NewLog(cfg LogConfig) (*Log, error) {
 	}
 
 	return &Log{
-		file:   f,
-		path:   path,
-		dir:    cfg.DataDir,
-		size:   stat.Size(),
-		logger: cfg.Logger,
+		file:                    f,
+		path:                    path,
+		dir:                     cfg.DataDir,
+		size:                    stat.Size(),
+		logger:                  cfg.Logger,
+		compactionCheckInterval: cfg.CompactionCheckInterval,
+		compactionMinSizeBytes:  cfg.CompactionMinSizeBytes,
+		compactionMinStaleRatio: cfg.CompactionMinStaleRatio,
+		compactionMinStaleBytes: cfg.CompactionMinStaleBytes,
+		lastCompactionCheck:     time.Now(),
+		offsetEntryBytes:        make(map[offsetCommitKey]int64),
 	}, nil
 }
 
@@ -151,6 +189,7 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 		return fmt.Errorf("write metadata entry: %w", err)
 	}
 	l.size += int64(n)
+	l.trackOffsetCommitLocked(entryPayload, int64(n))
 
 	if doSync {
 		if err := l.file.Sync(); err != nil {
@@ -162,11 +201,7 @@ func (l *Log) appendLocked(entryPayload []byte, doSync bool) error {
 		l.replicateHook(frame)
 	}
 
-	count := l.appendCount.Add(1)
-	if count%compactionCheckInterval == 0 && l.size > compactionThreshold {
-		// Compaction runs with the lock held — it's brief (~1ms for typical state)
-		l.compactLocked()
-	}
+	l.maybeCompactLocked()
 
 	return nil
 }
@@ -352,6 +387,77 @@ func (l *Log) SetCompactionWatermarkCallback(cb func(CompactionWatermarkEntry)) 
 	l.compactionWatermarkCallback = cb
 }
 
+func (l *Log) maybeCompactLocked() {
+	now := time.Now()
+	if now.Sub(l.lastCompactionCheck) < l.compactionCheckInterval {
+		return
+	}
+	l.lastCompactionCheck = now
+	if l.shouldCompactLocked() {
+		l.compactLocked()
+	}
+}
+
+func (l *Log) shouldCompactLocked() bool {
+	if l.snapshotFn == nil {
+		return false
+	}
+	if l.size < l.compactionMinSizeBytes {
+		return false
+	}
+	staleBytes, staleRatio := l.offsetStaleMetricsLocked()
+	if staleRatio < l.compactionMinStaleRatio {
+		return false
+	}
+	if staleBytes < l.compactionMinStaleBytes {
+		return false
+	}
+	return true
+}
+
+func (l *Log) offsetStaleMetricsLocked() (int64, float64) {
+	if l.offsetTotalBytes <= 0 {
+		return 0, 0
+	}
+	staleBytes := l.offsetTotalBytes - l.offsetLiveBytes
+	if staleBytes < 0 {
+		staleBytes = 0
+	}
+	staleRatio := float64(staleBytes) / float64(l.offsetTotalBytes)
+	if staleRatio < 0 {
+		staleRatio = 0
+	}
+	if staleRatio > 1 {
+		staleRatio = 1
+	}
+	return staleBytes, staleRatio
+}
+
+func (l *Log) trackOffsetCommitFromFrameLocked(frame []byte, framedSize int64) {
+	if len(frame) < 9 {
+		return
+	}
+	payload := frame[8:]
+	l.trackOffsetCommitLocked(payload, framedSize)
+}
+
+func (l *Log) trackOffsetCommitLocked(entryPayload []byte, framedSize int64) {
+	if len(entryPayload) < 2 || entryPayload[0] != EntryOffsetCommit {
+		return
+	}
+	e, err := UnmarshalOffsetCommit(entryPayload[1:])
+	if err != nil {
+		return
+	}
+	key := offsetCommitKey{group: e.Group, topic: e.Topic, partition: e.Partition}
+	l.offsetTotalBytes += framedSize
+	if prevSize, ok := l.offsetEntryBytes[key]; ok {
+		l.offsetLiveBytes -= prevSize
+	}
+	l.offsetEntryBytes[key] = framedSize
+	l.offsetLiveBytes += framedSize
+}
+
 // compactLocked performs compaction while holding l.mu.
 // Writes a fresh log from the snapshot function, then atomically replaces
 // the old log via fsync + rename.
@@ -421,7 +527,8 @@ func (l *Log) compactLocked() {
 	l.file = f
 	oldSize := l.size
 	l.size = newSize
-	l.appendCount.Store(0)
+	l.offsetTotalBytes = l.offsetLiveBytes
+	l.lastCompactionCheck = time.Now()
 
 	l.logger.Info("metadata.log compacted",
 		"old_size", oldSize,
@@ -442,7 +549,7 @@ func (l *Log) compactLocked() {
 func (l *Log) Compact() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.size > compactionThreshold {
+	if l.shouldCompactLocked() {
 		l.compactLocked()
 	}
 }
@@ -508,6 +615,8 @@ func (l *Log) AppendRaw(frame []byte) error {
 		return fmt.Errorf("write raw metadata entry: %w", err)
 	}
 	l.size += int64(n)
+	l.trackOffsetCommitFromFrameLocked(frame, int64(n))
+	l.maybeCompactLocked()
 	return nil
 }
 
@@ -564,6 +673,10 @@ func (l *Log) ReplaceFromSnapshot(data []byte) error {
 	}
 	l.file = f
 	l.size = int64(len(data))
+	l.offsetEntryBytes = make(map[offsetCommitKey]int64)
+	l.offsetTotalBytes = 0
+	l.offsetLiveBytes = 0
+	l.lastCompactionCheck = time.Now()
 
 	// Replay the snapshot to rebuild in-memory state.
 	// replayLocked opens its own file handle for reading, safe under l.mu.

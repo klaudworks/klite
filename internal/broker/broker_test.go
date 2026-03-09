@@ -260,6 +260,18 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.CompactionReadRate != 50*1024*1024 {
 		t.Errorf("CompactionReadRate = %d, want %d", cfg.CompactionReadRate, 50*1024*1024)
 	}
+	if cfg.MetadataCompactionCheckInterval != 30*time.Second {
+		t.Errorf("MetadataCompactionCheckInterval = %v, want 30s", cfg.MetadataCompactionCheckInterval)
+	}
+	if cfg.MetadataCompactionMinSizeBytes != 64*1024*1024 {
+		t.Errorf("MetadataCompactionMinSizeBytes = %d, want %d", cfg.MetadataCompactionMinSizeBytes, 64*1024*1024)
+	}
+	if cfg.MetadataCompactionMinStaleRatio != 0.75 {
+		t.Errorf("MetadataCompactionMinStaleRatio = %v, want 0.75", cfg.MetadataCompactionMinStaleRatio)
+	}
+	if cfg.MetadataCompactionMinStaleBytes != 32*1024*1024 {
+		t.Errorf("MetadataCompactionMinStaleBytes = %d, want %d", cfg.MetadataCompactionMinStaleBytes, 32*1024*1024)
+	}
 
 	// Replication defaults
 	if cfg.ReplicationAckTimeout != 5*time.Second {

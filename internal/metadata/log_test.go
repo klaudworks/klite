@@ -3,7 +3,9 @@ package metadata
 import (
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestEntryRoundTrip_CreateTopic(t *testing.T) {
@@ -357,6 +359,166 @@ func TestLogCompaction(t *testing.T) {
 	}
 	if offsets[0].Offset != 99 {
 		t.Fatalf("expected latest offset 99, got %d", offsets[0].Offset)
+	}
+}
+
+func TestOffsetCommitStaleAccountingRepeatedUpdates(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ml, err := NewLog(LogConfig{
+		DataDir:                 dir,
+		CompactionCheckInterval: 24 * time.Hour,
+		CompactionMinSizeBytes:  1,
+		CompactionMinStaleRatio: 1,
+		CompactionMinStaleBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ml.Close() }()
+
+	appendOffset := func(group, topic string, partition int32, offset int64) {
+		t.Helper()
+		err := ml.Append(MarshalOffsetCommit(&OffsetCommitEntry{
+			Group:     group,
+			Topic:     topic,
+			Partition: partition,
+			Offset:    offset,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	appendOffset("g1", "t1", 0, 1)
+	appendOffset("g1", "t1", 0, 2)
+	appendOffset("g1", "t1", 0, 3)
+	appendOffset("g1", "t1", 1, 1)
+
+	if ml.offsetTotalBytes <= 0 {
+		t.Fatalf("offsetTotalBytes = %d, want > 0", ml.offsetTotalBytes)
+	}
+	if ml.offsetLiveBytes <= 0 {
+		t.Fatalf("offsetLiveBytes = %d, want > 0", ml.offsetLiveBytes)
+	}
+	if ml.offsetTotalBytes <= ml.offsetLiveBytes {
+		t.Fatalf("expected stale bytes > 0, total=%d live=%d", ml.offsetTotalBytes, ml.offsetLiveBytes)
+	}
+	if len(ml.offsetEntryBytes) != 2 {
+		t.Fatalf("offsetEntryBytes entries = %d, want 2", len(ml.offsetEntryBytes))
+	}
+}
+
+func TestMetadataCompactionGate_MinSizeBlocksCompaction(t *testing.T) {
+	t.Parallel()
+
+	ml := newCompactionGateTestLog(t, 1<<20, 0.25, 1)
+	defer func() { _ = ml.Close() }()
+	var compactCount atomic.Int32
+	ml.SetCompactHook(func(_ []byte) {
+		compactCount.Add(1)
+	})
+
+	appendSameKeyOffsetCommits(t, ml, 6)
+
+	if compactions := compactCount.Load(); compactions != 0 {
+		t.Fatalf("compactions = %d, want 0", compactions)
+	}
+}
+
+func TestMetadataCompactionGate_StaleRatioOnlyDoesNotCompact(t *testing.T) {
+	t.Parallel()
+
+	ml := newCompactionGateTestLog(t, 1, 0.5, 1<<20)
+	defer func() { _ = ml.Close() }()
+	var compactCount atomic.Int32
+	ml.SetCompactHook(func(_ []byte) {
+		compactCount.Add(1)
+	})
+
+	appendSameKeyOffsetCommits(t, ml, 8)
+
+	if compactions := compactCount.Load(); compactions != 0 {
+		t.Fatalf("compactions = %d, want 0", compactions)
+	}
+}
+
+func TestMetadataCompactionGate_StaleBytesOnlyDoesNotCompact(t *testing.T) {
+	t.Parallel()
+
+	ml := newCompactionGateTestLog(t, 1, 0.99, 1)
+	defer func() { _ = ml.Close() }()
+	var compactCount atomic.Int32
+	ml.SetCompactHook(func(_ []byte) {
+		compactCount.Add(1)
+	})
+
+	appendSameKeyOffsetCommits(t, ml, 3)
+
+	if compactions := compactCount.Load(); compactions != 0 {
+		t.Fatalf("compactions = %d, want 0", compactions)
+	}
+}
+
+func TestMetadataCompactionGate_BothPassCompactsAndResetsBaseline(t *testing.T) {
+	t.Parallel()
+
+	ml := newCompactionGateTestLog(t, 1, 0.5, 1)
+	defer func() { _ = ml.Close() }()
+	var compactCount atomic.Int32
+	ml.SetCompactHook(func(_ []byte) {
+		compactCount.Add(1)
+	})
+
+	appendSameKeyOffsetCommits(t, ml, 4)
+
+	if compactions := compactCount.Load(); compactions < 1 {
+		t.Fatalf("compactions = %d, want >= 1", compactions)
+	}
+	if ml.offsetTotalBytes != ml.offsetLiveBytes {
+		t.Fatalf("baseline not reset: total=%d live=%d", ml.offsetTotalBytes, ml.offsetLiveBytes)
+	}
+}
+
+func newCompactionGateTestLog(t *testing.T, minSize int64, minRatio float64, minStaleBytes int64) *Log {
+	t.Helper()
+
+	ml, err := NewLog(LogConfig{
+		DataDir:                 t.TempDir(),
+		CompactionCheckInterval: 1 * time.Nanosecond,
+		CompactionMinSizeBytes:  minSize,
+		CompactionMinStaleRatio: minRatio,
+		CompactionMinStaleBytes: minStaleBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ml.SetSnapshotFn(func() [][]byte {
+		return [][]byte{
+			MarshalOffsetCommit(&OffsetCommitEntry{
+				Group:     "g1",
+				Topic:     "topic",
+				Partition: 0,
+				Offset:    999,
+			}),
+		}
+	})
+	return ml
+}
+
+func appendSameKeyOffsetCommits(t *testing.T, ml *Log, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		err := ml.Append(MarshalOffsetCommit(&OffsetCommitEntry{
+			Group:     "g1",
+			Topic:     "topic",
+			Partition: 0,
+			Offset:    int64(i),
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

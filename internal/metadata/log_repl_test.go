@@ -159,15 +159,15 @@ func TestMetadataLogCompactHookNotCalledOnStandby(t *testing.T) {
 		}
 	}
 
-	// Compaction should not have been triggered because appendCount was
-	// not incremented by ReplayEntry
+	// Compaction should not have been triggered because ReplayEntry does not
+	// append to metadata.log.
 	if compactCalled {
 		t.Fatal("compactHook should not be called when using ReplayEntry (standby mode)")
 	}
 
-	// Verify appendCount is still 0
-	if ml.appendCount.Load() != 0 {
-		t.Fatalf("appendCount should be 0 on standby, got %d", ml.appendCount.Load())
+	// Verify stale accounting was not touched.
+	if ml.offsetTotalBytes != 0 {
+		t.Fatalf("offsetTotalBytes should be 0 on standby, got %d", ml.offsetTotalBytes)
 	}
 }
 

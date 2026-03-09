@@ -182,6 +182,34 @@ func main() {
 				Value:       cfg.CompactionReadRate,
 				Destination: &cfg.CompactionReadRate,
 			},
+			&cli.DurationFlag{
+				Name:        "metadata-compaction-check-interval",
+				Usage:       "How often to evaluate metadata.log compaction eligibility (default: 30s)",
+				Value:       cfg.MetadataCompactionCheckInterval,
+				Destination: &cfg.MetadataCompactionCheckInterval,
+				Sources:     cli.EnvVars("KLITE_METADATA_COMPACTION_CHECK_INTERVAL"),
+			},
+			&cli.Int64Flag{
+				Name:        "metadata-compaction-min-size-bytes",
+				Usage:       "Minimum metadata.log size before compaction is considered (default: 64 MiB)",
+				Value:       cfg.MetadataCompactionMinSizeBytes,
+				Destination: &cfg.MetadataCompactionMinSizeBytes,
+				Sources:     cli.EnvVars("KLITE_METADATA_COMPACTION_MIN_SIZE_BYTES"),
+			},
+			&cli.Float64Flag{
+				Name:        "metadata-compaction-min-stale-ratio",
+				Usage:       "Minimum stale ratio before metadata compaction is considered (default: 0.75)",
+				Value:       cfg.MetadataCompactionMinStaleRatio,
+				Destination: &cfg.MetadataCompactionMinStaleRatio,
+				Sources:     cli.EnvVars("KLITE_METADATA_COMPACTION_MIN_STALE_RATIO"),
+			},
+			&cli.Int64Flag{
+				Name:        "metadata-compaction-min-stale-bytes",
+				Usage:       "Minimum stale bytes before metadata compaction is considered (default: 32 MiB)",
+				Value:       cfg.MetadataCompactionMinStaleBytes,
+				Destination: &cfg.MetadataCompactionMinStaleBytes,
+				Sources:     cli.EnvVars("KLITE_METADATA_COMPACTION_MIN_STALE_BYTES"),
+			},
 
 			// SASL
 			&cli.BoolFlag{
