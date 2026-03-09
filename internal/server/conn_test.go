@@ -507,6 +507,396 @@ func TestWriteLoopChannelCloseDuringOOODrain(t *testing.T) {
 	}
 }
 
+// buildKafkaFrame builds a length-prefixed Kafka request frame from a kmsg.Request.
+// The frame format is: [4-byte size][int16 apiKey][int16 version][int32 corrID][nullable string clientID][flexible tags if applicable][request body].
+func buildKafkaFrame(t *testing.T, kreq kmsg.Request, corrID int32) []byte {
+	t.Helper()
+	var buf []byte
+	buf = binary.BigEndian.AppendUint16(buf, uint16(kreq.Key()))
+	buf = binary.BigEndian.AppendUint16(buf, uint16(kreq.GetVersion()))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(corrID))
+	// Nullable string clientID: length -1 (null)
+	buf = binary.BigEndian.AppendUint16(buf, 0xFFFF)
+	if kreq.IsFlexible() {
+		buf = append(buf, 0) // empty tags
+	}
+	buf = kreq.AppendTo(buf)
+	// Prefix with 4-byte length
+	frame := make([]byte, 4+len(buf))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(buf)))
+	copy(frame[4:], buf)
+	return frame
+}
+
+func TestMaxConnectionLimit(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+	handlers := NewHandlerRegistry()
+	srv := NewServer(handlers, shutdownCh, slog.Default())
+	srv.maxConns = 2
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() { _ = srv.Serve(ln) }()
+
+	addr := ln.Addr().String()
+
+	// Connect maxConns clients.
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	defer func() { _ = conn1.Close() }()
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	// Wait for both connections to be registered.
+	deadline := time.After(2 * time.Second)
+	for srv.ConnCount() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected ConnCount=2, got %d", srv.ConnCount())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Third connection should be rejected (closed immediately by server).
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial 3: %v", err)
+	}
+	defer func() { _ = conn3.Close() }()
+
+	// The server closes the rejected connection. Reading should return EOF/error.
+	_ = conn3.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var buf [1]byte
+	_, err = conn3.Read(buf[:])
+	if err == nil {
+		t.Fatal("expected rejected connection to be closed by server")
+	}
+
+	// ConnCount should still be 2 (rejected conn not counted).
+	if got := srv.ConnCount(); got != 2 {
+		t.Fatalf("ConnCount after rejection: got %d, want 2", got)
+	}
+}
+
+func TestMaxConnectionLimitAcceptsAfterClose(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+	handlers := NewHandlerRegistry()
+	srv := NewServer(handlers, shutdownCh, slog.Default())
+	srv.maxConns = 1
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() { _ = srv.Serve(ln) }()
+
+	addr := ln.Addr().String()
+
+	// Fill the limit.
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for srv.ConnCount() < 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected ConnCount=1, got %d", srv.ConnCount())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Close the connection to free a slot.
+	_ = conn1.Close()
+
+	// Wait for ConnCount to drop to 0.
+	deadline = time.After(2 * time.Second)
+	for srv.ConnCount() > 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected ConnCount=0 after close, got %d", srv.ConnCount())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// New connection should now be accepted.
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	deadline = time.After(2 * time.Second)
+	for srv.ConnCount() < 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected ConnCount=1 after reconnect, got %d", srv.ConnCount())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestProduceHandlerRunsInlineBlocksReadLoop(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+	handlers := NewHandlerRegistry()
+
+	produceBlocking := make(chan struct{})
+	metadataCalled := make(chan struct{}, 1)
+
+	// Produce handler (key 0) blocks until we signal.
+	handlers.Register(0, func(req kmsg.Request) (kmsg.Response, error) {
+		<-produceBlocking
+		resp := kmsg.NewProduceResponse()
+		return &resp, nil
+	})
+
+	// Metadata handler (key 3) signals when called.
+	handlers.Register(3, func(req kmsg.Request) (kmsg.Response, error) {
+		select {
+		case metadataCalled <- struct{}{}:
+		default:
+		}
+		resp := kmsg.NewMetadataResponse()
+		return &resp, nil
+	})
+
+	srv := NewServer(handlers, shutdownCh, slog.Default())
+
+	// Use net.Pipe for deterministic control.
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	// Run the server's connection handler.
+	srv.connCount.Add(1)
+	serveDone := make(chan struct{})
+	go func() {
+		cc := newClientConn(srv, serverSide)
+		cc.serve()
+		close(serveDone)
+	}()
+
+	// Send a Produce request (key=0, version=0).
+	produceReq := kmsg.NewProduceRequest()
+	produceReq.SetVersion(0)
+	produceFrame := buildKafkaFrame(t, &produceReq, 1)
+	if _, err := clientSide.Write(produceFrame); err != nil {
+		t.Fatalf("write produce: %v", err)
+	}
+
+	// Give the readLoop time to enter the produce handler.
+	time.Sleep(50 * time.Millisecond)
+
+	// Send a Metadata request from a goroutine because net.Pipe is
+	// synchronous — the Write blocks until the reader consumes the data,
+	// and the readLoop is stuck in the produce handler.
+	metadataReq := kmsg.NewMetadataRequest()
+	metadataReq.SetVersion(0)
+	metadataFrame := buildKafkaFrame(t, &metadataReq, 2)
+	metaWriteDone := make(chan error, 1)
+	go func() {
+		_, err := clientSide.Write(metadataFrame)
+		metaWriteDone <- err
+	}()
+
+	// The Metadata handler should NOT be called while Produce is blocking,
+	// because Produce runs inline on the readLoop goroutine.
+	select {
+	case <-metadataCalled:
+		t.Fatal("Metadata handler called while Produce handler is blocked — Produce is not running inline")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: readLoop is stuck in produce handler, can't read next frame.
+	}
+
+	// Unblock produce handler.
+	close(produceBlocking)
+
+	// Wait for the metadata write to complete.
+	select {
+	case err := <-metaWriteDone:
+		if err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata write did not complete")
+	}
+
+	// Now Metadata should be dispatched.
+	select {
+	case <-metadataCalled:
+		// Expected.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Metadata handler not called after Produce handler unblocked")
+	}
+
+	// Clean up: close client side, wait for serve to finish.
+	_ = clientSide.Close()
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not exit")
+	}
+}
+
+func TestPanicRecoveryProduceInline(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+	handlers := NewHandlerRegistry()
+
+	// Produce handler panics.
+	handlers.Register(0, func(req kmsg.Request) (kmsg.Response, error) {
+		panic("test produce panic")
+	})
+
+	srv := NewServer(handlers, shutdownCh, slog.Default())
+
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	srv.connCount.Add(1)
+	serveDone := make(chan struct{})
+	go func() {
+		cc := newClientConn(srv, serverSide)
+		cc.serve()
+		close(serveDone)
+	}()
+
+	// Send a Produce request that triggers the panic.
+	produceReq := kmsg.NewProduceRequest()
+	produceReq.SetVersion(0)
+	frame := buildKafkaFrame(t, &produceReq, 1)
+	if _, err := clientSide.Write(frame); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The panic should be recovered. The connection should close because
+	// the panic sends a clientResp with err, which writeLoop treats as fatal.
+	select {
+	case <-serveDone:
+		// Expected: connection closed gracefully.
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not exit after handler panic")
+	}
+
+	// Verify the pipe was closed (reading returns error).
+	var buf [1]byte
+	_, err := clientSide.Read(buf[:])
+	if err == nil {
+		t.Fatal("expected read error after panic-induced close")
+	}
+}
+
+func TestPanicRecoveryGoroutinePool(t *testing.T) {
+	t.Parallel()
+
+	shutdownCh := make(chan struct{})
+	defer close(shutdownCh)
+	handlers := NewHandlerRegistry()
+
+	// Metadata handler (key 3) panics — dispatched via goroutine pool.
+	handlers.Register(3, func(req kmsg.Request) (kmsg.Response, error) {
+		panic("test metadata panic")
+	})
+
+	srv := NewServer(handlers, shutdownCh, slog.Default())
+
+	// First verify with a panicking connection.
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	srv.connCount.Add(1)
+	serveDone := make(chan struct{})
+	go func() {
+		cc := newClientConn(srv, serverSide)
+		cc.serve()
+		close(serveDone)
+	}()
+
+	metadataReq := kmsg.NewMetadataRequest()
+	metadataReq.SetVersion(0)
+	frame := buildKafkaFrame(t, &metadataReq, 1)
+	if _, err := clientSide.Write(frame); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Connection should close after panic recovery sends error to writeLoop.
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve did not exit after goroutine pool handler panic")
+	}
+
+	// Now verify the server still works: create a new connection with a
+	// non-panicking handler and confirm it functions.
+	handlers2 := NewHandlerRegistry()
+	handlers2.Register(3, func(req kmsg.Request) (kmsg.Response, error) {
+		resp := kmsg.NewMetadataResponse()
+		return &resp, nil
+	})
+	srv2 := NewServer(handlers2, shutdownCh, slog.Default())
+
+	client2, server2 := net.Pipe()
+	defer func() { _ = client2.Close() }()
+	defer func() { _ = server2.Close() }()
+
+	srv2.connCount.Add(1)
+	serveDone2 := make(chan struct{})
+	go func() {
+		cc := newClientConn(srv2, server2)
+		cc.serve()
+		close(serveDone2)
+	}()
+
+	frame2 := buildKafkaFrame(t, &metadataReq, 1)
+	if _, err := client2.Write(frame2); err != nil {
+		t.Fatalf("write to healthy conn: %v", err)
+	}
+
+	// Read the response — should succeed.
+	_ = client2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var sizeBuf [4]byte
+	if _, err := io.ReadFull(client2, sizeBuf[:]); err != nil {
+		t.Fatalf("read response size: %v", err)
+	}
+	respSize := binary.BigEndian.Uint32(sizeBuf[:])
+	if respSize == 0 {
+		t.Fatal("empty response from healthy connection")
+	}
+
+	_ = client2.Close()
+	select {
+	case <-serveDone2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serve2 did not exit")
+	}
+}
+
 func TestCloseConnsUnblocksWait(t *testing.T) {
 	t.Parallel()
 
