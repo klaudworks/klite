@@ -133,13 +133,66 @@ func TestWriteResponseApiVersionsNoTagByte(t *testing.T) {
 	// ApiVersions (key 18) response should NOT have the tag byte in the header.
 	// Other flexible responses DO have the tag byte.
 	//
-	// We verify this by checking the encoded bytes.
-	// ApiVersions response header: [4 size][4 corrID][body]  (no tag byte)
-	// Other flexible response header: [4 size][4 corrID][1 tag=0][body]
+	// Header layout:
+	//   ApiVersions: [4 size][4 corrID][body]       (no tag byte)
+	//   Other flex:  [4 size][4 corrID][1 tag=0][body]
 
-	// This is a structural test to verify the writeResponse method handles
-	// the ApiVersions exception correctly. The full protocol test is in
-	// integration tests.
+	newCC := func() (*clientConn, *bytes.Buffer) {
+		var buf bytes.Buffer
+		return &clientConn{
+			bw:     bufio.NewWriter(&buf),
+			logger: slog.Default(),
+		}, &buf
+	}
+
+	corrID := int32(42)
+
+	// ApiVersions v3 (flexible, key 18) — no tag byte expected.
+	avResp := kmsg.NewPtrApiVersionsResponse()
+	avResp.Version = 3
+	cc, buf := newCC()
+	if err := cc.writeResponse(clientResp{kresp: avResp, corr: corrID}); err != nil {
+		t.Fatalf("writeResponse ApiVersions: %v", err)
+	}
+	avData := buf.Bytes()
+	avSize := binary.BigEndian.Uint32(avData[:4])
+	if int(avSize) != len(avData)-4 {
+		t.Fatalf("size field mismatch: got %d, want %d", avSize, len(avData)-4)
+	}
+	avCorr := int32(binary.BigEndian.Uint32(avData[4:8]))
+	if avCorr != corrID {
+		t.Fatalf("corrID mismatch: got %d, want %d", avCorr, corrID)
+	}
+	avBody := avResp.AppendTo(nil)
+	// Bytes after the 8-byte header should be exactly the body (no tag byte).
+	if !bytes.Equal(avData[8:], avBody) {
+		t.Fatalf("ApiVersions: expected body immediately after corrID (no tag byte)\n  got:  %v\n  want: %v", avData[8:], avBody)
+	}
+
+	// Metadata v9 (flexible, key 3) — tag byte expected.
+	mdResp := kmsg.NewPtrMetadataResponse()
+	mdResp.Version = 9
+	cc, buf = newCC()
+	if err := cc.writeResponse(clientResp{kresp: mdResp, corr: corrID}); err != nil {
+		t.Fatalf("writeResponse Metadata: %v", err)
+	}
+	mdData := buf.Bytes()
+	mdSize := binary.BigEndian.Uint32(mdData[:4])
+	if int(mdSize) != len(mdData)-4 {
+		t.Fatalf("size field mismatch: got %d, want %d", mdSize, len(mdData)-4)
+	}
+	mdCorr := int32(binary.BigEndian.Uint32(mdData[4:8]))
+	if mdCorr != corrID {
+		t.Fatalf("corrID mismatch: got %d, want %d", mdCorr, corrID)
+	}
+	if mdData[8] != 0 {
+		t.Fatalf("Metadata: expected tag byte 0x00 at offset 8, got 0x%02x", mdData[8])
+	}
+	mdBody := mdResp.AppendTo(nil)
+	// Bytes after 8-byte header + 1 tag byte should be the body.
+	if !bytes.Equal(mdData[9:], mdBody) {
+		t.Fatalf("Metadata: expected body after tag byte\n  got:  %v\n  want: %v", mdData[9:], mdBody)
+	}
 }
 
 func TestHandlerRegistryBasic(t *testing.T) {
