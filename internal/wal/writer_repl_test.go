@@ -108,7 +108,7 @@ func TestWriterReplicatorNil(t *testing.T) {
 	}
 }
 
-func TestWriterSyncModeACK(t *testing.T) {
+func TestWriterAcksAll_BlocksOnReplACK(t *testing.T) {
 	t.Parallel()
 
 	repl := &mockReplicator{connected: true}
@@ -121,7 +121,7 @@ func TestWriterSyncModeACK(t *testing.T) {
 		Data:      makeTestBatch(1, 1000),
 	}
 
-	errCh, err := w.AppendAsync(entry)
+	errCh, err := w.AppendAsync(entry, AppendOpts{RequireReplACK: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestWriterSyncModeACK(t *testing.T) {
 	}
 }
 
-func TestWriterSyncModeTimeout(t *testing.T) {
+func TestWriterAcksAll_ReplTimeout(t *testing.T) {
 	t.Parallel()
 
 	repl := &mockReplicator{connected: true}
@@ -160,13 +160,12 @@ func TestWriterSyncModeTimeout(t *testing.T) {
 		Data:      makeTestBatch(1, 1000),
 	}
 
-	errCh, err := w.AppendAsync(entry)
+	errCh, err := w.AppendAsync(entry, AppendOpts{RequireReplACK: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Never resolve the replicator — simulate timeout
-	// We need to send a timeout error to the replicator channel
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		repl.resolvePending(0, fmt.Errorf("repl: ACK timeout"))
@@ -287,14 +286,12 @@ func (b *batchTrackingReplicator) getCalls() []mockReplCall {
 	return out
 }
 
-func TestWriterReplicatorLocalFsyncFails(t *testing.T) {
+func TestWriterAcksAll_ManualReplResolve(t *testing.T) {
 	t.Parallel()
 
-	// Verify that when replicator succeeds but fsync is disabled (baseline),
-	// the writer works correctly with the replication path.
+	// Verify that with RequireReplACK=true, the writer blocks until the
+	// replicator ACK is manually resolved.
 	repl := &mockReplicator{connected: true}
-	// Use auto-reply so the replicator resolves immediately
-	repl.autoReply = nil // nil autoReply means manual control via pendingChs
 
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
@@ -323,7 +320,7 @@ func TestWriterReplicatorLocalFsyncFails(t *testing.T) {
 		Data:      makeTestBatch(1, 1000),
 	}
 
-	errCh, appErr := w.AppendAsync(entry)
+	errCh, appErr := w.AppendAsync(entry, AppendOpts{RequireReplACK: true})
 	if appErr != nil {
 		t.Fatal(appErr)
 	}
@@ -370,7 +367,7 @@ func TestWriterSyncModeNoStandbyConnected(t *testing.T) {
 	}
 }
 
-func TestWriterSyncModeStandbyWasConnected(t *testing.T) {
+func TestWriterAcksAll_ReplErrorPropagates(t *testing.T) {
 	t.Parallel()
 
 	repl := &mockReplicator{connected: true}
@@ -383,7 +380,7 @@ func TestWriterSyncModeStandbyWasConnected(t *testing.T) {
 		Offset:    0,
 		Data:      makeTestBatch(1, 1000),
 	}
-	errCh1, err := w.AppendAsync(entry1)
+	errCh1, err := w.AppendAsync(entry1, AppendOpts{RequireReplACK: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +405,7 @@ func TestWriterSyncModeStandbyWasConnected(t *testing.T) {
 		Offset:    1,
 		Data:      makeTestBatch(1, 1000),
 	}
-	errCh2, err := w.AppendAsync(entry2)
+	errCh2, err := w.AppendAsync(entry2, AppendOpts{RequireReplACK: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +417,7 @@ func TestWriterSyncModeStandbyWasConnected(t *testing.T) {
 	select {
 	case err := <-errCh2:
 		if err == nil {
-			t.Fatal("expected error in sync mode after standby disconnect")
+			t.Fatal("expected error for acks=all after repl failure")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("second write timeout")
@@ -855,4 +852,191 @@ func TestSetReplicatorRaceSafe(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestWriterAcks1_DoesNotBlockOnRepl(t *testing.T) {
+	t.Parallel()
+
+	repl := &mockReplicator{connected: true}
+	w := newTestWriter(t, repl)
+
+	entry := &Entry{
+		TopicID:   [16]byte{1, 2, 3},
+		Partition: 0,
+		Offset:    0,
+		Data:      makeTestBatch(1, 1000),
+	}
+
+	// RequireReplACK=false (default / acks=1 semantics)
+	errCh, err := w.AppendAsync(entry, AppendOpts{RequireReplACK: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// errCh should resolve WITHOUT waiting for replicator ACK
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("errCh should resolve after local fsync, not wait for repl ACK")
+	}
+
+	// Replicator should still have been called (replication still happens)
+	time.Sleep(20 * time.Millisecond) // let async drain goroutine run
+	calls := repl.getCalls()
+	if len(calls) == 0 {
+		t.Fatal("expected Replicate to be called even with RequireReplACK=false")
+	}
+
+	// Clean up: resolve the pending repl channel so it doesn't leak
+	repl.resolvePending(0, nil)
+}
+
+func TestWriterAcks1_ReplFailureDoesNotAffectProducer(t *testing.T) {
+	t.Parallel()
+
+	repl := &mockReplicator{connected: true}
+	w := newTestWriter(t, repl)
+
+	entry := &Entry{
+		TopicID:   [16]byte{1, 2, 3},
+		Partition: 0,
+		Offset:    0,
+		Data:      makeTestBatch(1, 1000),
+	}
+
+	errCh, err := w.AppendAsync(entry, AppendOpts{RequireReplACK: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Producer should succeed immediately regardless of replication outcome
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("acks=1 should succeed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	// Now resolve repl with an error — this should not propagate anywhere
+	time.Sleep(20 * time.Millisecond)
+	repl.resolvePending(0, fmt.Errorf("repl: standby crashed"))
+}
+
+func TestWriterMixedAcks_SplitBatch(t *testing.T) {
+	t.Parallel()
+
+	repl := &mockReplicator{connected: true}
+
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	idx := NewIndex()
+	cfg := WriterConfig{
+		Dir:             walDir,
+		SyncInterval:    100 * time.Millisecond, // long interval to batch entries together
+		SegmentMaxBytes: 64 * 1024 * 1024,
+		FsyncEnabled:    false,
+		Clock:           clock.RealClock{},
+		Replicator:      repl,
+	}
+	w, err := NewWriter(cfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// Submit two entries in quick succession: one acks=1, one acks=-1.
+	// They should land in the same fsync batch.
+	entry1 := &Entry{
+		TopicID:   [16]byte{1, 2, 3},
+		Partition: 0,
+		Offset:    0,
+		Data:      makeTestBatch(1, 1000),
+	}
+	entry2 := &Entry{
+		TopicID:   [16]byte{1, 2, 3},
+		Partition: 0,
+		Offset:    1,
+		Data:      makeTestBatch(1, 1000),
+	}
+
+	errCh1, err := w.AppendAsync(entry1, AppendOpts{RequireReplACK: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh2, err := w.AppendAsync(entry2, AppendOpts{RequireReplACK: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// errCh1 (acks=1) should resolve immediately after fsync, without
+	// waiting for replicator ACK.
+	select {
+	case err := <-errCh1:
+		if err != nil {
+			t.Fatalf("acks=1 entry should succeed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acks=1 entry timed out")
+	}
+
+	// errCh2 (acks=-1) should NOT have resolved yet.
+	select {
+	case <-errCh2:
+		t.Fatal("acks=-1 entry should not resolve before replicator ACK")
+	case <-time.After(20 * time.Millisecond):
+		// expected
+	}
+
+	// Resolve the replicator
+	repl.resolvePending(0, nil)
+
+	select {
+	case err := <-errCh2:
+		if err != nil {
+			t.Fatalf("acks=-1 entry should succeed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acks=-1 entry timed out after repl ACK")
+	}
+}
+
+func TestWriterDefaultAppend_NoReplBlock(t *testing.T) {
+	t.Parallel()
+
+	// Verify that Append without opts (the default) does not block on repl.
+	repl := &mockReplicator{connected: true}
+	w := newTestWriter(t, repl)
+
+	entry := &Entry{
+		TopicID:   [16]byte{1, 2, 3},
+		Partition: 0,
+		Offset:    0,
+		Data:      makeTestBatch(1, 1000),
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Append(entry)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("default Append should succeed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("default Append blocked — should not wait for repl ACK")
+	}
+
+	// Resolve pending so mock doesn't leak
+	time.Sleep(20 * time.Millisecond)
+	repl.resolvePending(0, nil)
 }

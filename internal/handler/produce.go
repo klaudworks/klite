@@ -174,7 +174,7 @@ func HandleProduce(state *cluster.State, walWriter *wal.Writer, clk clock.Clock)
 					}
 				}
 
-				pending, walErr := produceSubmitWAL(pd, td, raw, meta, walWriter)
+				pending, walErr := produceSubmitWAL(pd, td, raw, meta, walWriter, r.Acks)
 				if walErr != nil {
 					sp.ErrorCode = kerr.KafkaStorageError.Code
 					st.Partitions = append(st.Partitions, sp)
@@ -261,7 +261,7 @@ type pendingWAL struct {
 // produceSubmitWAL reserves offset and enqueues the WAL entry. Chunk pool
 // write is deferred until after fsync so data never appears in memory
 // before it is durable on disk.
-func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer) (pendingWAL, error) {
+func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, meta cluster.BatchMeta, walWriter *wal.Writer, acks int16) (pendingWAL, error) {
 	stored := make([]byte, len(raw))
 	copy(stored, raw)
 
@@ -278,7 +278,9 @@ func produceSubmitWAL(pd *cluster.PartData, td *cluster.TopicData, raw []byte, m
 		Offset:    baseOffset,
 		Data:      stored,
 	}
-	errCh, err := walWriter.AppendAsync(walEntry)
+	errCh, err := walWriter.AppendAsync(walEntry, wal.AppendOpts{
+		RequireReplACK: acks == -1,
+	})
 	if err != nil {
 		pd.RollbackReserve(baseOffset)
 		pd.Unlock()

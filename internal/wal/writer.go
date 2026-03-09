@@ -60,8 +60,9 @@ func DefaultWriterConfig() WriterConfig {
 }
 
 type writeRequest struct {
-	entry []byte     // serialized WAL entry (MarshalEntry output)
-	errCh chan error // receives nil on success, non-nil on write/fsync failure
+	entry          []byte     // serialized WAL entry (MarshalEntry output)
+	errCh          chan error // receives nil on success, non-nil on write/fsync failure
+	requireReplACK bool       // true → block on standby ACK (acks=-1); false → ack after local fsync
 }
 
 type segmentInfo struct {
@@ -242,8 +243,18 @@ func (w *Writer) Start() error {
 	return nil
 }
 
-// Append blocks until the entry is written and fsync'd.
-func (w *Writer) Append(entry *Entry) error {
+// AppendOpts controls per-entry WAL behavior.
+type AppendOpts struct {
+	// RequireReplACK, when true, blocks the caller until the standby
+	// acknowledges the entry (acks=-1 / "all" semantics). When false,
+	// the entry is acked after local fsync only (acks=0/1 semantics).
+	// Replication still happens in the background either way.
+	RequireReplACK bool
+}
+
+// Append blocks until the entry is written and fsync'd (and optionally
+// replicated, depending on opts).
+func (w *Writer) Append(entry *Entry, opts ...AppendOpts) error {
 	w.mu.Lock()
 	if w.stopped {
 		w.mu.Unlock()
@@ -261,8 +272,13 @@ func (w *Writer) Append(entry *Entry) error {
 	serialized := MarshalEntry(entry)
 	errCh := make(chan error, 1)
 
+	var reqReplACK bool
+	if len(opts) > 0 {
+		reqReplACK = opts[0].RequireReplACK
+	}
+
 	select {
-	case w.writeCh <- writeRequest{entry: serialized, errCh: errCh}:
+	case w.writeCh <- writeRequest{entry: serialized, errCh: errCh, requireReplACK: reqReplACK}:
 	case <-w.stopCh:
 		return ErrClosed
 	}
@@ -275,7 +291,7 @@ func (w *Writer) Append(entry *Entry) error {
 	}
 }
 
-func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
+func (w *Writer) AppendAsync(entry *Entry, opts ...AppendOpts) (done <-chan error, err error) {
 	w.mu.Lock()
 	if w.stopped {
 		w.mu.Unlock()
@@ -293,8 +309,13 @@ func (w *Writer) AppendAsync(entry *Entry) (done <-chan error, err error) {
 	serialized := MarshalEntry(entry)
 	errCh := make(chan error, 1)
 
+	var reqReplACK bool
+	if len(opts) > 0 {
+		reqReplACK = opts[0].RequireReplACK
+	}
+
 	select {
-	case w.writeCh <- writeRequest{entry: serialized, errCh: errCh}:
+	case w.writeCh <- writeRequest{entry: serialized, errCh: errCh, requireReplACK: reqReplACK}:
 		return errCh, nil
 	case <-w.stopCh:
 		return nil, ErrClosed
@@ -511,25 +532,37 @@ func (w *Writer) run() {
 		}
 
 		if written > 0 {
-			// Phase 3: wait for standby ACK (if replicating)
-			var replErr error
-			if replCh != nil {
-				replErr = <-replCh
-			}
-
-			if replErr != nil {
-				w.logger.Warn("WAL replication failed, returning error to producers",
-					"err", replErr, "batches", written)
-				for _, req := range pending[:written] {
-					req.errCh <- replErr
-				}
-			} else {
-				if repl != nil && !repl.Connected() {
-					w.logNoStandbyOnce()
-				}
-				for _, req := range pending[:written] {
+			// Ack requests that only need local fsync (acks=0/1) immediately.
+			// Requests that require repl ACK (acks=-1) wait for Phase 3.
+			var needReplACK []writeRequest
+			for _, req := range pending[:written] {
+				if req.requireReplACK && replCh != nil {
+					needReplACK = append(needReplACK, req)
+				} else {
 					req.errCh <- nil
 				}
+			}
+
+			// Phase 3: wait for standby ACK (only if there are acks=-1 requests)
+			if len(needReplACK) > 0 {
+				replErr := <-replCh
+				replCh = nil // consumed
+				if replErr != nil {
+					w.logger.Warn("WAL replication failed, returning error to acks=all producers",
+						"err", replErr, "batches", len(needReplACK))
+				}
+				for _, req := range needReplACK {
+					req.errCh <- replErr
+				}
+			} else if replCh != nil {
+				// No acks=-1 requests in this batch, but replication was
+				// started. Drain the channel asynchronously so the sender's
+				// pending-ACK map gets cleaned up.
+				go func(ch <-chan error) { <-ch }(replCh)
+			}
+
+			if repl != nil && !repl.Connected() {
+				w.logNoStandbyOnce()
 			}
 		}
 		pending = pending[:0]
