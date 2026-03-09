@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3store "github.com/klaudworks/klite/internal/s3"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -728,10 +729,35 @@ func TestWALProduceConsume(t *testing.T) {
 	require.Equal(t, int64(2), consumed[2].Offset)
 }
 
+// gatedS3 wraps an S3API and blocks PutObject calls until the gate is opened.
+// Used to prevent S3 flushes during specific test phases.
+type gatedS3 struct {
+	s3store.S3API
+	gate chan struct{} // closed to allow puts through
+}
+
+func newGatedS3(inner s3store.S3API) *gatedS3 {
+	return &gatedS3{S3API: inner, gate: make(chan struct{})}
+}
+
+func (g *gatedS3) OpenGate() { close(g.gate) }
+
+func (g *gatedS3) PutObject(ctx context.Context, input *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return g.S3API.PutObject(ctx, input, opts...)
+}
+
 // TestWALBackPressureS3Recovery verifies the end-to-end back-pressure path:
 // when the WAL fills up (all segments unflushed to S3), produce fails or
 // times out. After the S3 flusher runs and advances the watermark, produce
 // succeeds again and all data remains consumable.
+//
+// A gatedS3 wrapper blocks all S3 uploads during the fill phase so the WAL
+// fills deterministically regardless of CPU contention from parallel tests.
 func TestWALBackPressureS3Recovery(t *testing.T) {
 	t.Parallel()
 
@@ -743,11 +769,12 @@ func TestWALBackPressureS3Recovery(t *testing.T) {
 	)
 
 	mem := s3store.NewInMemoryS3()
+	gated := newGatedS3(mem)
 	topic := "wal-backpressure-s3"
 	pad := strings.Repeat("x", valuePadding)
 
 	tb := StartBroker(t,
-		WithS3(mem, "test-bucket", "klite/test"),
+		WithS3(gated, "test-bucket", "klite/test"),
 		WithWALSegmentMaxBytes(walSegmentSize),
 		WithWALMaxDiskSize(walMaxDisk),
 		WithS3FlushInterval(1*time.Second),
@@ -760,9 +787,8 @@ func TestWALBackPressureS3Recovery(t *testing.T) {
 	require.NoError(t, err)
 
 	// Phase 1: Produce until WAL back-pressure causes a failure.
-	// A short timeout ensures we detect the back-pressure quickly — the
-	// error may be KafkaStorageError (WAL full on submit) or a context
-	// timeout (WAL full causes fsync to stall).
+	// S3 puts are gated so the flusher cannot drain the WAL — this makes
+	// back-pressure deterministic regardless of system load.
 	producer := NewClient(t, tb.Addr,
 		kgo.DefaultProduceTopic(topic),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
@@ -798,7 +824,9 @@ func TestWALBackPressureS3Recovery(t *testing.T) {
 	require.Greater(t, ackedCount, 0, "should have produced at least some records before back-pressure")
 	t.Logf("produced %d acked records before WAL back-pressure", ackedCount)
 
-	// Phase 2: Wait for S3 flusher to flush data and clear back-pressure.
+	// Phase 2: Open the S3 gate so the flusher can drain WAL segments.
+	gated.OpenGate()
+
 	require.Eventually(t, func() bool {
 		for _, k := range mem.Keys() {
 			if s3KeyMatchesPartition(k, topic, 0) && strings.HasSuffix(k, ".obj") {
@@ -809,8 +837,6 @@ func TestWALBackPressureS3Recovery(t *testing.T) {
 	}, 15*time.Second, 200*time.Millisecond, "S3 flush did not occur")
 
 	// Phase 3: Produce should succeed again after S3 flush clears WAL pressure.
-	// Use a fresh producer to avoid idempotent dedup complications from the
-	// timed-out produce (which may have been durably written).
 	producer2 := NewClient(t, tb.Addr,
 		kgo.DefaultProduceTopic(topic),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
@@ -834,9 +860,6 @@ func TestWALBackPressureS3Recovery(t *testing.T) {
 	t.Logf("produce recovered after S3 flush")
 
 	// Phase 4: Verify all data is consumable from offset 0.
-	// The timed-out record may or may not have been durably written, so the
-	// total consumable count is at least ackedCount + 1 (the recovery record)
-	// but may be ackedCount + 2 if the timed-out record was also persisted.
 	consumer := NewClient(t, tb.Addr,
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
@@ -846,7 +869,6 @@ func TestWALBackPressureS3Recovery(t *testing.T) {
 	consumed := ConsumeN(t, consumer, minExpected, 30*time.Second)
 	require.GreaterOrEqual(t, len(consumed), minExpected)
 
-	// Verify ordering: offsets should be monotonically increasing.
 	for i := 1; i < len(consumed); i++ {
 		require.Greater(t, consumed[i].Offset, consumed[i-1].Offset,
 			"offsets should be monotonically increasing at position %d", i)
