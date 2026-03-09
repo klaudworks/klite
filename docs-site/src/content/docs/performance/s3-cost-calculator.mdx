@@ -66,8 +66,8 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
 
 | Operation | Rate |
 |-----------|------|
-| PUT / COPY / POST / LIST | $0.005 per 1,000 |
-| GET / SELECT | $0.0004 per 1,000 |
+| PUT / COPY / POST / LIST | $5.00 per million |
+| GET / SELECT | $0.40 per million |
 | DELETE | Free |
 | Storage (first 50 TB) | $0.023 per GB-month |
 
@@ -140,7 +140,7 @@ After the listing cache append optimization, **PUTs are the largest API cost**. 
     content: attr(data-tip);
     position: absolute;
     bottom: calc(100% + 0.4rem);
-    right: -0.5rem;
+    left: 0;
     width: 220px;
     padding: 0.5rem 0.6rem;
     font-size: 0.75rem;
@@ -244,7 +244,10 @@ After the listing cache append optimization, **PUTs are the largest API cost**. 
     document.getElementById('getCost').textContent = usd(getCost);
     document.getElementById('listCount').textContent = fmt(totalLISTs);
     document.getElementById('listCost').textContent = usd(listCost);
-    document.getElementById('storageSize').textContent = fmt(storageGB) + ' GB';
+    var storageTB = storageGB / 1024;
+    document.getElementById('storageSize').textContent = storageGB >= 1024
+      ? storageTB.toFixed(1) + ' TB'
+      : fmt(storageGB) + ' GB';
     document.getElementById('storageCost').textContent = usd(storageCostVal);
     document.getElementById('totalCost').textContent = usd(total);
     document.getElementById('dataRate').textContent = (bytesPerSecUncompressed / (1024 * 1024)).toFixed(1) + ' MiB/s';
