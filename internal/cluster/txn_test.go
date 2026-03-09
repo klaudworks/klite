@@ -522,3 +522,509 @@ func TestExpiredTransactionsIgnoresZeroTimeout(t *testing.T) {
 		t.Fatalf("expected 0 expired with zero timeout, got %d", len(expired))
 	}
 }
+
+// --- StoreTxnOffset tests ---
+
+func TestStoreTxnOffsetValid(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-store", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	errCode := m.StoreTxnOffset(pid, epoch, "group-1", "t", 0, 42, 0, "meta")
+	if errCode != 0 {
+		t.Fatalf("StoreTxnOffset: errCode=%d, want 0", errCode)
+	}
+
+	ps := m.GetProducer(pid)
+	gOffsets := ps.TxnOffsets["group-1"]
+	pending, ok := gOffsets[TopicPartition{Topic: "t", Partition: 0}]
+	if !ok {
+		t.Fatal("expected pending offset for group-1, t-0")
+	}
+	if pending.Offset != 42 || pending.Metadata != "meta" {
+		t.Fatalf("pending = %+v, want offset=42 metadata=meta", pending)
+	}
+}
+
+func TestStoreTxnOffsetUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	errCode := m.StoreTxnOffset(999, 0, "group-1", "t", 0, 42, 0, "")
+	if errCode != 3 {
+		t.Fatalf("StoreTxnOffset unknown PID: errCode=%d, want 3", errCode)
+	}
+}
+
+func TestStoreTxnOffsetFencedEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, _, _ := m.InitProducerID("txn-fence", 5000)
+	// Re-init to bump epoch to 1.
+	_, epoch, _ := m.InitProducerID("txn-fence", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// Old epoch (0) should be fenced.
+	errCode := m.StoreTxnOffset(pid, 0, "group-1", "t", 0, 42, 0, "")
+	if errCode != 35 {
+		t.Fatalf("StoreTxnOffset fenced: errCode=%d, want 35 (PRODUCER_FENCED)", errCode)
+	}
+}
+
+func TestStoreTxnOffsetInvalidEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-inv-epoch", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// Higher epoch than current should return INVALID_PRODUCER_EPOCH.
+	errCode := m.StoreTxnOffset(pid, epoch+1, "group-1", "t", 0, 42, 0, "")
+	if errCode != 47 {
+		t.Fatalf("StoreTxnOffset invalid epoch: errCode=%d, want 47 (INVALID_PRODUCER_EPOCH)", errCode)
+	}
+}
+
+func TestStoreTxnOffsetNotOngoing(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-not-ongoing", 5000)
+
+	// No AddPartitionsToTxn → TxnState is TxnNone.
+	errCode := m.StoreTxnOffset(pid, epoch, "group-1", "t", 0, 42, 0, "")
+	if errCode != 53 {
+		t.Fatalf("StoreTxnOffset not ongoing: errCode=%d, want 53 (INVALID_TXN_STATE)", errCode)
+	}
+}
+
+func TestStoreTxnOffsetMultipleGroups(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-multi-grp", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	m.StoreTxnOffset(pid, epoch, "group-a", "t", 0, 10, 0, "")
+	m.StoreTxnOffset(pid, epoch, "group-b", "t", 0, 20, 0, "")
+
+	ps := m.GetProducer(pid)
+	if len(ps.TxnOffsets) != 2 {
+		t.Fatalf("expected 2 groups in TxnOffsets, got %d", len(ps.TxnOffsets))
+	}
+	if ps.TxnOffsets["group-a"][TopicPartition{Topic: "t", Partition: 0}].Offset != 10 {
+		t.Fatal("group-a offset mismatch")
+	}
+	if ps.TxnOffsets["group-b"][TopicPartition{Topic: "t", Partition: 0}].Offset != 20 {
+		t.Fatal("group-b offset mismatch")
+	}
+}
+
+// --- AddOffsetsToTxn tests ---
+
+func TestAddOffsetsToTxnValid(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	pid, epoch, _ := m.InitProducerID("txn-offsets", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	errCode := m.AddOffsetsToTxn(pid, epoch, "consumer-group")
+	if errCode != 0 {
+		t.Fatalf("AddOffsetsToTxn: errCode=%d, want 0", errCode)
+	}
+
+	ps := m.GetProducer(pid)
+	if len(ps.TxnGroups) != 1 || ps.TxnGroups[0] != "consumer-group" {
+		t.Fatalf("TxnGroups = %v, want [consumer-group]", ps.TxnGroups)
+	}
+}
+
+func TestAddOffsetsToTxnStartsTxn(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	pid, epoch, _ := m.InitProducerID("txn-auto-start", 5000)
+
+	// Call AddOffsetsToTxn without prior AddPartitionsToTxn — should start txn.
+	errCode := m.AddOffsetsToTxn(pid, epoch, "group-1")
+	if errCode != 0 {
+		t.Fatalf("AddOffsetsToTxn: errCode=%d, want 0", errCode)
+	}
+
+	ps := m.GetProducer(pid)
+	if ps.TxnState != TxnOngoing {
+		t.Fatalf("TxnState = %d, want TxnOngoing (%d)", ps.TxnState, TxnOngoing)
+	}
+}
+
+func TestAddOffsetsToTxnUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	errCode := m.AddOffsetsToTxn(999, 0, "group-1")
+	if errCode != 3 {
+		t.Fatalf("AddOffsetsToTxn unknown PID: errCode=%d, want 3", errCode)
+	}
+}
+
+func TestAddOffsetsToTxnFencedEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, _, _ := m.InitProducerID("txn-aot-fence", 5000)
+	_, epoch, _ := m.InitProducerID("txn-aot-fence", 5000)
+	_ = epoch
+
+	errCode := m.AddOffsetsToTxn(pid, 0, "group-1")
+	if errCode != 35 {
+		t.Fatalf("AddOffsetsToTxn fenced: errCode=%d, want 35", errCode)
+	}
+}
+
+func TestAddOffsetsToTxnInvalidEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-aot-inv", 5000)
+
+	errCode := m.AddOffsetsToTxn(pid, epoch+1, "group-1")
+	if errCode != 47 {
+		t.Fatalf("AddOffsetsToTxn invalid epoch: errCode=%d, want 47", errCode)
+	}
+}
+
+func TestAddOffsetsToTxnNonTransactional(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("", 0)
+
+	errCode := m.AddOffsetsToTxn(pid, epoch, "group-1")
+	if errCode != 49 {
+		t.Fatalf("AddOffsetsToTxn non-transactional: errCode=%d, want 49", errCode)
+	}
+}
+
+// --- PrepareEndTxn tests ---
+
+func TestPrepareEndTxnCommit(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-end", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+	m.AddOffsetsToTxn(pid, epoch, "group-1")
+	m.StoreTxnOffset(pid, epoch, "group-1", "t", 0, 50, 0, "")
+	m.RecordTxnBatch(pid, "t", 0, 100)
+
+	state, errCode := m.PrepareEndTxn(pid, epoch, true)
+	if errCode != 0 {
+		t.Fatalf("PrepareEndTxn: errCode=%d, want 0", errCode)
+	}
+	if !state.Commit {
+		t.Fatal("expected commit=true")
+	}
+	if len(state.TxnPartitions) != 1 {
+		t.Fatalf("TxnPartitions count=%d, want 1", len(state.TxnPartitions))
+	}
+	if len(state.TxnGroups) != 1 || state.TxnGroups[0] != "group-1" {
+		t.Fatalf("TxnGroups = %v, want [group-1]", state.TxnGroups)
+	}
+	if state.TxnOffsets["group-1"][TopicPartition{Topic: "t", Partition: 0}].Offset != 50 {
+		t.Fatal("expected offset 50 in end state")
+	}
+	if state.TxnFirstOffsets[tp] != 100 {
+		t.Fatalf("TxnFirstOffsets[tp] = %d, want 100", state.TxnFirstOffsets[tp])
+	}
+
+	// Producer state should be reset.
+	ps := m.GetProducer(pid)
+	if ps.TxnState != TxnNone {
+		t.Fatalf("TxnState after commit = %d, want TxnNone", ps.TxnState)
+	}
+	if ps.LastWasCommit != true {
+		t.Fatal("LastWasCommit should be true")
+	}
+}
+
+func TestPrepareEndTxnRetryIdempotent(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-retry", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// First EndTxn commit.
+	_, errCode := m.PrepareEndTxn(pid, epoch, true)
+	if errCode != 0 {
+		t.Fatalf("first PrepareEndTxn: errCode=%d", errCode)
+	}
+
+	// Retry with same commit flag — idempotent, should succeed.
+	state, errCode := m.PrepareEndTxn(pid, epoch, true)
+	if errCode != 0 {
+		t.Fatalf("retry PrepareEndTxn (same flag): errCode=%d, want 0", errCode)
+	}
+	if state == nil {
+		t.Fatal("expected non-nil state on idempotent retry")
+	}
+	if !state.Commit {
+		t.Fatal("expected commit=true on idempotent retry")
+	}
+	// Idempotent retry returns empty partitions/groups (txn already ended).
+	if len(state.TxnPartitions) != 0 {
+		t.Fatalf("expected empty TxnPartitions on retry, got %d", len(state.TxnPartitions))
+	}
+}
+
+func TestPrepareEndTxnRetryDifferentFlag(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-diff", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// Commit the transaction.
+	_, errCode := m.PrepareEndTxn(pid, epoch, true)
+	if errCode != 0 {
+		t.Fatalf("first commit: errCode=%d", errCode)
+	}
+
+	// Retry with different flag (abort) — should return INVALID_TXN_STATE.
+	state, errCode := m.PrepareEndTxn(pid, epoch, false)
+	if errCode != 53 {
+		t.Fatalf("retry with different flag: errCode=%d, want 53 (INVALID_TXN_STATE)", errCode)
+	}
+	if state != nil {
+		t.Fatal("expected nil state on INVALID_TXN_STATE")
+	}
+}
+
+func TestPrepareEndTxnAbortRetryIdempotent(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-abort-retry", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	// First EndTxn abort.
+	_, errCode := m.PrepareEndTxn(pid, epoch, false)
+	if errCode != 0 {
+		t.Fatalf("first abort: errCode=%d", errCode)
+	}
+
+	// Retry abort — should be idempotent.
+	state, errCode := m.PrepareEndTxn(pid, epoch, false)
+	if errCode != 0 {
+		t.Fatalf("retry abort: errCode=%d, want 0", errCode)
+	}
+	if state.Commit {
+		t.Fatal("expected commit=false on abort retry")
+	}
+}
+
+func TestPrepareEndTxnUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	state, errCode := m.PrepareEndTxn(999, 0, true)
+	if errCode != 3 {
+		t.Fatalf("PrepareEndTxn unknown PID: errCode=%d, want 3", errCode)
+	}
+	if state != nil {
+		t.Fatal("expected nil state for unknown PID")
+	}
+}
+
+func TestPrepareEndTxnFencedEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, _, _ := m.InitProducerID("txn-end-fence", 5000)
+	_, epoch, _ := m.InitProducerID("txn-end-fence", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	_, errCode := m.PrepareEndTxn(pid, 0, true)
+	if errCode != 35 {
+		t.Fatalf("PrepareEndTxn fenced: errCode=%d, want 35", errCode)
+	}
+}
+
+func TestPrepareEndTxnInvalidEpoch(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-end-inv", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	_, errCode := m.PrepareEndTxn(pid, epoch+1, true)
+	if errCode != 47 {
+		t.Fatalf("PrepareEndTxn invalid epoch: errCode=%d, want 47", errCode)
+	}
+}
+
+// --- RecordTxnBatch tests ---
+
+func TestRecordTxnBatchTracksFirstOffset(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-batch", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	m.RecordTxnBatch(pid, "t", 0, 100)
+	m.RecordTxnBatch(pid, "t", 0, 200)
+	m.RecordTxnBatch(pid, "t", 0, 300)
+
+	ps := m.GetProducer(pid)
+
+	// TxnFirstOffsets should only record the first offset per partition.
+	if first := ps.TxnFirstOffsets[tp]; first != 100 {
+		t.Fatalf("TxnFirstOffsets[t-0] = %d, want 100", first)
+	}
+
+	// All batches should be tracked in TxnBatches.
+	if len(ps.TxnBatches) != 3 {
+		t.Fatalf("TxnBatches count = %d, want 3", len(ps.TxnBatches))
+	}
+}
+
+func TestRecordTxnBatchMultiplePartitions(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-batch-mp", 5000)
+	tp0 := TopicPartition{Topic: "t", Partition: 0}
+	tp1 := TopicPartition{Topic: "t", Partition: 1}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0, tp1})
+
+	m.RecordTxnBatch(pid, "t", 0, 10)
+	m.RecordTxnBatch(pid, "t", 1, 20)
+	m.RecordTxnBatch(pid, "t", 0, 50)
+
+	ps := m.GetProducer(pid)
+	if ps.TxnFirstOffsets[tp0] != 10 {
+		t.Fatalf("TxnFirstOffsets[t-0] = %d, want 10", ps.TxnFirstOffsets[tp0])
+	}
+	if ps.TxnFirstOffsets[tp1] != 20 {
+		t.Fatalf("TxnFirstOffsets[t-1] = %d, want 20", ps.TxnFirstOffsets[tp1])
+	}
+}
+
+func TestRecordTxnBatchUnknownPID(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	// Should be a no-op, not panic.
+	m.RecordTxnBatch(999, "t", 0, 100)
+}
+
+// --- InitProducerID epoch overflow tests ---
+
+func TestInitProducerIDEpochOverflow(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, _, _ := m.InitProducerID("txn-overflow", 5000)
+	originalPID := pid
+
+	// Manually set epoch to max int16 so next bump overflows.
+	ps := m.GetProducer(pid)
+	m.mu.Lock()
+	ps.Epoch = 32766 // next InitProducerID will bump to 32767, then one more will overflow
+	m.mu.Unlock()
+
+	// Bump to 32767 (max int16).
+	pid2, epoch2, errCode := m.InitProducerID("txn-overflow", 5000)
+	if errCode != 0 {
+		t.Fatalf("bump to max: errCode=%d", errCode)
+	}
+	if pid2 != originalPID {
+		t.Fatalf("PID should still be %d, got %d", originalPID, pid2)
+	}
+	if epoch2 != 32767 {
+		t.Fatalf("epoch = %d, want 32767", epoch2)
+	}
+
+	// Next bump: 32767+1 overflows int16 to negative → triggers new PID allocation.
+	pid3, epoch3, errCode := m.InitProducerID("txn-overflow", 5000)
+	if errCode != 0 {
+		t.Fatalf("overflow bump: errCode=%d", errCode)
+	}
+	if pid3 == originalPID {
+		t.Fatalf("expected new PID after overflow, still got %d", pid3)
+	}
+	if epoch3 != 0 {
+		t.Fatalf("epoch after overflow = %d, want 0", epoch3)
+	}
+
+	// Old PID should be removed.
+	if old := m.GetProducer(originalPID); old != nil {
+		t.Fatal("old PID should be removed after overflow")
+	}
+
+	// New PID should be active.
+	newPS := m.GetProducer(pid3)
+	if newPS == nil {
+		t.Fatal("new PID should be registered")
+	}
+	if newPS.TxnID != "txn-overflow" {
+		t.Fatalf("new producer TxnID = %q, want txn-overflow", newPS.TxnID)
+	}
+}
+
+func TestInitProducerIDReuseTxnIDResetsOngoingTxn(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFakeClock(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	m := NewProducerIDManager()
+	m.SetClock(fc)
+
+	pid, epoch, _ := m.InitProducerID("txn-reuse", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp})
+
+	ps := m.GetProducer(pid)
+	if ps.TxnState != TxnOngoing {
+		t.Fatalf("TxnState = %d, want TxnOngoing", ps.TxnState)
+	}
+
+	// Re-init same txnID while txn is ongoing — should reset txn state and bump epoch.
+	pid2, epoch2, _ := m.InitProducerID("txn-reuse", 5000)
+	if pid2 != pid {
+		t.Fatalf("PID changed on re-init: %d != %d", pid2, pid)
+	}
+	if epoch2 != epoch+1 {
+		t.Fatalf("epoch = %d, want %d", epoch2, epoch+1)
+	}
+
+	ps = m.GetProducer(pid)
+	if ps.TxnState != TxnNone {
+		t.Fatalf("TxnState after re-init = %d, want TxnNone", ps.TxnState)
+	}
+	if len(ps.TxnPartitions) != 0 {
+		t.Fatalf("TxnPartitions should be empty after re-init, got %d", len(ps.TxnPartitions))
+	}
+}
