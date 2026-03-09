@@ -73,13 +73,9 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
 
 ### What drives costs
 
-**Storage** is the dominant cost in almost every scenario (90%+ of total). API costs only become significant at very high message rates with multiple S3-tier consumers.
+**Storage dominates** — typically 90%+ of total S3 cost. API costs only matter at very high throughput.
 
-After the listing cache append optimization, **PUTs are the largest API cost**. Each flush cycle creates one S3 object per partition (when data exceeds the target object size or flush interval). Increasing the target object size (`--s3-target-object-size`) reduces PUT count proportionally.
-
-**GETs** scale with `objects * consumers` — each S3-tier consumer reads each new object once (range GET + footer read).
-
-**LISTs** are now negligible. The listing cache is maintained in-memory and only refreshed on cold start or after compaction.
+The main API cost driver is **cold reads**: consumers fetching data that's too old to be in the on-disk WAL. If your consumers keep up with producers, all reads are served from the WAL and never hit S3.
 
 <style>{`
   .calc-grid {
