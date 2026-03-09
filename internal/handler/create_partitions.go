@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"log/slog"
+
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/server"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -31,6 +33,13 @@ func HandleCreatePartitions(state *cluster.State) server.Handler {
 			}
 
 			if !r.ValidateOnly {
+				if err := state.PersistPartitionCount(rt.Topic, td.ID, rt.Count); err != nil {
+					slog.Warn("metadata.log: failed to persist CreatePartitions",
+						"topic", rt.Topic, "count", rt.Count, "err", err)
+					st.ErrorCode = kerr.KafkaStorageError.Code
+					resp.Topics = append(resp.Topics, st)
+					continue
+				}
 				state.AddPartitions(rt.Topic, int(rt.Count))
 			}
 

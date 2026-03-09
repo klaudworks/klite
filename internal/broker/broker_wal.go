@@ -46,6 +46,10 @@ func (b *Broker) initMetadataLog() error {
 		b.state.SetCompactionWatermarkFromReplay(e.TopicName, e.Partition, e.CleanedUpTo)
 	})
 
+	ml.SetPartitionCountCallback(func(e metadata.PartitionCountEntry) {
+		b.state.AddPartitionsFromReplay(e.TopicName, e.TopicID, int(e.PartitionCount))
+	})
+
 	if b.saslStore != nil {
 		ml.SetScramCallbacks(
 			func(e metadata.ScramCredentialEntry) {

@@ -1089,6 +1089,48 @@ func TestAddPartitions(t *testing.T) {
 	s.AddPartitions("nonexistent", 10)
 }
 
+func TestAddPartitionsFromReplay(t *testing.T) {
+	t.Parallel()
+
+	s := NewState(Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  false,
+	})
+
+	td, _ := s.CreateTopic("grow-replay-topic", 2)
+	if len(td.Partitions) != 2 {
+		t.Fatalf("expected 2 partitions initially, got %d", len(td.Partitions))
+	}
+
+	s.AddPartitionsFromReplay("grow-replay-topic", td.ID, 5)
+	td = s.GetTopic("grow-replay-topic")
+	if len(td.Partitions) != 5 {
+		t.Fatalf("expected 5 partitions after replay growth, got %d", len(td.Partitions))
+	}
+
+	// Re-applying the same replay entry should be idempotent.
+	s.AddPartitionsFromReplay("grow-replay-topic", td.ID, 5)
+	td = s.GetTopic("grow-replay-topic")
+	if len(td.Partitions) != 5 {
+		t.Fatalf("expected idempotent replay to keep 5 partitions, got %d", len(td.Partitions))
+	}
+
+	// Stale replay entry with smaller count should be ignored.
+	s.AddPartitionsFromReplay("grow-replay-topic", td.ID, 3)
+	td = s.GetTopic("grow-replay-topic")
+	if len(td.Partitions) != 5 {
+		t.Fatalf("expected stale replay entry to be ignored, got %d partitions", len(td.Partitions))
+	}
+
+	// Unknown topic ID should be ignored.
+	s.AddPartitionsFromReplay("grow-replay-topic", [16]byte{9, 9, 9}, 8)
+	td = s.GetTopic("grow-replay-topic")
+	if len(td.Partitions) != 5 {
+		t.Fatalf("expected unknown topic ID to be ignored, got %d partitions", len(td.Partitions))
+	}
+}
+
 func TestSnapshotEntries(t *testing.T) {
 	t.Parallel()
 

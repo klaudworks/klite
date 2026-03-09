@@ -287,6 +287,48 @@ func TestMetadataLogReplayEntry(t *testing.T) {
 	}
 }
 
+func TestMetadataLogReplayEntryPartitionCount(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	ml, err := NewLog(LogConfig{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ml.Close() }()
+
+	var got []PartitionCountEntry
+	ml.SetPartitionCountCallback(func(e PartitionCountEntry) {
+		got = append(got, e)
+	})
+
+	entry := MarshalPartitionCount(&PartitionCountEntry{
+		TopicName:      "replayed-topic",
+		TopicID:        [16]byte{1, 2, 3},
+		PartitionCount: 9,
+	})
+
+	frameSize := 4 + 4 + len(entry)
+	frame := make([]byte, frameSize)
+	binary.BigEndian.PutUint32(frame[0:4], uint32(4+len(entry)))
+	binary.BigEndian.PutUint32(frame[4:8], crc32.Checksum(entry, crc32cTable))
+	copy(frame[8:], entry)
+
+	if err := ml.ReplayEntry(frame); err != nil {
+		t.Fatalf("ReplayEntry: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 partition count callback, got %d", len(got))
+	}
+	if got[0].PartitionCount != 9 {
+		t.Fatalf("partition count: got %d, want 9", got[0].PartitionCount)
+	}
+	if got[0].TopicName != "replayed-topic" {
+		t.Fatalf("topic name: got %q, want replayed-topic", got[0].TopicName)
+	}
+}
+
 func TestMetadataLogReplayEntryCRCMismatch(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

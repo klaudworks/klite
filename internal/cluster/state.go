@@ -367,19 +367,7 @@ func (s *State) AddPartitions(topicName string, newCount int) {
 	if !ok {
 		return
 	}
-	current := len(td.Partitions)
-	if newCount <= current {
-		return
-	}
-	for i := current; i < newCount; i++ {
-		pd := &PartData{
-			Topic:   topicName,
-			Index:   int32(i),
-			TopicID: td.ID,
-		}
-		pd.InitWAL(s.chunkPool, s.walWriter, s.walIndex)
-		td.Partitions = append(td.Partitions, pd)
-	}
+	s.growTopicPartitionsLocked(td, newCount)
 }
 
 func (s *State) SetTopicConfig(topicName, key, value string) {
@@ -456,6 +444,24 @@ func (s *State) PersistTopicCreation(td *TopicData) {
 		slog.Warn("metadata.log: failed to persist topic creation",
 			"topic", td.Name, "err", err)
 	}
+}
+
+// PersistPartitionCount writes a partition expansion entry to the metadata log.
+// Must be called outside s.mu. Returns nil if metadata log is not configured.
+func (s *State) PersistPartitionCount(topicName string, topicID [16]byte, partitionCount int32) error {
+	ml := s.metaLog
+	if ml == nil {
+		return nil
+	}
+	entry := metadata.MarshalPartitionCount(&metadata.PartitionCountEntry{
+		TopicName:      topicName,
+		TopicID:        topicID,
+		PartitionCount: partitionCount,
+	})
+	if err := ml.AppendSync(entry); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SnapshotEntries generates serialized metadata entries for all live state.
@@ -571,6 +577,33 @@ func (s *State) CreateTopicFromReplay(name string, numPartitions int, topicID [1
 	return td
 }
 
+// AddPartitionsFromReplay grows a topic's partition count during metadata.log replay.
+// The operation is idempotent and ignores stale entries with smaller/equal counts.
+func (s *State) AddPartitionsFromReplay(topicName string, topicID [16]byte, newCount int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	td, ok := s.topics[topicName]
+	if ok && td.ID != topicID {
+		td = nil
+		ok = false
+	}
+	if !ok {
+		for _, candidate := range s.topics {
+			if candidate.ID == topicID {
+				td = candidate
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok || td == nil {
+		return
+	}
+
+	s.growTopicPartitionsLocked(td, newCount)
+}
+
 func (s *State) SetCommittedOffsetFromReplay(groupID, topic string, partition int32, offset int64, metadataStr string) {
 	s.mu.Lock()
 	g, ok := s.groups[groupID]
@@ -636,6 +669,26 @@ func (s *State) StopAllGroups() {
 	defer s.mu.Unlock()
 	for _, g := range s.groups {
 		g.Stop()
+	}
+}
+
+// Caller must hold s.mu.Lock().
+func (s *State) growTopicPartitionsLocked(td *TopicData, newCount int) {
+	current := len(td.Partitions)
+	if newCount <= current {
+		return
+	}
+	for i := current; i < newCount; i++ {
+		pd := &PartData{
+			Topic:   td.Name,
+			Index:   int32(i),
+			TopicID: td.ID,
+		}
+		pd.InitWAL(s.chunkPool, s.walWriter, s.walIndex)
+		if s.s3Fetcher != nil {
+			pd.SetS3Fetcher(s.s3Fetcher)
+		}
+		td.Partitions = append(td.Partitions, pd)
 	}
 }
 

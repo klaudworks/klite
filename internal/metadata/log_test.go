@@ -115,6 +115,26 @@ func TestEntryRoundTrip_LogStartOffset(t *testing.T) {
 	}
 }
 
+func TestEntryRoundTrip_PartitionCount(t *testing.T) {
+	t.Parallel()
+	e := PartitionCountEntry{
+		TopicName:      "pc-topic",
+		TopicID:        [16]byte{1, 2, 3, 4},
+		PartitionCount: 7,
+	}
+	buf := MarshalPartitionCount(&e)
+	if buf[0] != EntryPartitionCount {
+		t.Fatalf("expected type %x, got %x", EntryPartitionCount, buf[0])
+	}
+	got, err := UnmarshalPartitionCount(buf[1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TopicName != e.TopicName || got.TopicID != e.TopicID || got.PartitionCount != e.PartitionCount {
+		t.Fatalf("mismatch: got %+v, want %+v", got, e)
+	}
+}
+
 func TestLogAppendAndReplay(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -156,6 +176,15 @@ func TestLogAppendAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	err = ml.AppendSync(MarshalPartitionCount(&PartitionCountEntry{
+		TopicName:      "test-topic",
+		TopicID:        topicID,
+		PartitionCount: 5,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	_ = ml.Close()
 
 	// Replay
@@ -168,6 +197,7 @@ func TestLogAppendAndReplay(t *testing.T) {
 	var topics []CreateTopicEntry
 	var offsets []OffsetCommitEntry
 	var logStarts []LogStartOffsetEntry
+	var partitionCounts []PartitionCountEntry
 
 	ml2.SetCallbacks(
 		func(e CreateTopicEntry) { topics = append(topics, e) },
@@ -177,14 +207,15 @@ func TestLogAppendAndReplay(t *testing.T) {
 		func(e ProducerIDEntry) {},
 		func(e LogStartOffsetEntry) { logStarts = append(logStarts, e) },
 	)
+	ml2.SetPartitionCountCallback(func(e PartitionCountEntry) { partitionCounts = append(partitionCounts, e) })
 
 	count, err := ml2.Replay()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if count != 3 {
-		t.Fatalf("expected 3 entries, got %d", count)
+	if count != 4 {
+		t.Fatalf("expected 4 entries, got %d", count)
 	}
 	if len(topics) != 1 {
 		t.Fatalf("expected 1 topic, got %d", len(topics))
@@ -214,6 +245,12 @@ func TestLogAppendAndReplay(t *testing.T) {
 	}
 	if logStarts[0].LogStartOffset != 10 {
 		t.Fatalf("unexpected logStartOffset: %d", logStarts[0].LogStartOffset)
+	}
+	if len(partitionCounts) != 1 {
+		t.Fatalf("expected 1 partition count entry, got %d", len(partitionCounts))
+	}
+	if partitionCounts[0].PartitionCount != 5 {
+		t.Fatalf("unexpected partition count: %d", partitionCounts[0].PartitionCount)
 	}
 }
 

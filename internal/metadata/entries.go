@@ -16,6 +16,7 @@ const (
 	EntryScramCredential       byte = 0x07
 	EntryScramCredentialDelete byte = 0x08
 	EntryCompactionWatermark   byte = 0x09
+	EntryPartitionCount        byte = 0x0A
 )
 
 type CreateTopicEntry struct {
@@ -52,6 +53,12 @@ type LogStartOffsetEntry struct {
 	TopicName      string
 	Partition      int32
 	LogStartOffset int64
+}
+
+type PartitionCountEntry struct {
+	TopicName      string
+	TopicID        [16]byte
+	PartitionCount int32
 }
 
 // Serialization format:
@@ -291,6 +298,41 @@ func UnmarshalLogStartOffset(payload []byte) (LogStartOffsetEntry, error) {
 		return e, fmt.Errorf("short read for logStartOffset")
 	}
 	e.LogStartOffset = int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	return e, nil
+}
+
+func MarshalPartitionCount(e *PartitionCountEntry) []byte {
+	size := 1 + 2 + len(e.TopicName) + 16 + 4
+	buf := make([]byte, size)
+	buf[0] = EntryPartitionCount
+	off := 1
+	off = putString(buf, off, e.TopicName)
+	copy(buf[off:off+16], e.TopicID[:])
+	off += 16
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(e.PartitionCount))
+	return buf
+}
+
+func UnmarshalPartitionCount(payload []byte) (PartitionCountEntry, error) {
+	var e PartitionCountEntry
+	off := 0
+	var err error
+
+	e.TopicName, off, err = getString(payload, off)
+	if err != nil {
+		return e, err
+	}
+
+	if off+16 > len(payload) {
+		return e, fmt.Errorf("short read for topic ID")
+	}
+	copy(e.TopicID[:], payload[off:off+16])
+	off += 16
+
+	if off+4 > len(payload) {
+		return e, fmt.Errorf("short read for partition count")
+	}
+	e.PartitionCount = int32(binary.BigEndian.Uint32(payload[off : off+4]))
 	return e, nil
 }
 

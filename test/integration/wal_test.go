@@ -418,6 +418,81 @@ func TestWALMultiPartitionRestart(t *testing.T) {
 	}
 }
 
+// TestWALCreatePartitionsSurvivesRestart verifies that CreatePartitions is
+// durably persisted before success is returned. A record written to a newly
+// added partition must still be present after restart.
+func TestWALCreatePartitionsSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	topic := "wal-create-partitions-restart-test"
+	newPartition := int32(3)
+
+	func() {
+		tb := StartBroker(t,
+
+			WithDataDir(dataDir),
+		)
+		defer tb.Stop()
+
+		admin := NewAdminClient(t, tb.Addr)
+		_, err := admin.CreateTopic(context.Background(), 1, 1, nil, topic)
+		require.NoError(t, err)
+
+		resps, err := admin.UpdatePartitions(context.Background(), 4, topic)
+		require.NoError(t, err)
+		require.NoError(t, resps.Error())
+
+		producer := NewClient(t, tb.Addr,
+			kgo.DefaultProduceTopic(topic),
+			kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		)
+		first := &kgo.Record{Topic: topic, Partition: newPartition, Value: []byte("before-restart")}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		results := producer.ProduceSync(ctx, first)
+		cancel()
+		require.Len(t, results, 1)
+		require.NoError(t, results[0].Err)
+		require.Equal(t, int64(0), results[0].Record.Offset)
+	}()
+
+	tb2 := StartBroker(t,
+
+		WithDataDir(dataDir),
+	)
+
+	admin2 := NewAdminClient(t, tb2.Addr)
+	topics, err := admin2.ListTopics(context.Background())
+	require.NoError(t, err)
+	td, ok := topics[topic]
+	require.True(t, ok)
+	require.Len(t, td.Partitions, 4)
+
+	producer2 := NewClient(t, tb2.Addr,
+		kgo.DefaultProduceTopic(topic),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+	)
+	second := &kgo.Record{Topic: topic, Partition: newPartition, Value: []byte("after-restart")}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	results := producer2.ProduceSync(ctx, second)
+	cancel()
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
+	require.Equal(t, int64(1), results[0].Record.Offset)
+
+	consumer := NewClient(t, tb2.Addr,
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			topic: {newPartition: kgo.NewOffset().AtStart()},
+		}),
+	)
+	consumed := ConsumeN(t, consumer, 2, 10*time.Second)
+	require.Len(t, consumed, 2)
+	require.Equal(t, int64(0), consumed[0].Offset)
+	require.Equal(t, int64(1), consumed[1].Offset)
+	require.Equal(t, "before-restart", string(consumed[0].Value))
+	require.Equal(t, "after-restart", string(consumed[1].Value))
+}
+
 // TestWALCrashRecovery verifies that if the last WAL entry is corrupted
 // (simulating a crash mid-write), the broker recovers by truncating the
 // corrupted tail and serves all valid data.

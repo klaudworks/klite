@@ -47,6 +47,7 @@ type Log struct {
 	offsetCommitCallback          func(OffsetCommitEntry)
 	producerIDCallback            func(ProducerIDEntry)
 	logStartCallback              func(LogStartOffsetEntry)
+	partitionCountCallback        func(PartitionCountEntry)
 	scramCredentialCallback       func(ScramCredentialEntry)
 	scramCredentialDeleteCallback func(ScramCredentialDeleteEntry)
 	compactionWatermarkCallback   func(CompactionWatermarkEntry)
@@ -276,6 +277,15 @@ func (l *Log) dispatchEntry(entryType byte, data []byte) error {
 			l.logStartCallback(e)
 		}
 
+	case EntryPartitionCount:
+		e, err := UnmarshalPartitionCount(data)
+		if err != nil {
+			return err
+		}
+		if l.partitionCountCallback != nil {
+			l.partitionCountCallback(e)
+		}
+
 	case EntryScramCredential:
 		e, err := UnmarshalScramCredential(data)
 		if err != nil {
@@ -324,6 +334,10 @@ func (l *Log) SetCallbacks(
 	l.offsetCommitCallback = offsetCommitCb
 	l.producerIDCallback = producerIDCb
 	l.logStartCallback = logStartCb
+}
+
+func (l *Log) SetPartitionCountCallback(cb func(PartitionCountEntry)) {
+	l.partitionCountCallback = cb
 }
 
 func (l *Log) SetScramCallbacks(
