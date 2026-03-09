@@ -44,6 +44,7 @@ export default defineConfig({
 			{ label: 'Latency Benchmark', slug: 'performance/benchmarks' },
 			{ label: 'Throughput Benchmark', slug: 'performance/stress-test' },
 				{ label: 'Optimizations', slug: 'performance/optimizations' },
+			{ label: 'S3 Cost Calculator', slug: 'performance/s3-cost-calculator' },
 			],
 		},
 			{

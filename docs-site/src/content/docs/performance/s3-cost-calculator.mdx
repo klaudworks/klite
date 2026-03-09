@@ -1,0 +1,227 @@
+---
+title: S3 Cost Calculator
+description: Estimate monthly S3 API and storage costs for your klite workload.
+---
+
+Estimate your monthly S3 costs based on your workload parameters. All calculations use US East (N. Virginia) S3 Standard pricing.
+
+<div id="calc">
+  <div class="calc-grid">
+    <div class="calc-field">
+      <label for="msgRate">Message rate (msgs/sec)</label>
+      <input type="number" id="msgRate" value="100000" min="1" />
+    </div>
+    <div class="calc-field">
+      <label for="msgSize">Average message size (bytes)</label>
+      <input type="number" id="msgSize" value="1024" min="1" />
+    </div>
+    <div class="calc-field">
+      <label for="partitions">Partitions</label>
+      <input type="number" id="partitions" value="10" min="1" />
+    </div>
+    <div class="calc-field">
+      <label for="consumers">S3-tier consumers (lagging)</label>
+      <input type="number" id="consumers" value="1" min="0" />
+    </div>
+    <div class="calc-field">
+      <label for="retention">Retention (days)</label>
+      <input type="number" id="retention" value="7" min="1" />
+    </div>
+    <div class="calc-field">
+      <label for="objectSize">Target object size (MiB)</label>
+      <input type="number" id="objectSize" value="64" min="1" />
+    </div>
+    <div class="calc-field">
+      <label for="flushInterval">Flush interval (seconds)</label>
+      <input type="number" id="flushInterval" value="60" min="1" />
+    </div>
+    <div class="calc-field">
+      <label for="compression">Compression ratio</label>
+      <input type="number" id="compression" value="1.5" min="1" step="0.1" />
+      <span class="calc-hint">1.0 = none, 1.5 = typical Snappy</span>
+    </div>
+  </div>
+
+  <div id="results" class="calc-results">
+    <table>
+      <thead>
+        <tr><th></th><th>Count/month</th><th>Cost/month</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>PUT</td><td id="putCount">—</td><td id="putCost">—</td></tr>
+        <tr><td>GET</td><td id="getCount">—</td><td id="getCost">—</td></tr>
+        <tr><td>LIST</td><td id="listCount">—</td><td id="listCost">—</td></tr>
+        <tr><td>Storage</td><td id="storageSize">—</td><td id="storageCost">—</td></tr>
+        <tr class="calc-total"><td><strong>Total</strong></td><td></td><td id="totalCost">—</td></tr>
+      </tbody>
+    </table>
+    <div class="calc-meta">
+      <span>Data rate: <strong id="dataRate">—</strong></span>
+      <span>On disk: <strong id="diskRate">—</strong></span>
+      <span>Objects flushed: <strong id="objectCount">—</strong>/month</span>
+    </div>
+  </div>
+</div>
+
+:::note
+S3-tier consumers are consumers reading data that has already been flushed to S3 (i.e., lagging behind the in-memory buffer). Real-time consumers reading from the WAL do not generate S3 API calls.
+:::
+
+### Pricing reference
+
+| Operation | Rate |
+|-----------|------|
+| PUT / COPY / POST / LIST | $0.005 per 1,000 |
+| GET / SELECT | $0.0004 per 1,000 |
+| DELETE | Free |
+| Storage (first 50 TB) | $0.023 per GB-month |
+
+### What drives costs
+
+**Storage** is the dominant cost in almost every scenario (90%+ of total). API costs only become significant at very high message rates with multiple S3-tier consumers.
+
+After the listing cache append optimization, **PUTs are the largest API cost**. Each flush cycle creates one S3 object per partition (when data exceeds the target object size or flush interval). Increasing the target object size (`--s3-target-object-size`) reduces PUT count proportionally.
+
+**GETs** scale with `objects * consumers` — each S3-tier consumer reads each new object once (range GET + footer read).
+
+**LISTs** are now negligible. The listing cache is maintained in-memory and only refreshed on cold start or after compaction.
+
+<style>{`
+  .calc-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: end;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+  }
+  @media (max-width: 600px) {
+    .calc-grid { grid-template-columns: 1fr; }
+  }
+  .calc-field label {
+    display: block;
+    font-size: 0.85rem;
+    margin-bottom: 0.25rem;
+    color: var(--sl-color-gray-2);
+  }
+  .calc-field input {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 4px;
+    background: var(--sl-color-bg);
+    color: var(--sl-color-text);
+    font-size: 0.95rem;
+    font-family: inherit;
+  }
+  .calc-field input:focus {
+    outline: 2px solid var(--sl-color-accent);
+    outline-offset: -1px;
+  }
+  .calc-hint {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--sl-color-gray-3);
+    margin-top: 0.2rem;
+  }
+  .calc-results {
+    margin-top: 1rem;
+  }
+  .calc-results table {
+    width: 100%;
+  }
+  .calc-results td:nth-child(2),
+  .calc-results td:nth-child(3),
+  .calc-results th:nth-child(2),
+  .calc-results th:nth-child(3) {
+    text-align: right;
+  }
+  .calc-total td {
+    border-top: 2px solid var(--sl-color-gray-5);
+  }
+  .calc-meta {
+    display: flex;
+    gap: 2rem;
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+    color: var(--sl-color-gray-3);
+  }
+`}</style>
+
+<script is:inline>{`
+  const M = 2592000; // seconds per month
+  const PUT_RATE = 0.005 / 1000;
+  const GET_RATE = 0.0004 / 1000;
+  const LIST_RATE = 0.005 / 1000;
+  const STORAGE_RATE = 0.023; // per GB-month
+
+  function fmt(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return n.toFixed(0);
+  }
+  function usd(n) { return '$' + n.toFixed(2); }
+
+  function calculate() {
+    var rate = Number(document.getElementById('msgRate').value) || 0;
+    var size = Number(document.getElementById('msgSize').value) || 0;
+    var P = Number(document.getElementById('partitions').value) || 1;
+    var C = Number(document.getElementById('consumers').value) || 0;
+    var D = Number(document.getElementById('retention').value) || 1;
+    var targetMiB = Number(document.getElementById('objectSize').value) || 64;
+    var T = Number(document.getElementById('flushInterval').value) || 60;
+
+    var comp = Math.max(1, Number(document.getElementById('compression').value) || 1);
+
+    var targetBytes = targetMiB * 1024 * 1024;
+    var bytesPerSecUncompressed = rate * size;
+    var bytesPerSec = bytesPerSecUncompressed / comp;
+    var bytesPerPartitionPerInterval = (bytesPerSec / P) * T;
+    var objectsPerInterval = Math.max(1, bytesPerPartitionPerInterval / targetBytes);
+    var flushPUTs = objectsPerInterval * P * (M / T);
+
+    // PUTs: flush + metadata.log + lease renewal
+    var metaPUTs = M / T;
+    var leasePUTs = M / 5;
+    var totalPUTs = flushPUTs + metaPUTs + leasePUTs;
+
+    // GETs: consumer range + footer + lease standby
+    var consumerGETs = flushPUTs * C * 2; // range + footer
+    var leaseGETs = M / 2;
+    var totalGETs = consumerGETs + leaseGETs;
+
+    // LISTs: negligible after listing cache append optimization
+    // retention (per partition per hour) + compaction + GC
+    var retentionLISTs = P * (M / 3600);
+    var gcLISTs = M / 30;
+    var totalLISTs = retentionLISTs + gcLISTs;
+
+    // Storage
+    var storageBytes = bytesPerSec * D * 86400;
+    var storageGB = storageBytes / (1024 * 1024 * 1024);
+
+    var putCost = totalPUTs * PUT_RATE;
+    var getCost = totalGETs * GET_RATE;
+    var listCost = totalLISTs * LIST_RATE;
+    var storageCostVal = storageGB * STORAGE_RATE;
+    var total = putCost + getCost + listCost + storageCostVal;
+
+    document.getElementById('putCount').textContent = fmt(totalPUTs);
+    document.getElementById('putCost').textContent = usd(putCost);
+    document.getElementById('getCount').textContent = fmt(totalGETs);
+    document.getElementById('getCost').textContent = usd(getCost);
+    document.getElementById('listCount').textContent = fmt(totalLISTs);
+    document.getElementById('listCost').textContent = usd(listCost);
+    document.getElementById('storageSize').textContent = fmt(storageGB) + ' GB';
+    document.getElementById('storageCost').textContent = usd(storageCostVal);
+    document.getElementById('totalCost').textContent = usd(total);
+    document.getElementById('dataRate').textContent = (bytesPerSecUncompressed / (1024 * 1024)).toFixed(1) + ' MiB/s';
+    document.getElementById('diskRate').textContent = (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MiB/s';
+    document.getElementById('objectCount').textContent = fmt(flushPUTs);
+  }
+
+  document.querySelectorAll('#calc input').forEach(function(el) {
+    el.addEventListener('input', calculate);
+  });
+  calculate();
+`}</script>
