@@ -6,6 +6,8 @@ import (
 )
 
 func TestValidateTopicName(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		topic   string
@@ -31,6 +33,8 @@ func TestValidateTopicName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			got := ValidateTopicName(tt.topic)
 			if tt.wantErr == "" {
 				if got != "" {
