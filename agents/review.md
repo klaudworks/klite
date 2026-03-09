@@ -72,3 +72,10 @@ br create "title" -d "description" -p 1 -l needs-plan --deps discovered-from:<re
 - Approve changes that fail build or tests — even if the failure looks
   unrelated, the suite must be green before approval
 - Skip, disable, or weaken tests to make the suite pass
+
+## Beads Command Safety
+
+- Use `--format toon` only for read/query commands. Do not pass `--format` to
+  mutating commands (`create`, `update`, `close`, `comments add`).
+- For multi-line text sent to beads commands, use heredoc-safe quoting to
+  avoid shell parsing/escaping failures.

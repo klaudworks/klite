@@ -54,6 +54,13 @@ fulfills the plan's intent.
    - Fix it (up to 3 attempts)
    - If unfixable: revert and defer (see "Getting Stuck" in `ralph/03-improve.md`)
 
+## Beads Command Safety
+
+- Use `--format toon` only with read/query commands. Do not pass `--format` to
+  mutating commands (`create`, `update`, `close`, `comments add`).
+- Prefer heredoc-wrapped text for long descriptions/comments to avoid shell
+  quoting breakage.
+
 ## Commits
 
 One atomic commit per issue. The review agent expects a single hash to

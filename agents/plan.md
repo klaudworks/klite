@@ -72,6 +72,22 @@ the code better.
     br label add <issue-id> has-plan
     ```
 
+## Beads Command Safety
+
+- `--format toon` is for read/query commands only (`show`, `ready`, `list`,
+  `search`, etc.). Do not pass `--format` to mutating commands (`create`,
+  `update`, `close`, `comments add`).
+- For multi-line descriptions/comments, use safe heredoc quoting to avoid shell
+  escaping errors:
+
+```sh
+br create --actor "$ACTOR" "Title" -p 2 -t bug --description "$(cat <<'EOF'
+Line 1
+Line 2 with quotes "like this" and backticks `like this`
+EOF
+)"
+```
+
 ## What a Good Plan Contains
 
 - **Why this matters**: A sentence on the concrete benefit — fewer bugs,
