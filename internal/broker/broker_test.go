@@ -649,6 +649,156 @@ func TestAbortOrphanedTransactions_NoOrphans(t *testing.T) {
 	}
 }
 
+// TestAbortOrphanedTransactionsDurability verifies that orphan-sweep abort
+// control batches survive WAL replay.
+func TestAbortOrphanedTransactionsDurability(t *testing.T) {
+	t.Parallel()
+
+	walDir := t.TempDir()
+	logger := slog.Default()
+	topicID := [16]byte{9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4}
+
+	idx := wal.NewIndex()
+	walCfg := wal.DefaultWriterConfig()
+	walCfg.Dir = walDir
+	walCfg.S3Configured = true
+	walCfg.Logger = logger
+	w, err := wal.NewWriter(walCfg, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Stop() })
+
+	pool := chunk.NewPool(64*1024*1024, cluster.DefaultMaxMessageBytes)
+	state := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+
+	td, _, err := state.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td.ID = topicID
+	pd := td.Partitions[0]
+	pd.Lock()
+	pd.TopicID = topicID
+	pd.InitWAL(pool, w, idx)
+	pd.Unlock()
+
+	const producerID int64 = 1234
+	const producerEpoch int16 = 1
+	const firstOffset int64 = 0
+
+	txnBatch := makeTestBatchPID(firstOffset, 5, producerID, producerEpoch, 0)
+	binary.BigEndian.PutUint16(txnBatch[21:23], binary.BigEndian.Uint16(txnBatch[21:23])|0x0010)
+	errCh, walErr := w.AppendAsync(&wal.Entry{
+		TopicID:   topicID,
+		Partition: 0,
+		Offset:    firstOffset,
+		Data:      txnBatch,
+	})
+	if walErr != nil {
+		t.Fatal(walErr)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate replayed runtime state before orphan sweep.
+	pd.Lock()
+	pd.SetHW(6)
+	pd.AddOpenTxn(producerID, firstOffset)
+	pd.Unlock()
+
+	b := &Broker{
+		walWriter: w,
+		walIndex:  idx,
+		chunkPool: pool,
+		state:     state,
+		logger:    logger,
+		cfg:       Config{Clock: clock.RealClock{}},
+	}
+
+	b.abortOrphanedTransactions()
+
+	pd.RLock()
+	openAfterSweep := pd.OpenTxnPIDs()
+	hwAfterSweep := pd.HW()
+	pd.RUnlock()
+	if len(openAfterSweep) != 0 {
+		t.Fatalf("expected no open txns after sweep, got %v", openAfterSweep)
+	}
+
+	w.Stop()
+
+	idx2 := wal.NewIndex()
+	walCfg2 := wal.DefaultWriterConfig()
+	walCfg2.Dir = walDir
+	walCfg2.S3Configured = true
+	walCfg2.Logger = logger
+	w2, err := wal.NewWriter(walCfg2, idx2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w2.Stop() })
+
+	state2 := cluster.NewState(cluster.Config{
+		NodeID:            0,
+		DefaultPartitions: 1,
+		AutoCreateTopics:  true,
+	})
+	td2, _, err := state2.GetOrCreateTopic("test-topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td2.ID = topicID
+	pd2 := td2.Partitions[0]
+	pd2.Lock()
+	pd2.TopicID = topicID
+	pd2.InitWAL(pool, w2, idx2)
+	pd2.Unlock()
+
+	b2 := &Broker{
+		walWriter: w2,
+		walIndex:  idx2,
+		chunkPool: pool,
+		state:     state2,
+		logger:    logger,
+		cfg:       Config{Clock: clock.RealClock{}},
+	}
+	if err := b2.replayWAL(w2); err != nil {
+		t.Fatalf("replayWAL: %v", err)
+	}
+
+	pd2.RLock()
+	openAfterReplay := pd2.OpenTxnPIDs()
+	abortedAfterReplay := pd2.AbortedTxnsInRange(firstOffset, pd2.HW())
+	hwAfterReplay := pd2.HW()
+	lsoAfterReplay := pd2.LSO()
+	pd2.RUnlock()
+
+	if len(openAfterReplay) != 0 {
+		t.Fatalf("after replay expected no open txns, got %v", openAfterReplay)
+	}
+	if len(abortedAfterReplay) == 0 {
+		t.Fatal("after replay expected aborted txn index to contain orphan abort")
+	}
+	if hwAfterReplay != hwAfterSweep {
+		t.Fatalf("after replay HW=%d, want %d", hwAfterReplay, hwAfterSweep)
+	}
+	if lsoAfterReplay != hwAfterReplay {
+		t.Fatalf("after replay LSO=%d, want HW=%d", lsoAfterReplay, hwAfterReplay)
+	}
+}
+
 // TestEndTxnControlBatchDurability verifies that EndTxn commit/abort control
 // batches are written to the WAL and survive replay. This is the regression
 // test for the bug where HandleEndTxn used PushBatch (in-memory only) instead

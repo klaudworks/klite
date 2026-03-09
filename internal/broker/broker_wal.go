@@ -503,16 +503,73 @@ func (b *Broker) abortOrphanedTransactions() {
 				}
 
 				spare := pd.AcquireSpareChunk(len(raw))
-				pd.Lock()
-				baseOffset, spare := pd.PushBatch(raw, meta, spare)
-				pd.RemoveOpenTxn(pid)
-				pd.AddAbortedTxn(cluster.AbortedTxnEntry{
-					ProducerID:  pid,
-					FirstOffset: firstOffset,
-					LastOffset:  baseOffset,
-				})
-				pd.Unlock()
-				pd.ReleaseSpareChunk(spare)
+				if b.walWriter != nil {
+					stored := make([]byte, len(raw))
+					copy(stored, raw)
+
+					pd.Lock()
+					baseOffset := pd.ReserveOffset(meta)
+					cluster.AssignOffset(stored, baseOffset)
+					errCh, walErr := b.walWriter.AppendAsync(&wal.Entry{
+						TopicID:   pd.TopicID,
+						Partition: pd.Index,
+						Offset:    baseOffset,
+						Data:      stored,
+					})
+					if walErr != nil {
+						pd.RollbackReserve(baseOffset)
+						pd.Unlock()
+						pd.ReleaseSpareChunk(spare)
+						b.logger.Warn("abortOrphanedTransactions: WAL submit failed",
+							"topic", td.Name, "partition", pd.Index, "producer_id", pid, "err", walErr)
+						continue
+					}
+					pd.Unlock()
+
+					if walErr := <-errCh; walErr != nil {
+						pd.Lock()
+						pd.SkipOffsets(baseOffset, int64(meta.LastOffsetDelta)+1)
+						pd.Unlock()
+						pd.ReleaseSpareChunk(spare)
+						b.logger.Warn("abortOrphanedTransactions: WAL write failed",
+							"topic", td.Name, "partition", pd.Index, "producer_id", pid, "err", walErr)
+						continue
+					}
+
+					pd.Lock()
+					spare = pd.AppendToChunk(stored, chunk.ChunkBatch{
+						BaseOffset:      baseOffset,
+						LastOffsetDelta: meta.LastOffsetDelta,
+						MaxTimestamp:    meta.MaxTimestamp,
+						NumRecords:      meta.NumRecords,
+					}, spare)
+					pd.CommitBatch(cluster.StoredBatch{
+						BaseOffset:      baseOffset,
+						LastOffsetDelta: meta.LastOffsetDelta,
+						RawBytes:        stored,
+						MaxTimestamp:    meta.MaxTimestamp,
+						NumRecords:      meta.NumRecords,
+					})
+					pd.RemoveOpenTxn(pid)
+					pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+						ProducerID:  pid,
+						FirstOffset: firstOffset,
+						LastOffset:  baseOffset,
+					})
+					pd.Unlock()
+					pd.ReleaseSpareChunk(spare)
+				} else {
+					pd.Lock()
+					baseOffset, spare := pd.PushBatch(raw, meta, spare)
+					pd.RemoveOpenTxn(pid)
+					pd.AddAbortedTxn(cluster.AbortedTxnEntry{
+						ProducerID:  pid,
+						FirstOffset: firstOffset,
+						LastOffset:  baseOffset,
+					})
+					pd.Unlock()
+					pd.ReleaseSpareChunk(spare)
+				}
 
 				aborted++
 			}

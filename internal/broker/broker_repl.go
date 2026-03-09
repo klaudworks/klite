@@ -533,6 +533,7 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 	b.walWriter.ResetLocalOnlyBatches()
 
 	ackTimeout := b.cfg.ReplicationAckTimeout
+	currentEpoch := b.currentEpoch()
 
 	// Close existing sender if any
 	if b.replSender != nil {
@@ -543,9 +544,32 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 	sender.S3FlushWatermarkFn = b.walWriter.S3FlushWatermark
 	b.replSender = sender
 
+	sameEpochReconnect := epoch != 0 && epoch == currentEpoch
+	sendSnapshot := epoch == 0 || epoch != currentEpoch
+	if sameEpochReconnect {
+		needsSnapshot, snapCheckErr := b.sameEpochReconnectNeedsSnapshot(lastWALSeq)
+		if snapCheckErr != nil {
+			b.logger.Warn("replication: failed to evaluate reconnect snapshot need", "err", snapCheckErr)
+			needsSnapshot = true
+		}
+		sendSnapshot = sendSnapshot || needsSnapshot
+	}
+
+	if sendSnapshot {
+		metaData, readErr := os.ReadFile(b.metaLog.Path())
+		if readErr != nil {
+			b.logger.Warn("replication: failed to read metadata.log for snapshot", "err", readErr)
+			return
+		}
+		walSeq := b.walWriter.NextSequence()
+		if snapErr := sender.SendSnapshot(walSeq, metaData); snapErr != nil {
+			b.logger.Warn("replication: failed to send snapshot", "err", snapErr)
+		}
+	}
+
 	// Best-effort WAL backfill for reconnects within the same epoch.
 	// This closes the historical gap while the standby was disconnected.
-	if epoch != 0 && epoch == b.currentEpoch() {
+	if sameEpochReconnect {
 		if err := b.backfillStandbyFromWAL(sender, lastWALSeq); err != nil {
 			b.logger.Warn("replication: WAL backfill on reconnect failed", "err", err)
 		}
@@ -564,22 +588,27 @@ func (b *Broker) handleStandbyConn(ctx context.Context, conn net.Conn) {
 		}
 	})
 
-	// Send SNAPSHOT on epoch mismatch or fresh standby
-	// (For simplicity, always send SNAPSHOT on new connection to ensure consistency)
-	if epoch == 0 || epoch != b.currentEpoch() {
-		metaData, readErr := os.ReadFile(b.metaLog.Path())
-		if readErr != nil {
-			b.logger.Warn("replication: failed to read metadata.log for snapshot", "err", readErr)
-			return
-		}
-		walSeq := b.walWriter.NextSequence()
-		if snapErr := sender.SendSnapshot(walSeq, metaData); snapErr != nil {
-			b.logger.Warn("replication: failed to send snapshot", "err", snapErr)
-		}
-	}
-
 	// Start keepalive goroutine
 	go b.keepaliveLoop(ctx, sender)
+}
+
+func (b *Broker) sameEpochReconnectNeedsSnapshot(standbyLastSeq uint64) (bool, error) {
+	if b.walWriter == nil {
+		return false, nil
+	}
+
+	nextSeq := b.walWriter.NextSequence()
+	startSeq := standbyLastSeq + 1
+	if startSeq >= nextSeq {
+		return false, nil
+	}
+
+	const probeBatchBytes = 4 * 1024 * 1024
+	_, _, _, count, err := b.walWriter.ReadSequenceBatch(startSeq, nextSeq-1, probeBatchBytes)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (b *Broker) backfillStandbyFromWAL(sender *repl.Sender, standbyLastSeq uint64) error {

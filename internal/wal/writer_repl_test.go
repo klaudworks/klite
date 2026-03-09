@@ -532,6 +532,58 @@ func TestWriterReplicationConnectivityTransitionLogging(t *testing.T) {
 	}
 }
 
+func TestWriterAcksAll_DisconnectedAfterConnectedFallsBackToLocalFsync(t *testing.T) {
+	t.Parallel()
+
+	repl := &mockReplicator{connected: true}
+	logs := &logCaptureHandler{}
+	w := newTestWriterWithLogger(t, repl, slog.New(logs))
+
+	entry := func(offset int64) *Entry {
+		return &Entry{
+			TopicID:   [16]byte{1, 2, 3},
+			Partition: 0,
+			Offset:    offset,
+			Data:      makeTestBatch(1, 1000),
+		}
+	}
+
+	// Connected path first: acks=-1 waits for standby ACK.
+	errCh1, err := w.AppendAsync(entry(0), AppendOpts{RequireReplACK: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	repl.resolvePending(0, nil)
+	select {
+	case err := <-errCh1:
+		if err != nil {
+			t.Fatalf("first append should succeed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for first acks=-1 append")
+	}
+
+	// Transition to disconnected: acks=-1 should degrade to local fsync ACK.
+	repl.setConnected(false)
+	errCh2, err := w.AppendAsync(entry(1), AppendOpts{RequireReplACK: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh2:
+		if err != nil {
+			t.Fatalf("disconnected acks=-1 append should still ack locally: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for disconnected acks=-1 append")
+	}
+
+	if got := logs.count(slog.LevelWarn, "WAL local-only ack: standby not connected"); got != 1 {
+		t.Fatalf("expected exactly one disconnect warning, got %d", got)
+	}
+}
+
 func TestWriterShutdownReplicationTimeout(t *testing.T) {
 	t.Parallel()
 

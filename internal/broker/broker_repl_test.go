@@ -644,9 +644,10 @@ func TestHandleStandbyConn_BackfillsMissingWALOnReconnect(t *testing.T) {
 	defer cancel()
 
 	type result struct {
-		msgType byte
-		payload []byte
-		err     error
+		snapshotType byte
+		backfillType byte
+		payload      []byte
+		err          error
 	}
 	resCh := make(chan result, 1)
 
@@ -659,7 +660,13 @@ func TestHandleStandbyConn_BackfillsMissingWALOnReconnect(t *testing.T) {
 			return
 		}
 
-		r.msgType, r.payload, r.err = repl.ReadFrame(standbyConn)
+		r.snapshotType, _, r.err = repl.ReadFrame(standbyConn)
+		if r.err != nil {
+			resCh <- r
+			return
+		}
+
+		r.backfillType, r.payload, r.err = repl.ReadFrame(standbyConn)
 		if r.err != nil {
 			resCh <- r
 			return
@@ -682,8 +689,11 @@ func TestHandleStandbyConn_BackfillsMissingWALOnReconnect(t *testing.T) {
 	if r.err != nil {
 		t.Fatalf("standby handshake/read failed: %v", r.err)
 	}
-	if r.msgType != repl.MsgWALBatch {
-		t.Fatalf("expected WAL_BATCH backfill, got type 0x%02x", r.msgType)
+	if r.snapshotType != repl.MsgSnapshot {
+		t.Fatalf("expected SNAPSHOT first on reconnect, got type 0x%02x", r.snapshotType)
+	}
+	if r.backfillType != repl.MsgWALBatch {
+		t.Fatalf("expected WAL_BATCH backfill second, got type 0x%02x", r.backfillType)
 	}
 
 	firstSeq, lastSeq, entryCount, _, _, err := repl.UnmarshalWALBatch(r.payload)
@@ -695,6 +705,89 @@ func TestHandleStandbyConn_BackfillsMissingWALOnReconnect(t *testing.T) {
 	}
 	if entryCount != 2 {
 		t.Fatalf("backfill entryCount: got %d, want 2", entryCount)
+	}
+
+	if b.replSender == nil {
+		t.Fatal("replSender should be set after successful reconnect")
+	}
+	b.replSender.Close()
+}
+
+func TestHandleStandbyConn_SendsSnapshotBeforeBackfillOnSameEpochReconnect(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.Now())
+	brokerEpoch := uint64(11)
+	b := newHandshakeBroker(t, clk, brokerEpoch)
+
+	// Seed one WAL entry so reconnect requires a backfill frame.
+	topicID := [16]byte{9, 9, 9}
+	if err := b.walWriter.Append(&wal.Entry{
+		TopicID:   topicID,
+		Partition: 0,
+		Offset:    0,
+		Data:      make([]byte, 27),
+	}); err != nil {
+		t.Fatalf("append WAL entry: %v", err)
+	}
+
+	brokerConn, standbyConn := net.Pipe()
+	defer standbyConn.Close() //nolint:errcheck
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type result struct {
+		snapshotType byte
+		backfillType byte
+		err          error
+	}
+	resCh := make(chan result, 1)
+
+	go func() {
+		var r result
+		// Standby is reconnecting in the same epoch and missing seq 42.
+		hello := repl.MarshalHello(41, brokerEpoch)
+		if err := repl.WriteFrame(standbyConn, repl.MsgHello, hello); err != nil {
+			r.err = err
+			resCh <- r
+			return
+		}
+
+		r.snapshotType, _, r.err = repl.ReadFrame(standbyConn)
+		if r.err != nil {
+			resCh <- r
+			return
+		}
+
+		var backfillPayload []byte
+		r.backfillType, backfillPayload, r.err = repl.ReadFrame(standbyConn)
+		if r.err != nil {
+			resCh <- r
+			return
+		}
+
+		_, lastSeq, _, _, _, err := repl.UnmarshalWALBatch(backfillPayload)
+		if err != nil {
+			r.err = err
+			resCh <- r
+			return
+		}
+		r.err = repl.WriteFrame(standbyConn, repl.MsgACK, repl.MarshalACK(lastSeq))
+		resCh <- r
+	}()
+
+	b.handleStandbyConn(ctx, brokerConn)
+
+	r := <-resCh
+	if r.err != nil {
+		t.Fatalf("standby reconnect failed: %v", r.err)
+	}
+	if r.snapshotType != repl.MsgSnapshot {
+		t.Fatalf("first frame should be SNAPSHOT, got 0x%02x", r.snapshotType)
+	}
+	if r.backfillType != repl.MsgWALBatch {
+		t.Fatalf("second frame should be WAL_BATCH, got 0x%02x", r.backfillType)
 	}
 
 	if b.replSender == nil {
