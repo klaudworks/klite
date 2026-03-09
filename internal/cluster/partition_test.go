@@ -1245,6 +1245,8 @@ func TestFetchHWConsistency(t *testing.T) {
 	pd := newTestPartition()
 
 	const batches = 5000
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -1254,6 +1256,8 @@ func TestFetchHWConsistency(t *testing.T) {
 			raw := makeSimpleBatch(10, int64(i))
 			meta, err := ParseBatchHeader(raw)
 			if err != nil {
+				t.Errorf("writer: ParseBatchHeader failed at iteration %d: %v", i, err)
+				cancel()
 				return
 			}
 			spare := pd.AcquireSpareChunk(len(raw))
@@ -1270,6 +1274,9 @@ func TestFetchHWConsistency(t *testing.T) {
 		defer wg.Done()
 		fetchOffset := int64(0)
 		for fetchOffset < batches*10 {
+			if ctx.Err() != nil {
+				return
+			}
 			fr := pd.Fetch(fetchOffset, 1024*1024)
 			if fr.Err != 0 {
 				if fr.Err == ErrCodeOffsetOutOfRange {
@@ -1313,6 +1320,8 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 	pd := newTestPartition()
 
 	const iterations = 5000
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -1322,6 +1331,8 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 			raw := makeSimpleBatch(10, int64(i))
 			meta, err := ParseBatchHeader(raw)
 			if err != nil {
+				t.Errorf("writer: ParseBatchHeader failed at iteration %d: %v", i, err)
+				cancel()
 				return
 			}
 			stored := make([]byte, len(raw))
@@ -1360,6 +1371,9 @@ func TestFetchHWConsistencyTwoPhase(t *testing.T) {
 		defer wg.Done()
 		fetchOffset := int64(0)
 		for fetchOffset < iterations*10 {
+			if ctx.Err() != nil {
+				return
+			}
 			fr := pd.Fetch(fetchOffset, 1024*1024)
 			if fr.Err != 0 {
 				if fr.Err == ErrCodeOffsetOutOfRange {
