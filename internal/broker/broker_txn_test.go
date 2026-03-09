@@ -290,6 +290,65 @@ func TestAbortExpiredTransactions_NoExpired(t *testing.T) {
 	}
 }
 
+func TestAbortExpiredTransactions_WALSubmitFailureKeepsTxnRetryable(t *testing.T) {
+	t.Parallel()
+	b, pd, fc := setupTxnTestBroker(t, "test-topic")
+
+	pid, _ := startTxn(t, b, "txn-submit-fail", "test-topic", 0, 5000, 0)
+
+	pd.Lock()
+	pd.SetHW(5)
+	pd.AddOpenTxn(pid, 0)
+	pd.Unlock()
+
+	fc.Advance(6 * time.Second)
+
+	// Force AppendAsync submit failure.
+	b.walWriter.Stop()
+	b.abortExpiredTransactions()
+
+	ps := b.state.PIDManager().GetProducer(pid)
+	if ps.TxnState != cluster.TxnOngoing {
+		t.Fatalf("TxnState after failed abort = %d, want TxnOngoing", ps.TxnState)
+	}
+
+	pd.RLock()
+	openAfterFail := pd.OpenTxnPIDs()
+	pd.RUnlock()
+	if len(openAfterFail) != 1 {
+		t.Fatalf("expected 1 open txn after failed abort, got %d", len(openAfterFail))
+	}
+
+	idx2 := wal.NewIndex()
+	walCfg := wal.DefaultWriterConfig()
+	walCfg.Dir = t.TempDir()
+	walCfg.S3Configured = true
+	walCfg.Logger = slog.Default()
+	w2, err := wal.NewWriter(walCfg, idx2)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w2.Start(); err != nil {
+		t.Fatalf("Start writer: %v", err)
+	}
+	t.Cleanup(func() { w2.Stop() })
+
+	pd.Lock()
+	pd.InitWAL(b.chunkPool, w2, idx2)
+	pd.Unlock()
+	b.walWriter = w2
+	b.walIndex = idx2
+
+	b.abortExpiredTransactions()
+
+	pd.RLock()
+	openAfterRetry := pd.OpenTxnPIDs()
+	pd.RUnlock()
+	if len(openAfterRetry) != 0 {
+		t.Fatalf("expected no open txns after retry, got %d", len(openAfterRetry))
+	}
+}
+
 func TestAbortExpiredTransactions_MultiPartitionTxn(t *testing.T) {
 	t.Parallel()
 

@@ -49,6 +49,7 @@ func (b *Broker) abortExpiredTransactions() {
 			tp         cluster.TopicPartition
 		}
 		var pending []pendingAbort
+		hadError := false
 
 		for tp := range endState.TxnPartitions {
 			td := b.state.GetTopic(tp.Topic)
@@ -81,6 +82,7 @@ func (b *Broker) abortExpiredTransactions() {
 				pd.Unlock()
 				b.logger.Error("abortExpiredTransactions: WAL submit failed",
 					"topic", tp.Topic, "partition", tp.Partition, "err", walErr)
+				hadError = true
 				continue
 			}
 			pd.Unlock()
@@ -104,8 +106,8 @@ func (b *Broker) abortExpiredTransactions() {
 					"topic", pc.tp.Topic, "partition", pc.tp.Partition, "err", walErr)
 				pc.pd.Lock()
 				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
-				pc.pd.RemoveOpenTxn(endState.ProducerID)
 				pc.pd.Unlock()
+				hadError = true
 				continue
 			}
 
@@ -135,6 +137,12 @@ func (b *Broker) abortExpiredTransactions() {
 			pc.pd.Unlock()
 			pc.pd.ReleaseSpareChunk(spare)
 			pc.pd.NotifyWaiters()
+		}
+
+		if ec := b.state.PIDManager().FinalizeEndTxn(endState.ProducerID, endState.Epoch, false, !hadError); ec != 0 {
+			b.logger.Warn("abortExpiredTransactions: finalize failed",
+				"producer_id", endState.ProducerID, "epoch", endState.Epoch, "err_code", ec)
+			continue
 		}
 
 		b.logger.Info("aborted expired transaction",

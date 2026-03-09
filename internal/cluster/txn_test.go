@@ -505,6 +505,9 @@ func TestExpiredTransactionsIgnoresCompletedTxns(t *testing.T) {
 	if _, ec := m.PrepareEndTxn(pid, epoch, true); ec != 0 {
 		t.Fatalf("setup PrepareEndTxn: errCode=%d", ec)
 	}
+	if ec := m.FinalizeEndTxn(pid, epoch, true, true); ec != 0 {
+		t.Fatalf("setup FinalizeEndTxn: errCode=%d", ec)
+	}
 
 	// Advance past timeout.
 	fc.Advance(6 * time.Second)
@@ -787,10 +790,18 @@ func TestPrepareEndTxnCommit(t *testing.T) {
 		t.Fatalf("TxnFirstOffsets[tp] = %d, want 100", state.TxnFirstOffsets[tp])
 	}
 
-	// Producer state should be reset.
+	// Producer is now in the ending phase until finalize succeeds.
 	ps := m.GetProducer(pid)
+	if ps.TxnState != TxnEnding {
+		t.Fatalf("TxnState after prepare = %d, want TxnEnding", ps.TxnState)
+	}
+
+	if ec := m.FinalizeEndTxn(pid, epoch, true, true); ec != 0 {
+		t.Fatalf("FinalizeEndTxn: errCode=%d", ec)
+	}
+	ps = m.GetProducer(pid)
 	if ps.TxnState != TxnNone {
-		t.Fatalf("TxnState after commit = %d, want TxnNone", ps.TxnState)
+		t.Fatalf("TxnState after finalize = %d, want TxnNone", ps.TxnState)
 	}
 	if ps.LastWasCommit != true {
 		t.Fatal("LastWasCommit should be true")
@@ -807,13 +818,13 @@ func TestPrepareEndTxnRetryIdempotent(t *testing.T) {
 		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
 	}
 
-	// First EndTxn commit.
+	// First EndTxn commit enters TxnEnding.
 	_, errCode := m.PrepareEndTxn(pid, epoch, true)
 	if errCode != 0 {
 		t.Fatalf("first PrepareEndTxn: errCode=%d", errCode)
 	}
 
-	// Retry with same commit flag — idempotent, should succeed.
+	// Retry with same commit flag while ending should return the pending txn state.
 	state, errCode := m.PrepareEndTxn(pid, epoch, true)
 	if errCode != 0 {
 		t.Fatalf("retry PrepareEndTxn (same flag): errCode=%d, want 0", errCode)
@@ -824,9 +835,21 @@ func TestPrepareEndTxnRetryIdempotent(t *testing.T) {
 	if !state.Commit {
 		t.Fatal("expected commit=true on idempotent retry")
 	}
-	// Idempotent retry returns empty partitions/groups (txn already ended).
+	if len(state.TxnPartitions) != 1 {
+		t.Fatalf("expected 1 TxnPartition on retry before finalize, got %d", len(state.TxnPartitions))
+	}
+
+	if ec := m.FinalizeEndTxn(pid, epoch, true, true); ec != 0 {
+		t.Fatalf("FinalizeEndTxn: errCode=%d", ec)
+	}
+
+	// Retry after successful finalize is idempotent and empty.
+	state, errCode = m.PrepareEndTxn(pid, epoch, true)
+	if errCode != 0 {
+		t.Fatalf("post-finalize retry PrepareEndTxn: errCode=%d, want 0", errCode)
+	}
 	if len(state.TxnPartitions) != 0 {
-		t.Fatalf("expected empty TxnPartitions on retry, got %d", len(state.TxnPartitions))
+		t.Fatalf("expected empty TxnPartitions after finalize, got %d", len(state.TxnPartitions))
 	}
 }
 
@@ -840,7 +863,7 @@ func TestPrepareEndTxnRetryDifferentFlag(t *testing.T) {
 		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
 	}
 
-	// Commit the transaction.
+	// Enter ending with commit.
 	_, errCode := m.PrepareEndTxn(pid, epoch, true)
 	if errCode != 0 {
 		t.Fatalf("first commit: errCode=%d", errCode)
@@ -866,7 +889,7 @@ func TestPrepareEndTxnAbortRetryIdempotent(t *testing.T) {
 		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
 	}
 
-	// First EndTxn abort.
+	// First EndTxn abort enters TxnEnding.
 	_, errCode := m.PrepareEndTxn(pid, epoch, false)
 	if errCode != 0 {
 		t.Fatalf("first abort: errCode=%d", errCode)
@@ -879,6 +902,62 @@ func TestPrepareEndTxnAbortRetryIdempotent(t *testing.T) {
 	}
 	if state.Commit {
 		t.Fatal("expected commit=false on abort retry")
+	}
+}
+
+func TestFinalizeEndTxnFailureRestoresOngoing(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-finalize-fail", 5000)
+	tp := TopicPartition{Topic: "t", Partition: 0}
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
+
+	_, ec := m.PrepareEndTxn(pid, epoch, true)
+	if ec != 0 {
+		t.Fatalf("PrepareEndTxn: errCode=%d", ec)
+	}
+
+	if ec := m.FinalizeEndTxn(pid, epoch, true, false); ec != 0 {
+		t.Fatalf("FinalizeEndTxn failure: errCode=%d", ec)
+	}
+
+	ps := m.GetProducer(pid)
+	if ps.TxnState != TxnOngoing {
+		t.Fatalf("TxnState after failed finalize = %d, want TxnOngoing", ps.TxnState)
+	}
+	if !ps.TxnPartitions[tp] {
+		t.Fatalf("TxnPartitions missing %v after failed finalize", tp)
+	}
+
+	state, ec := m.PrepareEndTxn(pid, epoch, true)
+	if ec != 0 {
+		t.Fatalf("retry PrepareEndTxn after failed finalize: errCode=%d", ec)
+	}
+	if len(state.TxnPartitions) != 1 {
+		t.Fatalf("retry TxnPartitions = %d, want 1", len(state.TxnPartitions))
+	}
+}
+
+func TestAddPartitionsToTxnRejectedWhileEnding(t *testing.T) {
+	t.Parallel()
+	m := NewProducerIDManager()
+
+	pid, epoch, _ := m.InitProducerID("txn-ending-add", 5000)
+	tp0 := TopicPartition{Topic: "t", Partition: 0}
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp0}); ec != 0 {
+		t.Fatalf("setup AddPartitionsToTxn: errCode=%d", ec)
+	}
+
+	if _, ec := m.PrepareEndTxn(pid, epoch, true); ec != 0 {
+		t.Fatalf("PrepareEndTxn: errCode=%d", ec)
+	}
+
+	tp1 := TopicPartition{Topic: "t", Partition: 1}
+	if ec := m.AddPartitionsToTxn(pid, epoch, []TopicPartition{tp1}); ec != 53 {
+		t.Fatalf("AddPartitionsToTxn while ending: errCode=%d, want 53", ec)
 	}
 }
 
@@ -1383,12 +1462,9 @@ func TestProducerIDManagerConcurrentAccess(t *testing.T) {
 	}
 }
 
-// TestLSOStallAfterPrepareEndTxnWithoutRemoveOpenTxn proves that if
-// PrepareEndTxn transitions a producer's TxnState to TxnNone but the
-// partition's openTxnPIDs entry is NOT removed, the LSO is permanently
-// stuck: ExpiredTransactions returns empty (the PID won't be retried)
-// while LSO remains pinned at the open txn's first offset.
-func TestLSOStallAfterPrepareEndTxnWithoutRemoveOpenTxn(t *testing.T) {
+// TestFinalizeEndTxnFailureKeepsTxnRetryable verifies that a failed EndTxn
+// finalize keeps the txn in-progress so timeout sweeps can retry it.
+func TestFinalizeEndTxnFailureKeepsTxnRetryable(t *testing.T) {
 	t.Parallel()
 
 	fc := clock.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
@@ -1428,25 +1504,28 @@ func TestLSOStallAfterPrepareEndTxnWithoutRemoveOpenTxn(t *testing.T) {
 		t.Fatalf("expected 1 expired txn, got %d", len(expired))
 	}
 
-	// PrepareEndTxn transitions TxnState to TxnNone.
+	// Prepare then fail finalize, simulating WAL failure before durable marker.
 	_, ec := m.PrepareEndTxn(pid, epoch, false)
 	if ec != 0 {
 		t.Fatalf("PrepareEndTxn errCode=%d", ec)
 	}
+	if ec := m.FinalizeEndTxn(pid, epoch, false, false); ec != 0 {
+		t.Fatalf("FinalizeEndTxn failure errCode=%d", ec)
+	}
 
-	// Simulate WAL failure path: SkipOffsets is called but RemoveOpenTxn is NOT.
-	// (This is the bug in abortExpiredTransactions.)
+	// Simulate partition-side failure path: offsets can be skipped while open
+	// transaction tracking remains until a later successful abort.
 	pd.Lock()
 	pd.SkipOffsets(10, 1) // skip the control batch offset
 	pd.Unlock()
 
-	// ExpiredTransactions should now return empty — the PID has TxnState == TxnNone.
+	// Txn is still retryable.
 	expired = m.ExpiredTransactions()
-	if len(expired) != 0 {
-		t.Fatalf("expected 0 expired txns after PrepareEndTxn, got %d", len(expired))
+	if len(expired) != 1 {
+		t.Fatalf("expected 1 expired txn after failed finalize, got %d", len(expired))
 	}
 
-	// But LSO is still stuck at 0 — the openTxnPIDs entry was never removed.
+	// LSO remains pinned until RemoveOpenTxn is called by a successful abort.
 	pd.RLock()
 	lso := pd.LSO()
 	openPIDs := pd.OpenTxnPIDs()

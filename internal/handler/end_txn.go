@@ -32,6 +32,14 @@ func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) 
 			return resp, nil
 		}
 
+		finalized := false
+		defer func() {
+			if finalized {
+				return
+			}
+			state.PIDManager().FinalizeEndTxn(endState.ProducerID, endState.Epoch, endState.Commit, false)
+		}()
+
 		controlBatch := cluster.BuildControlBatch(endState.ProducerID, endState.Epoch, endState.Commit, clk.Now().UnixMilli())
 
 		// Phase 1: Reserve offsets and submit WAL writes for all partitions.
@@ -102,7 +110,6 @@ func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) 
 					"baseOffset", pc.baseOffset, "err", walErr)
 				pc.pd.Lock()
 				pc.pd.SkipOffsets(pc.baseOffset, int64(pc.meta.LastOffsetDelta)+1)
-				pc.pd.RemoveOpenTxn(endState.ProducerID)
 				pc.pd.Unlock()
 				resp.ErrorCode = kerr.KafkaStorageError.Code
 				continue
@@ -149,6 +156,12 @@ func HandleEndTxn(state *cluster.State, walWriter *wal.Writer, clk clock.Clock) 
 				})
 			}
 		}
+
+		if state.PIDManager().FinalizeEndTxn(endState.ProducerID, endState.Epoch, endState.Commit, resp.ErrorCode == 0) != 0 {
+			resp.ErrorCode = kerr.InvalidTxnState.Code
+			return resp, nil
+		}
+		finalized = true
 
 		return resp, nil
 	}

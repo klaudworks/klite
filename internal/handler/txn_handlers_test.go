@@ -7,6 +7,7 @@ import (
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	"github.com/klaudworks/klite/internal/metadata"
+	"github.com/klaudworks/klite/internal/wal"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -139,6 +140,16 @@ func callEndTxn(t *testing.T, state *cluster.State, clk clock.Clock, req *kmsg.E
 	return resp.(*kmsg.EndTxnResponse)
 }
 
+func callEndTxnWithWriter(t *testing.T, state *cluster.State, walWriter *wal.Writer, clk clock.Clock, req *kmsg.EndTxnRequest) *kmsg.EndTxnResponse {
+	t.Helper()
+	h := HandleEndTxn(state, walWriter, clk)
+	resp, err := h(req)
+	if err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	return resp.(*kmsg.EndTxnResponse)
+}
+
 func TestEndTxn_UnsupportedVersion(t *testing.T) {
 	state := cluster.NewState(cluster.Config{NodeID: 0, DefaultPartitions: 1})
 	clk := clock.NewFakeClock(time.Unix(1000, 0))
@@ -204,6 +215,7 @@ func TestEndTxn_NilTxnPartitions_NoWork(t *testing.T) {
 
 	// First EndTxn to commit
 	state.PIDManager().PrepareEndTxn(pid, epoch, true)
+	state.PIDManager().FinalizeEndTxn(pid, epoch, true, true)
 
 	// Now retry — TxnPartitions will be nil (idempotent retry with empty state)
 	r := kmsg.NewPtrEndTxnRequest()
@@ -229,6 +241,7 @@ func TestEndTxn_InvalidTxnState(t *testing.T) {
 	tp := cluster.TopicPartition{Topic: "t", Partition: 0}
 	state.PIDManager().AddPartitionsToTxn(pid, epoch, []cluster.TopicPartition{tp})
 	state.PIDManager().PrepareEndTxn(pid, epoch, true)
+	state.PIDManager().FinalizeEndTxn(pid, epoch, true, true)
 
 	// Try to abort after committing — should get INVALID_TXN_STATE (53)
 	r := kmsg.NewPtrEndTxnRequest()
@@ -241,6 +254,54 @@ func TestEndTxn_InvalidTxnState(t *testing.T) {
 	// Error code 53 = INVALID_TXN_STATE
 	if resp.ErrorCode != 53 {
 		t.Errorf("expected INVALID_TXN_STATE (53), got %d", resp.ErrorCode)
+	}
+}
+
+func TestEndTxn_WALSubmitFailureRetryDoesNotShortCircuit(t *testing.T) {
+	t.Parallel()
+
+	state := cluster.NewState(cluster.Config{NodeID: 0, DefaultPartitions: 1})
+	state.CreateTopic("t", 1)
+	clk := clock.NewFakeClock(time.Unix(1000, 0))
+
+	txnID := "txn-submit-failure"
+	pid, epoch, _ := state.PIDManager().InitProducerID(txnID, 5000)
+	tp := cluster.TopicPartition{Topic: "t", Partition: 0}
+	if ec := state.PIDManager().AddPartitionsToTxn(pid, epoch, []cluster.TopicPartition{tp}); ec != 0 {
+		t.Fatalf("AddPartitionsToTxn: errCode=%d", ec)
+	}
+
+	w, err := wal.NewWriter(wal.WriterConfig{Dir: t.TempDir(), S3Configured: true}, wal.NewIndex())
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatalf("Start writer: %v", err)
+	}
+	w.Stop() // force AppendAsync submit to return ErrClosed
+
+	r := kmsg.NewPtrEndTxnRequest()
+	r.Version = 3
+	r.ProducerID = pid
+	r.ProducerEpoch = epoch
+	r.Commit = true
+
+	resp1 := callEndTxnWithWriter(t, state, w, clk, r)
+	if resp1.ErrorCode != kerr.KafkaStorageError.Code {
+		t.Fatalf("first EndTxn error = %d, want %d", resp1.ErrorCode, kerr.KafkaStorageError.Code)
+	}
+	ps := state.PIDManager().GetProducer(pid)
+	if ps.TxnState != cluster.TxnOngoing {
+		t.Fatalf("TxnState after first WAL submit failure = %d, want TxnOngoing", ps.TxnState)
+	}
+
+	resp2 := callEndTxnWithWriter(t, state, w, clk, r)
+	if resp2.ErrorCode != kerr.KafkaStorageError.Code {
+		t.Fatalf("retry EndTxn error = %d, want %d", resp2.ErrorCode, kerr.KafkaStorageError.Code)
+	}
+	ps = state.PIDManager().GetProducer(pid)
+	if ps.TxnState != cluster.TxnOngoing {
+		t.Fatalf("TxnState after retry submit failure = %d, want TxnOngoing", ps.TxnState)
 	}
 }
 

@@ -15,6 +15,7 @@ type TxnState int8
 const (
 	TxnNone TxnState = iota
 	TxnOngoing
+	TxnEnding
 )
 
 type ProducerState struct {
@@ -33,6 +34,7 @@ type ProducerState struct {
 	TxnStartTime    time.Time
 	TxnTimeoutMs    int32
 	LastWasCommit   bool
+	TxnEndCommit    bool
 }
 
 type PendingTxnOffset struct {
@@ -397,6 +399,10 @@ func (m *ProducerIDManager) AddPartitionsToTxn(pid int64, epoch int16, partition
 		return 49 // TRANSACTIONAL_ID_AUTHORIZATION_FAILED — not a transactional producer
 	}
 
+	if ps.TxnState == TxnEnding {
+		return 53 // INVALID_TXN_STATE
+	}
+
 	if ps.TxnState != TxnOngoing {
 		ps.TxnState = TxnOngoing
 		ps.TxnStartTime = m.clk.Now()
@@ -429,6 +435,10 @@ func (m *ProducerIDManager) AddOffsetsToTxn(pid int64, epoch int16, groupID stri
 	}
 	if ps.TxnID == "" {
 		return 49
+	}
+
+	if ps.TxnState == TxnEnding {
+		return 53 // INVALID_TXN_STATE
 	}
 
 	if ps.TxnState != TxnOngoing {
@@ -522,7 +532,7 @@ func (m *ProducerIDManager) PrepareEndTxn(pid int64, epoch int16, commit bool) (
 		}
 		return nil, 47 // INVALID_PRODUCER_EPOCH
 	}
-	if ps.TxnState != TxnOngoing {
+	if ps.TxnState == TxnNone {
 		if ps.LastWasCommit == commit {
 			return &EndTxnState{
 				ProducerID: ps.ProducerID,
@@ -531,6 +541,20 @@ func (m *ProducerIDManager) PrepareEndTxn(pid int64, epoch int16, commit bool) (
 			}, 0
 		}
 		return nil, 53 // INVALID_TXN_STATE
+	}
+	if ps.TxnState == TxnEnding {
+		if ps.TxnEndCommit != commit {
+			return nil, 53 // INVALID_TXN_STATE
+		}
+		return &EndTxnState{
+			ProducerID:      ps.ProducerID,
+			Epoch:           ps.Epoch,
+			Commit:          commit,
+			TxnPartitions:   ps.TxnPartitions,
+			TxnGroups:       ps.TxnGroups,
+			TxnOffsets:      ps.TxnOffsets,
+			TxnFirstOffsets: ps.TxnFirstOffsets,
+		}, 0
 	}
 
 	state := &EndTxnState{
@@ -543,11 +567,48 @@ func (m *ProducerIDManager) PrepareEndTxn(pid int64, epoch int16, commit bool) (
 		TxnFirstOffsets: ps.TxnFirstOffsets,
 	}
 
-	ps.TxnState = TxnNone
-	ps.LastWasCommit = commit
-	ps.resetTxnState()
+	ps.TxnState = TxnEnding
+	ps.TxnEndCommit = commit
 
 	return state, 0
+}
+
+func (m *ProducerIDManager) FinalizeEndTxn(pid int64, epoch int16, commit, success bool) int16 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ps, ok := m.producers[pid]
+	if !ok {
+		return 3
+	}
+	if epoch != ps.Epoch {
+		if epoch < ps.Epoch {
+			return 90 // PRODUCER_FENCED
+		}
+		return 47 // INVALID_PRODUCER_EPOCH
+	}
+
+	if ps.TxnState != TxnEnding {
+		if ps.TxnState == TxnNone && ps.LastWasCommit == commit {
+			return 0
+		}
+		return 53 // INVALID_TXN_STATE
+	}
+	if ps.TxnEndCommit != commit {
+		return 53 // INVALID_TXN_STATE
+	}
+
+	if success {
+		ps.TxnState = TxnNone
+		ps.LastWasCommit = commit
+		ps.TxnEndCommit = false
+		ps.resetTxnState()
+		return 0
+	}
+
+	ps.TxnState = TxnOngoing
+	ps.TxnEndCommit = false
+	return 0
 }
 
 func (ps *ProducerState) resetTxnState() {
