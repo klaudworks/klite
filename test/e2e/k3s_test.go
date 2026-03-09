@@ -1370,7 +1370,6 @@ func portForward(t *testing.T, ctx context.Context, kubeconfigPath, target strin
 	}
 	require.NoError(t, scanner.Err(), "reading kubectl port-forward stdout")
 	require.Greater(t, localPort, 0, "never saw 'Forwarding from' line in kubectl output")
-	require.Greater(t, localPort, 0)
 	return &portForwardHandle{
 		LocalPort: localPort,
 		Addr:      fmt.Sprintf("127.0.0.1:%d", localPort),
