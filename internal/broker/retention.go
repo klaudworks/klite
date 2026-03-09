@@ -81,19 +81,28 @@ func (b *Broker) enforcePartitionRetention(
 	}
 
 	type objInfo struct {
-		key      string
-		dataSize int64 // logical data bytes (sum of batch lengths, no footer overhead)
-		footer   *s3store.Footer
+		key        string
+		baseOffset int64
+		dataSize   int64 // logical data bytes (sum of batch lengths, no footer overhead)
+		footer     *s3store.Footer
 	}
 	var infos []objInfo
 	for _, obj := range objects {
+		info := objInfo{
+			key:        obj.Key,
+			baseOffset: s3store.ParseBaseOffsetFromKey(obj.Key),
+			dataSize:   obj.Size,
+		}
 		footer, err := b.s3Reader.GetFooter(ctx, obj.Key, obj.Size)
 		if err != nil {
 			b.logger.Warn("retention: read footer failed",
 				"key", obj.Key, "err", err)
+			infos = append(infos, info)
 			continue
 		}
-		infos = append(infos, objInfo{key: obj.Key, dataSize: footer.DataSize(), footer: footer})
+		info.dataSize = footer.DataSize()
+		info.footer = footer
+		infos = append(infos, info)
 	}
 	if len(infos) == 0 {
 		return
@@ -104,6 +113,9 @@ func (b *Broker) enforcePartitionRetention(
 	expiredByTime := make([]bool, len(infos))
 	if retentionMs >= 0 {
 		for i, info := range infos {
+			if info.footer == nil {
+				continue
+			}
 			if info.footer.MaxTimestamp() >= 0 && info.footer.MaxTimestamp() < timeCutoff {
 				expiredByTime[i] = true
 			}
@@ -159,18 +171,38 @@ func (b *Broker) enforcePartitionRetention(
 		return
 	}
 
-	var actualLogStart int64
-	deletedSet := make(map[string]bool, deleted)
+	deletedSet := make(map[string]struct{}, deleted)
 	for i := 0; i < deleted; i++ {
-		deletedSet[deleteKeys[i]] = true
+		deletedSet[deleteKeys[i]] = struct{}{}
 	}
+
+	actualLogStart := int64(-1)
 	for _, info := range infos {
-		if !deletedSet[info.key] {
+		if _, wasDeleted := deletedSet[info.key]; wasDeleted {
 			continue
 		}
-		lastOff := info.footer.LastOffset()
-		if lastOff+1 > actualLogStart {
-			actualLogStart = lastOff + 1
+		if info.baseOffset < 0 {
+			continue
+		}
+		actualLogStart = info.baseOffset
+		break
+	}
+
+	if actualLogStart < 0 {
+		pd.RLock()
+		actualLogStart = pd.LogStart()
+		pd.RUnlock()
+		for _, info := range infos {
+			if _, wasDeleted := deletedSet[info.key]; !wasDeleted {
+				continue
+			}
+			if info.footer == nil {
+				continue
+			}
+			lastOff := info.footer.LastOffset()
+			if lastOff+1 > actualLogStart {
+				actualLogStart = lastOff + 1
+			}
 		}
 	}
 

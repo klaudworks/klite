@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,6 +210,64 @@ func TestRetentionBySize(t *testing.T) {
 	td.Partitions[0].RUnlock()
 	if logStart != 2 {
 		t.Errorf("logStartOffset: got %d, want 2", logStart)
+	}
+}
+
+func TestRetentionBySizeWithCorruptFooterStillProgresses(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(100000))
+	b, mem := newRetentionTestBroker(t, clk)
+
+	topic := "size-corrupt-footer-test"
+	b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+		"retention.ms":    "-1",
+		"retention.bytes": "-1",
+	})
+
+	tid := topicID(b, topic)
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{90000})
+	putTestObject(t, mem, topic, tid, 0, 1, []int64{91000})
+	putTestObject(t, mem, topic, tid, 0, 2, []int64{92000})
+	setPartitionHW(t, b, topic, 0, 3)
+
+	client := s3store.NewClient(s3store.ClientConfig{
+		S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test",
+	})
+	reader := s3store.NewReader(client, nil)
+
+	key0 := s3store.ObjectKey("klite/test", topic, tid, 0, 0)
+	key1 := s3store.ObjectKey("klite/test", topic, tid, 0, 1)
+	obj0Size, err := client.HeadObject(context.Background(), key0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer0, err := reader.GetFooter(context.Background(), key0, obj0Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.PutObject(context.Background(), key1, []byte("corrupt")); err != nil {
+		t.Fatal(err)
+	}
+
+	b.state.SetTopicConfig(topic, "retention.bytes", intToStr(footer0.DataSize()+1))
+	b.enforceRetention(context.Background())
+
+	keys := listObjectKeys(t, mem, topic, tid, 0)
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 object after size retention with corrupt footer, got %d", len(keys))
+	}
+	if !strings.HasSuffix(keys[0], "/00000000000000000002.obj") {
+		t.Fatalf("expected newest object to remain, got %q", keys[0])
+	}
+
+	td := b.state.GetTopic(topic)
+	td.Partitions[0].RLock()
+	logStart := td.Partitions[0].LogStart()
+	td.Partitions[0].RUnlock()
+	if logStart != 2 {
+		t.Fatalf("logStartOffset: got %d, want 2", logStart)
 	}
 }
 
