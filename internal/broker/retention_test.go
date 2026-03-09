@@ -477,6 +477,36 @@ func TestRetentionByTimeAndSizeCombined(t *testing.T) {
 			t.Fatalf("expected offset 2 object to remain, got %q", keys[1])
 		}
 	})
+
+	t.Run("time retention deletes even when size retention would keep all objects", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.UnixMilli(100000))
+		b, mem := newRetentionTestBroker(t, clk)
+
+		topic := "time-over-size-test"
+		b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+			"retention.ms":    "5000",
+			"retention.bytes": "1000000",
+		})
+
+		tid := topicID(b, topic)
+		putTestObject(t, mem, topic, tid, 0, 0, []int64{80000})
+		putTestObject(t, mem, topic, tid, 0, 1, []int64{98000})
+		putTestObject(t, mem, topic, tid, 0, 2, []int64{99000})
+		setPartitionHW(t, b, topic, 0, 3)
+
+		b.enforceRetention(context.Background())
+
+		keys := listObjectKeys(t, mem, topic, tid, 0)
+		if len(keys) != 2 {
+			t.Fatalf("expected only time-expired object to be deleted, got %d remaining", len(keys))
+		}
+		if !strings.HasSuffix(keys[0], "/00000000000000000001.obj") {
+			t.Fatalf("expected offset 1 object to remain, got %q", keys[0])
+		}
+		if !strings.HasSuffix(keys[1], "/00000000000000000002.obj") {
+			t.Fatalf("expected offset 2 object to remain, got %q", keys[1])
+		}
+	})
 }
 
 func TestRetentionBytesZeroKeepsLastObject(t *testing.T) {
@@ -513,6 +543,41 @@ func TestRetentionBytesZeroKeepsLastObject(t *testing.T) {
 	td.Partitions[0].RUnlock()
 	if logStart != 2 {
 		t.Fatalf("logStartOffset: got %d, want 2", logStart)
+	}
+}
+
+func TestRetentionBytesZeroSingleObjectStillSurvives(t *testing.T) {
+	t.Parallel()
+
+	clk := clock.NewFakeClock(time.UnixMilli(100000))
+	b, mem := newRetentionTestBroker(t, clk)
+
+	topic := "retention-bytes-zero-single-test"
+	b.state.CreateTopicWithConfigs(topic, 1, map[string]string{
+		"retention.ms":    "-1",
+		"retention.bytes": "0",
+	})
+
+	tid := topicID(b, topic)
+	putTestObject(t, mem, topic, tid, 0, 0, []int64{90000})
+	setPartitionHW(t, b, topic, 0, 1)
+
+	b.enforceRetention(context.Background())
+
+	keys := listObjectKeys(t, mem, topic, tid, 0)
+	if len(keys) != 1 {
+		t.Fatalf("expected single object to survive, got %d", len(keys))
+	}
+	if !strings.HasSuffix(keys[0], "/00000000000000000000.obj") {
+		t.Fatalf("expected original object to remain, got %q", keys[0])
+	}
+
+	td := b.state.GetTopic(topic)
+	td.Partitions[0].RLock()
+	logStart := td.Partitions[0].LogStart()
+	td.Partitions[0].RUnlock()
+	if logStart != 0 {
+		t.Fatalf("logStartOffset: got %d, want 0", logStart)
 	}
 }
 
