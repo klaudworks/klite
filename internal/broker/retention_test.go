@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3svc "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/klaudworks/klite/internal/clock"
 	"github.com/klaudworks/klite/internal/cluster"
 	s3store "github.com/klaudworks/klite/internal/s3"
@@ -375,6 +378,266 @@ func TestRetentionAdvancesWithClock(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("round 2: expected 1 object after clock advance, got %d", len(keys))
 	}
+}
+
+func TestScanOrphanedS3TopicsDetectsOrphansAndIgnoresMetadata(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+
+	_, _ = b.state.CreateTopicWithConfigs("live", 1, nil)
+	liveID := topicID(b, "live")
+	putTestObject(t, mem, "live", liveID, 0, 0, []int64{90000})
+
+	var orphanID [16]byte
+	orphanID[0] = 42
+	putTestObject(t, mem, "orphan", orphanID, 0, 0, []int64{90000})
+	putTestObject(t, mem, "orphan", orphanID, 0, 1, []int64{91000})
+
+	client := s3store.NewClient(s3store.ClientConfig{S3Client: mem, Bucket: "test-bucket", Prefix: "klite/test"})
+	if err := client.PutObject(context.Background(), "klite/test/metadata.log", []byte("meta")); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans := b.scanOrphanedS3Topics()
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphaned topic, got %d", len(orphans))
+	}
+	if orphans[0].Name != "orphan" {
+		t.Fatalf("unexpected orphan name: got %q, want %q", orphans[0].Name, "orphan")
+	}
+	if orphans[0].TopicID != orphanID {
+		t.Fatalf("unexpected orphan topic ID: got %v, want %v", orphans[0].TopicID, orphanID)
+	}
+}
+
+func TestScanOrphanedS3TopicsEmptyPrefix(t *testing.T) {
+	t.Parallel()
+
+	b, _ := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+	orphans := b.scanOrphanedS3Topics()
+	if len(orphans) != 0 {
+		t.Fatalf("expected no orphaned topics, got %d", len(orphans))
+	}
+}
+
+func TestGCDeletedTopicReenqueuesOnListFailure(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+	var retryID [16]byte
+	retryID[0] = 7
+	dt := cluster.DeletedTopic{Name: "retry", TopicID: retryID}
+	failedPrefix := "klite/test/" + s3store.TopicDir(dt.Name, dt.TopicID) + "/"
+
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: &listFailingS3{
+			InMemoryS3: mem,
+			failPrefix: failedPrefix,
+		},
+		Bucket: "test-bucket",
+		Prefix: "klite/test",
+		Logger: b.logger,
+	})
+
+	b.gcDeletedTopic(context.Background(), dt)
+
+	drained := b.state.DrainDeletedTopics()
+	if len(drained) != 1 {
+		t.Fatalf("expected 1 deleted topic re-enqueued, got %d", len(drained))
+	}
+	if drained[0] != dt {
+		t.Fatalf("unexpected re-enqueued topic: got %+v, want %+v", drained[0], dt)
+	}
+}
+
+func TestGCDeletedTopicDeletesObjectsAndHandlesEmptyList(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+	recording := &deleteRecordingS3{InMemoryS3: mem}
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: recording,
+		Bucket:   "test-bucket",
+		Prefix:   "klite/test",
+		Logger:   b.logger,
+	})
+
+	var goneID [16]byte
+	goneID[0] = 9
+	dt := cluster.DeletedTopic{Name: "gone", TopicID: goneID}
+	putTestObject(t, mem, dt.Name, dt.TopicID, 0, 0, []int64{90000})
+	putTestObject(t, mem, dt.Name, dt.TopicID, 1, 0, []int64{90000})
+
+	b.gcDeletedTopic(context.Background(), dt)
+	if len(recording.deleted) != 2 {
+		t.Fatalf("expected 2 deleted keys, got %d", len(recording.deleted))
+	}
+
+	objs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir(dt.Name, dt.TopicID)+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 0 {
+		t.Fatalf("expected no remaining objects for deleted topic, got %d", len(objs))
+	}
+
+	b.gcDeletedTopic(context.Background(), dt)
+	if len(recording.deleted) != 2 {
+		t.Fatalf("expected empty-list GC to keep delete count unchanged, got %d", len(recording.deleted))
+	}
+}
+
+func TestDeleteTopicObjectsRespectsContextCancellationBetweenTopics(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+
+	var firstID [16]byte
+	firstID[0] = 1
+	first := cluster.DeletedTopic{Name: "first", TopicID: firstID}
+	var secondID [16]byte
+	secondID[0] = 2
+	second := cluster.DeletedTopic{Name: "second", TopicID: secondID}
+
+	putTestObject(t, mem, first.Name, first.TopicID, 0, 0, []int64{90000})
+	putTestObject(t, mem, second.Name, second.TopicID, 0, 0, []int64{90000})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b.s3Client = s3store.NewClient(s3store.ClientConfig{
+		S3Client: &cancelOnListS3{
+			InMemoryS3: mem,
+			cancel:     cancel,
+			prefix:     "klite/test/" + s3store.TopicDir(first.Name, first.TopicID) + "/",
+		},
+		Bucket: "test-bucket",
+		Prefix: "klite/test",
+		Logger: b.logger,
+	})
+
+	b.deleteTopicObjects(ctx, []cluster.DeletedTopic{first, second})
+
+	firstObjs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir(first.Name, first.TopicID)+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstObjs) != 0 {
+		t.Fatalf("expected first topic objects to be deleted, got %d", len(firstObjs))
+	}
+
+	secondObjs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir(second.Name, second.TopicID)+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondObjs) != 1 {
+		t.Fatalf("expected second topic objects to remain due to cancellation, got %d", len(secondObjs))
+	}
+}
+
+func TestS3GCLoopStartupDeletesPendingAndOrphans(t *testing.T) {
+	t.Parallel()
+
+	b, mem := newRetentionTestBroker(t, clock.NewFakeClock(time.UnixMilli(100000)))
+
+	_, _ = b.state.CreateTopicWithConfigs("live", 1, nil)
+	liveID := topicID(b, "live")
+	putTestObject(t, mem, "live", liveID, 0, 0, []int64{90000})
+
+	pendingTD, _ := b.state.CreateTopicWithConfigs("pending", 1, nil)
+	pendingID := pendingTD.ID
+	putTestObject(t, mem, "pending", pendingID, 0, 0, []int64{90000})
+	b.state.DeleteTopic("pending")
+
+	var orphanID [16]byte
+	orphanID[0] = 3
+	putTestObject(t, mem, "orphan-loop", orphanID, 0, 0, []int64{90000})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		b.s3GCLoop(ctx)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		pendingObjs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir("pending", pendingID)+"/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		orphanObjs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir("orphan-loop", orphanID)+"/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pendingObjs) == 0 && len(orphanObjs) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for startup S3 GC to complete: pending=%d orphan=%d", len(pendingObjs), len(orphanObjs))
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	<-done
+
+	pendingObjs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir("pending", pendingID)+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingObjs) != 0 {
+		t.Fatalf("expected pending topic objects to be deleted, got %d", len(pendingObjs))
+	}
+
+	orphanObjs, err := b.s3Client.ListObjects(context.Background(), "klite/test/"+s3store.TopicDir("orphan-loop", orphanID)+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphanObjs) != 0 {
+		t.Fatalf("expected orphan topic objects to be deleted, got %d", len(orphanObjs))
+	}
+
+	liveObjs := listObjectKeys(t, mem, "live", liveID, 0)
+	if len(liveObjs) != 1 {
+		t.Fatalf("expected live topic object to remain, got %d", len(liveObjs))
+	}
+}
+
+type listFailingS3 struct {
+	*s3store.InMemoryS3
+	failPrefix string
+}
+
+func (l *listFailingS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObjectsV2Input, opts ...func(*s3svc.Options)) (*s3svc.ListObjectsV2Output, error) {
+	if strings.HasPrefix(aws.ToString(input.Prefix), l.failPrefix) {
+		return nil, errors.New("injected list failure")
+	}
+	return l.InMemoryS3.ListObjectsV2(ctx, input, opts...)
+}
+
+type deleteRecordingS3 struct {
+	*s3store.InMemoryS3
+	deleted []string
+}
+
+func (d *deleteRecordingS3) DeleteObject(ctx context.Context, input *s3svc.DeleteObjectInput, opts ...func(*s3svc.Options)) (*s3svc.DeleteObjectOutput, error) {
+	d.deleted = append(d.deleted, aws.ToString(input.Key))
+	return d.InMemoryS3.DeleteObject(ctx, input, opts...)
+}
+
+type cancelOnListS3 struct {
+	*s3store.InMemoryS3
+	cancel func()
+	prefix string
+	once   bool
+}
+
+func (c *cancelOnListS3) ListObjectsV2(ctx context.Context, input *s3svc.ListObjectsV2Input, opts ...func(*s3svc.Options)) (*s3svc.ListObjectsV2Output, error) {
+	if !c.once && strings.HasPrefix(aws.ToString(input.Prefix), c.prefix) {
+		c.once = true
+		c.cancel()
+	}
+	return c.InMemoryS3.ListObjectsV2(ctx, input, opts...)
 }
 
 func intToStr(n int64) string {
