@@ -24,6 +24,9 @@ type Server struct {
 	// wg tracks active connection goroutines for clean shutdown.
 	wg sync.WaitGroup
 
+	// serveWg tracks Serve so Wait does not race with wg.Add in Serve.
+	serveWg sync.WaitGroup
+
 	// connsMu protects activeConns.
 	connsMu     sync.Mutex
 	activeConns map[net.Conn]struct{}
@@ -44,6 +47,9 @@ func (s *Server) SetSASLEnabled(enabled bool) {
 }
 
 func (s *Server) Serve(ln net.Listener) error {
+	s.serveWg.Add(1)
+	defer s.serveWg.Done()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -91,6 +97,7 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) Wait() {
+	s.serveWg.Wait()
 	s.wg.Wait()
 }
 
