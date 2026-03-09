@@ -1,11 +1,18 @@
 ---
-title: S3 Cost Calculator
-description: Estimate monthly S3 API and storage costs for your klite workload.
+title: Object Storage Cost Calculator
+description: Estimate monthly object storage costs for your klite workload across AWS S3, GCS, and Azure Blob.
 ---
 
-Estimate your monthly S3 costs based on your workload parameters. All calculations use US East (N. Virginia) S3 Standard pricing.
+Estimate your monthly object storage costs based on your workload parameters.
 
 <div id="calc">
+  <div class="provider-tabs" role="tablist">
+    <button role="tab" class="provider-tab active" data-provider="aws">AWS S3</button>
+    <button role="tab" class="provider-tab" data-provider="gcs">GCS</button>
+    <button role="tab" class="provider-tab" data-provider="azure">Azure Blob</button>
+  </div>
+  <p class="provider-note" id="providerNote">US East (N. Virginia), S3 Standard.</p>
+
   <div class="calc-grid">
     <div class="calc-field">
       <label for="msgRate">Message rate (msgs/sec) <span class="info-icon" data-tip="Total messages produced per second across all partitions.">i</span></label>
@@ -16,23 +23,23 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
       <input type="number" id="msgSize" value="1024" min="1" />
     </div>
     <div class="calc-field">
-      <label for="partitions">Partitions <span class="info-icon" data-tip="Total partition count across all topics. Each partition flushes to S3 independently.">i</span></label>
+      <label for="partitions">Partitions <span class="info-icon" data-tip="Total partition count across all topics. Each partition flushes independently.">i</span></label>
       <input type="number" id="partitions" value="10" min="1" />
     </div>
     <div class="calc-field">
-      <label for="consumers">S3-tier consumers <span class="info-icon" data-tip="Consumers reading data already flushed to S3 (lagging behind the WAL). Real-time consumers reading from the WAL generate zero S3 calls.">i</span></label>
+      <label for="consumers">Storage-tier consumers <span class="info-icon" data-tip="Consumers reading data already flushed to object storage (lagging behind the WAL). Real-time consumers reading from the WAL generate zero API calls.">i</span></label>
       <input type="number" id="consumers" value="0" min="0" />
     </div>
     <div class="calc-field">
-      <label for="retention">Retention (days) <span class="info-icon" data-tip="How long data is kept in S3 before deletion. Directly determines storage volume.">i</span></label>
+      <label for="retention">Retention (days) <span class="info-icon" data-tip="How long data is kept before deletion. Directly determines storage volume.">i</span></label>
       <input type="number" id="retention" value="7" min="1" />
     </div>
     <div class="calc-field">
-      <label for="objectSize">Target object size (MiB) <span class="info-icon" data-tip="Flush threshold per partition. Larger objects mean fewer PUTs and GETs but higher flush latency. Tune with --s3-target-object-size.">i</span></label>
+      <label for="objectSize">Target object size (MiB) <span class="info-icon" data-tip="Flush threshold per partition. Larger objects mean fewer writes and reads but higher flush latency.">i</span></label>
       <input type="number" id="objectSize" value="64" min="1" />
     </div>
     <div class="calc-field">
-      <label for="flushInterval">S3 flush interval (seconds) <span class="info-icon" data-tip="Latest point at which data is flushed to S3. High-throughput partitions flush earlier when they hit the target object size. Tune with --s3-flush-interval.">i</span></label>
+      <label for="flushInterval">Flush interval (seconds) <span class="info-icon" data-tip="Latest point at which data is flushed. High-throughput partitions flush earlier when they hit the target object size.">i</span></label>
       <input type="number" id="flushInterval" value="60" min="1" />
     </div>
     <div class="calc-field">
@@ -47,9 +54,9 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
         <tr><th></th><th>Count/month</th><th>Cost/month</th></tr>
       </thead>
       <tbody>
-        <tr><td>PUT</td><td id="putCount">—</td><td id="putCost">—</td></tr>
-        <tr><td>GET</td><td id="getCount">—</td><td id="getCost">—</td></tr>
-        <tr><td>LIST</td><td id="listCount">—</td><td id="listCost">—</td></tr>
+        <tr><td id="putLabel">PUT</td><td id="putCount">—</td><td id="putCost">—</td></tr>
+        <tr><td id="getLabel">GET</td><td id="getCount">—</td><td id="getCost">—</td></tr>
+        <tr><td id="listLabel">LIST</td><td id="listCount">—</td><td id="listCost">—</td></tr>
         <tr><td>Storage</td><td id="storageSize">—</td><td id="storageCost">—</td></tr>
         <tr class="calc-total"><td><strong>Total</strong></td><td></td><td id="totalCost">—</td></tr>
       </tbody>
@@ -64,20 +71,50 @@ Estimate your monthly S3 costs based on your workload parameters. All calculatio
 
 ### Pricing reference
 
-| Operation | Rate |
-|-----------|------|
-| PUT / COPY / POST / LIST | $5.00 per million |
-| GET / SELECT | $0.40 per million |
-| DELETE | Free |
-| Storage (first 50 TB) | $0.023 per GB-month |
+<div id="pricingTable"></div>
 
 ### What drives costs
 
-**Storage dominates** — typically 90%+ of total S3 cost. API costs only matter at very high throughput.
+**Storage dominates** — typically 90%+ of total cost. API costs only matter at very high throughput.
 
-The main API cost driver is **S3 reads**: consumers fetching data that's been evicted from the on-disk WAL because `KLITE_WAL_MAX_DISK_SIZE` was exceeded and must be read back from S3.
+The main API cost driver is **object store reads**: consumers fetching data that's been evicted from the on-disk WAL because `KLITE_WAL_MAX_DISK_SIZE` was exceeded and must be read back from object storage.
+
+**Data transfer**: if klite runs in the same region as the bucket, there are no transfer costs. Running outside the provider's network incurs egress fees (<span id="egressNote">~$0.09/GB</span>) when consumers fetch WAL-evicted data. Writes are always free (ingress is $0).
 
 <style>{`
+  .provider-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 0.25rem;
+    border-bottom: 2px solid var(--sl-color-gray-6);
+  }
+  .provider-tab {
+    padding: 0.5rem 1.25rem;
+    border: none;
+    background: none;
+    color: var(--sl-color-gray-3);
+    font-size: 0.9rem;
+    font-family: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .provider-tab:hover {
+    color: var(--sl-color-text);
+  }
+  .provider-tab.active {
+    color: var(--sl-color-text-accent);
+    border-bottom-color: var(--sl-color-text-accent);
+    font-weight: 600;
+  }
+  .provider-note {
+    font-size: 0.8rem;
+    color: var(--sl-color-gray-3);
+    margin-top: 0.25rem;
+    margin-bottom: 1.25rem;
+  }
   .calc-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -178,14 +215,58 @@ The main API cost driver is **S3 reads**: consumers fetching data that's been ev
     font-size: 0.85rem;
     color: var(--sl-color-gray-3);
   }
+  #pricingTable table {
+    width: 100%;
+  }
+  #pricingTable td:nth-child(2),
+  #pricingTable th:nth-child(2) {
+    text-align: right;
+  }
 `}</style>
 
 <script is:inline>{`
-  const M = 2592000; // seconds per month
-  const PUT_RATE = 0.005 / 1000;
-  const GET_RATE = 0.0004 / 1000;
-  const LIST_RATE = 0.005 / 1000;
-  const STORAGE_RATE = 0.023; // per GB-month
+  var M = 2592000;
+
+  var PROVIDERS = {
+    aws: {
+      put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.023,
+      note: 'US East (N. Virginia), S3 Standard.',
+      egress: '~$0.09/GB',
+      putLabel: 'PUT', getLabel: 'GET', listLabel: 'LIST',
+      pricingRows: [
+        ['PUT / COPY / POST / LIST', '$5.00 per million'],
+        ['GET / SELECT', '$0.40 per million'],
+        ['Delete', 'Free'],
+        ['Storage (first 50 TB)', '$0.023 per GB-month']
+      ]
+    },
+    gcs: {
+      put: 0.005 / 1000, get: 0.0004 / 1000, list: 0.005 / 1000, storage: 0.020,
+      note: 'US multi-region / us-central1, Standard class. Same pricing via S3-compatible XML API.',
+      egress: '~$0.12/GB',
+      putLabel: 'Class A (write)', getLabel: 'Class B (read)', listLabel: 'Class A (list)',
+      pricingRows: [
+        ['Class A (write / list)', '$5.00 per million'],
+        ['Class B (read)', '$0.40 per million'],
+        ['Delete', 'Free'],
+        ['Storage (first 50 TB)', '$0.020 per GB-month']
+      ]
+    },
+    azure: {
+      put: 0.0081 / 1000, get: 0.0005 / 1000, list: 0.0081 / 1000, storage: 0.0184,
+      note: 'East US, Hot tier, LRS redundancy.',
+      egress: '~$0.087/GB',
+      putLabel: 'Write (Put)', getLabel: 'Read (Get)', listLabel: 'Write (List)',
+      pricingRows: [
+        ['Write (Put, List)', '$8.10 per million'],
+        ['Read (Get)', '$0.50 per million'],
+        ['Delete', 'Free'],
+        ['Storage (first 50 TB)', '$0.0184 per GB-month']
+      ]
+    }
+  };
+
+  var currentProvider = 'aws';
 
   function fmt(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
@@ -195,7 +276,28 @@ The main API cost driver is **S3 reads**: consumers fetching data that's been ev
   }
   function usd(n) { return '$' + n.toFixed(2); }
 
+  function renderPricingTable() {
+    var p = PROVIDERS[currentProvider];
+    var html = '<table><thead><tr><th>Operation</th><th>Rate</th></tr></thead><tbody>';
+    p.pricingRows.forEach(function(row) {
+      html += '<tr><td>' + row[0] + '</td><td>' + row[1] + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('pricingTable').innerHTML = html;
+  }
+
+  function updateLabels() {
+    var p = PROVIDERS[currentProvider];
+    document.getElementById('providerNote').textContent = p.note;
+    document.getElementById('egressNote').textContent = p.egress;
+    document.getElementById('putLabel').textContent = p.putLabel;
+    document.getElementById('getLabel').textContent = p.getLabel;
+    document.getElementById('listLabel').textContent = p.listLabel;
+    renderPricingTable();
+  }
+
   function calculate() {
+    var p = PROVIDERS[currentProvider];
     var rate = Number(document.getElementById('msgRate').value) || 0;
     var size = Number(document.getElementById('msgSize').value) || 0;
     var P = Number(document.getElementById('partitions').value) || 1;
@@ -203,7 +305,6 @@ The main API cost driver is **S3 reads**: consumers fetching data that's been ev
     var D = Number(document.getElementById('retention').value) || 1;
     var targetMiB = Number(document.getElementById('objectSize').value) || 64;
     var T = Number(document.getElementById('flushInterval').value) || 60;
-
     var comp = Math.max(1, Number(document.getElementById('compression').value) || 1);
 
     var targetBytes = targetMiB * 1024 * 1024;
@@ -213,30 +314,25 @@ The main API cost driver is **S3 reads**: consumers fetching data that's been ev
     var objectsPerInterval = Math.max(1, bytesPerPartitionPerInterval / targetBytes);
     var flushPUTs = objectsPerInterval * P * (M / T);
 
-    // PUTs: flush + metadata.log + lease renewal
     var metaPUTs = M / T;
     var leasePUTs = M / 5;
     var totalPUTs = flushPUTs + metaPUTs + leasePUTs;
 
-    // GETs: consumer range + footer + lease standby
-    var consumerGETs = flushPUTs * C * 2; // range + footer
+    var consumerGETs = flushPUTs * C * 2;
     var leaseGETs = M / 2;
     var totalGETs = consumerGETs + leaseGETs;
 
-    // LISTs: negligible after listing cache append optimization
-    // retention (per partition per hour) + compaction + GC
     var retentionLISTs = P * (M / 3600);
     var gcLISTs = M / 30;
     var totalLISTs = retentionLISTs + gcLISTs;
 
-    // Storage
     var storageBytes = bytesPerSec * D * 86400;
     var storageGB = storageBytes / (1024 * 1024 * 1024);
 
-    var putCost = totalPUTs * PUT_RATE;
-    var getCost = totalGETs * GET_RATE;
-    var listCost = totalLISTs * LIST_RATE;
-    var storageCostVal = storageGB * STORAGE_RATE;
+    var putCost = totalPUTs * p.put;
+    var getCost = totalGETs * p.get;
+    var listCost = totalLISTs * p.list;
+    var storageCostVal = storageGB * p.storage;
     var total = putCost + getCost + listCost + storageCostVal;
 
     document.getElementById('putCount').textContent = fmt(totalPUTs);
@@ -256,8 +352,21 @@ The main API cost driver is **S3 reads**: consumers fetching data that's been ev
     document.getElementById('objectCount').textContent = fmt(flushPUTs);
   }
 
+  // Provider tab switching
+  document.querySelectorAll('.provider-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      document.querySelectorAll('.provider-tab').forEach(function(t) { t.classList.remove('active'); });
+      tab.classList.add('active');
+      currentProvider = tab.getAttribute('data-provider');
+      updateLabels();
+      calculate();
+    });
+  });
+
   document.querySelectorAll('#calc input').forEach(function(el) {
     el.addEventListener('input', calculate);
   });
+
+  updateLabels();
   calculate();
 `}</script>
