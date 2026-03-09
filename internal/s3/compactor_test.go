@@ -575,6 +575,106 @@ func TestCompactionMinLag(t *testing.T) {
 	assert.Greater(t, watermark, int64(-1), "should compact with no min lag")
 }
 
+func TestFormWindowsEdgeCases(t *testing.T) {
+	clk := &clock.FakeClock{}
+	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	clk.Set(now)
+
+	compactor := &Compactor{
+		cfg: CompactorConfig{
+			WindowBytes: 1024,
+		},
+		clock: clk,
+	}
+
+	t.Run("min lag excludes all except anchor", func(t *testing.T) {
+		parsed := []windowObj{
+			{key: "k0", size: 100, baseOffset: 0, lastModified: now.Add(-2 * time.Hour)},
+			{key: "k1", size: 100, baseOffset: 1, lastModified: now.Add(-10 * time.Minute)},
+			{key: "k2", size: 100, baseOffset: 2, lastModified: now.Add(-5 * time.Minute)},
+		}
+
+		windows := compactor.formWindows(parsed, 0, int64(time.Hour/time.Millisecond))
+		require.Len(t, windows, 1)
+		require.Len(t, windows[0], 1)
+		assert.Equal(t, "k0", windows[0][0].key)
+	})
+
+	t.Run("anchor at last index", func(t *testing.T) {
+		parsed := []windowObj{
+			{key: "k10", size: 100, baseOffset: 10, lastModified: now.Add(-2 * time.Hour)},
+			{key: "k11", size: 100, baseOffset: 11, lastModified: now.Add(-2 * time.Hour)},
+			{key: "k12", size: 100, baseOffset: 12, lastModified: now.Add(-2 * time.Hour)},
+		}
+
+		windows := compactor.formWindows(parsed, 2, 0)
+		require.Len(t, windows, 1)
+		require.Len(t, windows[0], 1)
+		assert.Equal(t, "k12", windows[0][0].key)
+	})
+
+	t.Run("no anchor includes from first object", func(t *testing.T) {
+		parsed := []windowObj{
+			{key: "k10", size: 100, baseOffset: 10, lastModified: now.Add(-2 * time.Hour)},
+			{key: "k11", size: 100, baseOffset: 11, lastModified: now.Add(-2 * time.Hour)},
+			{key: "k12", size: 100, baseOffset: 12, lastModified: now.Add(-2 * time.Hour)},
+		}
+
+		windows := compactor.formWindows(parsed, -1, 0)
+		require.Len(t, windows, 1)
+		require.Len(t, windows[0], 3)
+		assert.Equal(t, []string{"k10", "k11", "k12"}, []string{windows[0][0].key, windows[0][1].key, windows[0][2].key})
+	})
+}
+
+func TestCompactionAllRecordsFilteredAdvancesWatermarkAndDeletesSources(t *testing.T) {
+	s3mem := NewInMemoryS3()
+	clk := clock.NewFakeClock(time.Unix(100000, 0))
+	compactor, _ := newTestCompactor(t, s3mem, clk)
+
+	obj1 := buildTestObject(t, []testBatch{{
+		baseOffset:    0,
+		baseTimestamp: 1000,
+		records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: nil},
+		},
+		codec: CompressionNone,
+	}})
+	putObject(t, s3mem, "test-prefix", "topic1", 0, 0, obj1)
+
+	obj2 := buildTestObject(t, []testBatch{{
+		baseOffset:    1,
+		baseTimestamp: 1000,
+		records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("B"), Value: nil},
+		},
+		codec: CompressionNone,
+	}})
+	putObject(t, s3mem, "test-prefix", "topic1", 0, 1, obj2)
+
+	ctx := context.Background()
+	var persisted []int64
+	compactor.cfg.PersistWatermark = func(topic string, partition int32, cleanedUpTo int64) error {
+		persisted = append(persisted, cleanedUpTo)
+		return nil
+	}
+
+	newWM, err := compactor.CompactPartition(ctx, "topic1", testTopicID, 0, -1, 0, 10000,
+		func() {}, func() {})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), newWM)
+	assert.Equal(t, []int64{1}, persisted)
+
+	client := NewClient(ClientConfig{
+		S3Client: s3mem,
+		Bucket:   "test-bucket",
+		Prefix:   "test-prefix",
+	})
+	objects, err := client.ListObjects(ctx, ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0))
+	require.NoError(t, err)
+	assert.Empty(t, objects)
+}
+
 func TestCompactionPreservesOrder(t *testing.T) {
 	s3mem := NewInMemoryS3()
 	compactor, _ := newTestCompactor(t, s3mem, nil)
