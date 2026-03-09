@@ -497,23 +497,46 @@ func (l *Log) AppendRaw(frame []byte) error {
 	return nil
 }
 
-// ReplaceFromSnapshot replaces the metadata.log file with snapshot contents
-// and replays it to rebuild in-memory state.
+// ReplaceFromSnapshot atomically replaces the metadata.log file with snapshot
+// contents and replays it to rebuild in-memory state. Uses write-to-tmp +
+// fsync + rename to avoid data loss on crash.
 func (l *Log) ReplaceFromSnapshot(data []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Close current file
+	// Write snapshot to a temp file
+	tmpPath := l.path + ".tmp"
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("snapshot: create tmp file: %w", err)
+	}
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("snapshot: write tmp file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("snapshot: fsync tmp file: %w", err)
+	}
+	_ = tmpFile.Close()
+
+	// Close current file before rename
 	if l.file != nil {
 		_ = l.file.Close()
 	}
 
-	// Write snapshot to file
-	if err := os.WriteFile(l.path, data, 0o644); err != nil {
-		return fmt.Errorf("write snapshot to metadata.log: %w", err)
+	// Atomic rename
+	if err := os.Rename(tmpPath, l.path); err != nil {
+		// Try to reopen the old file for continued operation
+		l.file, _ = os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+		return fmt.Errorf("snapshot: rename tmp to metadata.log: %w", err)
 	}
 
-	// Fsync the directory to make the new file entry durable
+	// Fsync the directory to make the rename durable
 	dir, err := os.Open(l.dir)
 	if err == nil {
 		_ = dir.Sync()
@@ -523,7 +546,7 @@ func (l *Log) ReplaceFromSnapshot(data []byte) error {
 	// Reopen for appending
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
-		return fmt.Errorf("reopen metadata.log after snapshot: %w", err)
+		return fmt.Errorf("snapshot: reopen metadata.log: %w", err)
 	}
 	l.file = f
 	l.size = int64(len(data))
