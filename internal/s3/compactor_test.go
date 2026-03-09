@@ -1004,6 +1004,64 @@ func TestCompactionOrphanCleanup(t *testing.T) {
 	assert.Len(t, objsAfter, 1, "orphan should be cleaned up")
 }
 
+func TestOrphanCleanupReturnsFilteredParsed(t *testing.T) {
+	s3mem := NewInMemoryS3()
+	compactor, _ := newTestCompactor(t, s3mem, nil)
+	ctx := context.Background()
+
+	covering := buildTestObject(t, []testBatch{{
+		baseOffset:    0,
+		baseTimestamp: 1000,
+		records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("A"), Value: []byte("v1")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("B"), Value: []byte("v1")},
+			{OffsetDelta: 2, TimestampDelta: 200, Key: []byte("C"), Value: []byte("v1")},
+			{OffsetDelta: 3, TimestampDelta: 300, Key: []byte("D"), Value: []byte("v1")},
+			{OffsetDelta: 4, TimestampDelta: 400, Key: []byte("E"), Value: []byte("v1")},
+		},
+		codec: CompressionNone,
+	}})
+	orphan := buildTestObject(t, []testBatch{{
+		baseOffset:    3,
+		baseTimestamp: 2000,
+		records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("C"), Value: []byte("v1")},
+			{OffsetDelta: 1, TimestampDelta: 100, Key: []byte("D"), Value: []byte("v1")},
+		},
+		codec: CompressionNone,
+	}})
+	nonOrphan := buildTestObject(t, []testBatch{{
+		baseOffset:    5,
+		baseTimestamp: 3000,
+		records: []Record{
+			{OffsetDelta: 0, TimestampDelta: 0, Key: []byte("E"), Value: []byte("v1")},
+		},
+		codec: CompressionNone,
+	}})
+
+	putObject(t, s3mem, "test-prefix", "topic1", 0, 0, covering)
+	putObject(t, s3mem, "test-prefix", "topic1", 0, 3, orphan)
+	putObject(t, s3mem, "test-prefix", "topic1", 0, 5, nonOrphan)
+
+	prefix := ObjectKeyPrefix("test-prefix", "topic1", testTopicID, 0)
+	objects, err := compactor.client.ListObjects(ctx, prefix)
+	require.NoError(t, err)
+	parsed := parseWindowObjects(objects, prefix)
+
+	filtered, err := compactor.orphanCleanup(ctx, parsed)
+	require.NoError(t, err)
+	require.Len(t, filtered, 2)
+
+	orphanKey := ObjectKey("test-prefix", "topic1", testTopicID, 0, 3)
+	for _, obj := range filtered {
+		assert.NotEqual(t, orphanKey, obj.key)
+	}
+
+	objects, err = compactor.client.ListObjects(ctx, prefix)
+	require.NoError(t, err)
+	assert.Len(t, objects, 2, "orphan should be deleted from S3")
+}
+
 func TestCompactionCrossWindowDedup(t *testing.T) {
 	s3mem := NewInMemoryS3()
 	compactor, _ := newTestCompactor(t, s3mem, nil)

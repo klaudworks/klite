@@ -98,53 +98,16 @@ func (c *Compactor) CompactPartition(
 		return cleanedUpTo, fmt.Errorf("list objects: %w", err)
 	}
 
-	if len(objects) == 0 {
+	parsed := parseWindowObjects(objects, prefix)
+	if len(parsed) == 0 {
 		return cleanedUpTo, nil
 	}
 
-	var parsed []windowObj
-	for _, obj := range objects {
-		baseOff := parseBaseOffset(obj.Key, prefix)
-		if baseOff < 0 {
-			continue
-		}
-		parsed = append(parsed, windowObj{
-			key:          obj.Key,
-			size:         obj.Size,
-			baseOffset:   baseOff,
-			lastModified: obj.LastModified,
-		})
-	}
-	sort.Slice(parsed, func(i, j int) bool {
-		return parsed[i].baseOffset < parsed[j].baseOffset
-	})
-
-	// Orphan cleanup: delete objects whose offset range is fully covered by a later object
-	if err := c.orphanCleanup(ctx, parsed); err != nil {
+	// Orphan cleanup: delete objects whose offset range is fully covered by another object.
+	parsed, err = c.orphanCleanup(ctx, parsed)
+	if err != nil {
 		c.logger.Warn("orphan cleanup failed", "topic", topic, "partition", partition, "err", err)
 	}
-
-	objects, err = c.client.ListObjects(ctx, prefix)
-	if err != nil {
-		return cleanedUpTo, fmt.Errorf("re-list objects: %w", err)
-	}
-
-	parsed = parsed[:0]
-	for _, obj := range objects {
-		baseOff := parseBaseOffset(obj.Key, prefix)
-		if baseOff < 0 {
-			continue
-		}
-		parsed = append(parsed, windowObj{
-			key:          obj.Key,
-			size:         obj.Size,
-			baseOffset:   baseOff,
-			lastModified: obj.LastModified,
-		})
-	}
-	sort.Slice(parsed, func(i, j int) bool {
-		return parsed[i].baseOffset < parsed[j].baseOffset
-	})
 
 	if len(parsed) == 0 {
 		return cleanedUpTo, nil
@@ -536,6 +499,26 @@ type windowObj struct {
 	lastModified time.Time
 }
 
+func parseWindowObjects(objects []ObjectInfo, prefix string) []windowObj {
+	parsed := make([]windowObj, 0, len(objects))
+	for _, obj := range objects {
+		baseOff := parseBaseOffset(obj.Key, prefix)
+		if baseOff < 0 {
+			continue
+		}
+		parsed = append(parsed, windowObj{
+			key:          obj.Key,
+			size:         obj.Size,
+			baseOffset:   baseOff,
+			lastModified: obj.LastModified,
+		})
+	}
+	sort.Slice(parsed, func(i, j int) bool {
+		return parsed[i].baseOffset < parsed[j].baseOffset
+	})
+	return parsed
+}
+
 // formWindows groups objects into compaction windows bounded by WindowBytes.
 // Objects newer than minCompactionLagMs (based on LastModified) are excluded,
 // except for the anchor object which is always included.
@@ -578,10 +561,11 @@ func (c *Compactor) formWindows(parsed []windowObj, anchorIdx int, minCompaction
 	return windows
 }
 
-// orphanCleanup deletes objects whose offset range is fully covered by a later object.
-func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error {
+// orphanCleanup deletes objects whose offset range is fully covered by another object.
+// It returns parsed with orphaned objects removed.
+func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) ([]windowObj, error) {
 	if len(parsed) < 2 {
-		return nil
+		return parsed, nil
 	}
 
 	type objRange struct {
@@ -609,22 +593,23 @@ func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error
 		}
 	}
 
-	orphanSet := make(map[string]bool)
-	for i := 0; i < len(ranges); i++ {
+	orphanSet := make(map[string]struct{})
+	maxLastOff := int64(-1)
+	for i := range ranges {
 		if ranges[i].footerErr {
 			continue
 		}
-		for j := 0; j < len(ranges); j++ {
-			if i == j || ranges[j].footerErr {
-				continue
-			}
-			// If object i's range is fully covered by object j, object i is orphan
-			if ranges[i].baseOff >= ranges[j].baseOff && ranges[i].lastOff <= ranges[j].lastOff && ranges[i].key != ranges[j].key {
-				orphanSet[ranges[i].key] = true
-				break
-			}
+
+		if ranges[i].lastOff <= maxLastOff {
+			orphanSet[ranges[i].key] = struct{}{}
+			continue
+		}
+
+		if ranges[i].lastOff > maxLastOff {
+			maxLastOff = ranges[i].lastOff
 		}
 	}
+
 	var orphanKeys []string
 	for k := range orphanSet {
 		orphanKeys = append(orphanKeys, k)
@@ -636,7 +621,15 @@ func (c *Compactor) orphanCleanup(ctx context.Context, parsed []windowObj) error
 		c.client.DeleteObjectsBatch(ctx, orphanKeys)
 	}
 
-	return nil
+	filtered := make([]windowObj, 0, len(parsed)-len(orphanSet))
+	for _, p := range parsed {
+		if _, isOrphan := orphanSet[p.key]; isOrphan {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+
+	return filtered, nil
 }
 
 func parseBaseOffset(key, prefix string) int64 {
