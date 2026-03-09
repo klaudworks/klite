@@ -33,6 +33,8 @@ tmp/
 .cache/
 .opencode/
 ralph/
+research/
+agents/
 
 # Override global gitignore
 !AGENTS.md
